@@ -94,6 +94,51 @@ def _load_mimirignore() -> list[str]:
 
 _MIMIRIGNORE_PATTERNS: list[str] = _load_mimirignore()
 
+
+def _init_disk_cache() -> "Optional[object]":
+    """Open (or create) a per-workspace SQLite blueprint cache in ~/.cache/mimir/."""
+    try:
+        import sqlite3, hashlib
+        ws_hash = hashlib.sha256(str(WORKSPACE_ROOT).encode()).hexdigest()[:16]
+        cache_dir = Path.home() / ".cache" / "mimir"
+        cache_dir.mkdir(parents=True, exist_ok=True)
+        db = sqlite3.connect(str(cache_dir / f"{ws_hash}.db"), check_same_thread=False)
+        db.execute("PRAGMA journal_mode=WAL")
+        db.execute(
+            "CREATE TABLE IF NOT EXISTS blueprints"
+            " (path TEXT PRIMARY KEY, mtime REAL, size INTEGER, blueprint TEXT)"
+        )
+        db.commit()
+        return db
+    except Exception:
+        return None
+
+
+_DISK_CACHE = _init_disk_cache()
+
+
+def _load_disk_cache() -> int:
+    """Populate the in-memory cache from SQLite. Returns number of valid entries loaded."""
+    if _DISK_CACHE is None:
+        return 0
+    loaded = 0
+    try:
+        for path_str, mtime, size, blueprint in _DISK_CACHE.execute(
+            "SELECT path, mtime, size, blueprint FROM blueprints"
+        ):
+            try:
+                st = Path(path_str).stat()
+                if st.st_mtime == mtime and st.st_size == size:
+                    _CACHE[path_str] = (mtime, size, blueprint)
+                    _CACHE.move_to_end(path_str)
+                    loaded += 1
+            except OSError:
+                pass
+    except Exception:
+        pass
+    return loaded
+
+
 # Filename suffixes that indicate machine-generated files — never useful to read or search.
 _GENERATED_SUFFIXES = (".g.cs", ".generated.cs", ".g.dart", ".pb.go", ".pb.swift")
 _GENERATED_NAMES = frozenset({"AssemblyInfo.cs"})
@@ -252,6 +297,15 @@ def _cache_put(path: Path, blueprint: str) -> None:
     _CACHE.move_to_end(str(path))
     while len(_CACHE) > _CACHE_MAX:
         _CACHE.popitem(last=False)  # evict oldest
+    if _DISK_CACHE is not None:
+        try:
+            _DISK_CACHE.execute(
+                "INSERT OR REPLACE INTO blueprints VALUES (?,?,?,?)",
+                (str(path), st.st_mtime, st.st_size, blueprint),
+            )
+            _DISK_CACHE.commit()
+        except Exception:
+            pass
 
 
 # --------------------------------------------------------------------------- #
@@ -315,6 +369,7 @@ def _warm_cache() -> None:
     with ThreadPoolExecutor(max_workers=workers) as ex:
         for _ in as_completed(ex.submit(_build_blueprint, p) for p in files):
             pass
+    _build_cs_ns_index()
 
 
 # --------------------------------------------------------------------------- #
@@ -720,6 +775,36 @@ def _find_ts_aliases(source_file: Path) -> "dict[str, Path]":
     return {}
 
 
+_CS_NS_INDEX: "dict[str, list[str]]" = {}   # namespace → [rel_path, ...]
+_CS_NS_INDEX_READY = False
+
+
+def _build_cs_ns_index() -> None:
+    """Build a namespace→files index from already-cached C# blueprints.
+
+    Called at the end of _warm_cache() so all blueprints are populated first.
+    Uses the blueprint text (which already contains namespace declarations) so
+    no extra file reads are needed.
+    """
+    global _CS_NS_INDEX, _CS_NS_INDEX_READY
+    ns_re = re.compile(r'L\d+\s+namespace\s+([\w.]+)')
+    index: dict[str, list[str]] = {}
+    for path in _iter_source_files():
+        if path.suffix != '.cs':
+            continue
+        cached = _cache_get(path)
+        if cached is None:
+            continue
+        rel = str(path.relative_to(WORKSPACE_ROOT))
+        for line in cached.splitlines():
+            m = ns_re.match(line)
+            if m:
+                index.setdefault(m.group(1), []).append(rel)
+                break  # one namespace declaration per file
+    _CS_NS_INDEX = index
+    _CS_NS_INDEX_READY = True
+
+
 def _detect_root_namespace(suffix: str) -> str:
     """Infer the project's own root namespace/package by sampling source files."""
     if suffix in _NS_CACHE:
@@ -823,9 +908,14 @@ def _resolve_import(specifier: str, source_file: Path) -> tuple[str, str]:
         return ('external', specifier)
 
     if suffix in ('.cs', '.kt', '.kts', '.swift'):
-        # Namespace/module imports can't be resolved to specific files without
-        # knowing the project's root namespace. Flag as workspace if the specifier
-        # prefix matches any namespace declared in the workspace, else external.
+        if suffix == '.cs' and _CS_NS_INDEX_READY:
+            best: list[str] = []
+            for ns, ns_files in _CS_NS_INDEX.items():
+                if ns == specifier or specifier.startswith(ns + '.') or ns.startswith(specifier + '.'):
+                    best.extend(ns_files)
+            if best:
+                best.sort(key=lambda f: abs(len(f) - len(specifier)))
+                return ('workspace', best[0])
         root_ns = _detect_root_namespace(source_file.suffix)
         if root_ns and specifier.startswith(root_ns):
             return ('workspace', specifier)
@@ -1078,6 +1168,65 @@ def get_imports(file_path: str) -> str:
 
 
 @mcp.tool()
+def find_callers(symbol_name: str, max_results: int = 20) -> str:
+    """Find every call site and usage of a symbol across the workspace.
+
+    Unlike verify_symbol_existence (which searches only definition blueprints),
+    this searches raw source text to find where the symbol is called, passed,
+    or referenced in implementation code.
+
+    WHEN TO USE: after verify_symbol_existence tells you WHERE something is
+    defined, use find_callers to trace WHO calls it — for impact analysis,
+    understanding data flow, or finding all consumers of an interface.
+
+    Args:
+        symbol_name: exact identifier to search for (case-sensitive).
+        max_results: cap on results returned (default 20).
+    """
+    if not re.match(r'^\w+$', symbol_name):
+        return "Error: symbol_name must be a bare identifier (letters, digits, underscore)."
+
+    needle = symbol_name.encode('utf-8')
+    word_re = re.compile(rf'(?<!\w){re.escape(symbol_name)}(?!\w)')
+    files = _iter_source_files()
+    results: list[tuple[str, int, str]] = []
+    cutoff = max_results * 4
+
+    def _search_file(path: Path) -> list[tuple[str, int, str]]:
+        try:
+            raw = path.read_bytes()
+        except OSError:
+            return []
+        if needle not in raw:
+            return []
+        rel = str(path.relative_to(WORKSPACE_ROOT))
+        hits = []
+        for i, line in enumerate(raw.decode('utf-8', 'replace').splitlines(), 1):
+            if word_re.search(line):
+                hits.append((rel, i, line.strip()[:120]))
+        return hits
+
+    workers = min(8, os.cpu_count() or 4)
+    with ThreadPoolExecutor(max_workers=workers) as ex:
+        futs = {ex.submit(_search_file, p): p for p in files}
+        for fut in as_completed(futs):
+            results.extend(fut.result())
+            if len(results) >= cutoff:
+                break
+
+    if not results:
+        return f"No usages of '{symbol_name}' found in the workspace."
+
+    results = results[:max_results]
+    lines = [f"# Usages of '{symbol_name}'  ({len(results)} shown)\n"]
+    for rel, lineno, ctx in results:
+        lines.append(f"  {rel}:{lineno}  {ctx}")
+    if len(results) >= max_results:
+        lines.append(f"\n... capped at {max_results}; use a more specific name to narrow down")
+    return '\n'.join(lines)
+
+
+@mcp.tool()
 def execute_local_sandbox(language: str, code: str, timeout_seconds: int = 10) -> str:
     """Run a SHORT python or bash snippet locally and return its combined output.
     Intended for quick verification - run a test, check a value, list files,
@@ -1222,11 +1371,16 @@ def main() -> None:
     This is what the `mimir` command (declared in pyproject.toml under
     [project.scripts]) calls, and it's also what runs on `python mcp_optimized_mapper.py`.
     """
+    # Load persisted blueprints synchronously before the warm-up thread fires.
+    disk_loaded = _load_disk_cache()
+    total_files = len(_iter_source_files())
+
     # A short banner on stderr (NOT stdout - stdout is the JSON-RPC channel).
+    disk_status = f"disk_cache={disk_loaded}/{total_files} loaded" if _DISK_CACHE else "disk_cache=off"
     print(
         f"[mimir] root={WORKSPACE_ROOT} "
         f"tree_sitter={'on' if TREE_SITTER_OK else 'off (regex fallback)'} "
-        f"sandbox={'on' if SANDBOX_ENABLED else 'off'}",
+        f"sandbox={'on' if SANDBOX_ENABLED else 'off'}  {disk_status}",
         file=sys.stderr,
     )
     # Kick off parallel cache warm-up in the background so the first search is fast.
