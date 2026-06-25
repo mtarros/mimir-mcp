@@ -2,7 +2,7 @@
 # Mimir install script — macOS / Linux
 set -e
 
-REPO="git+https://github.com/yourusername/mimir-mcp.git"
+REPO="git+https://github.com/mtarros/mimir-mcp.git"
 
 # Install pipx if missing
 if ! command -v pipx &>/dev/null; then

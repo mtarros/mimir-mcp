@@ -11,18 +11,18 @@ Mimir is a local MCP server that gives Claude a set of tools to explore a codeba
 ### Option A — From GitHub (recommended for development)
 
 ```bash
-pipx install git+https://github.com/yourusername/mimir-mcp.git
+pipx install git+https://github.com/mtarros/mimir-mcp.git
 ```
 
 To update later:
 ```bash
-pipx install --force git+https://github.com/yourusername/mimir-mcp.git
+pipx install --force git+https://github.com/mtarros/mimir-mcp.git
 ```
 
 ### Option B — From a local clone
 
 ```bash
-git clone https://github.com/yourusername/mimir-mcp.git
+git clone https://github.com/mtarros/mimir-mcp.git
 cd mimir-mcp
 pipx install .
 ```

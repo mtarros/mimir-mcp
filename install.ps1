@@ -1,7 +1,7 @@
 # Mimir install script — Windows (PowerShell)
 $ErrorActionPreference = "Stop"
 
-$Repo = "git+https://github.com/yourusername/mimir-mcp.git"
+$Repo = "git+https://github.com/mtarros/mimir-mcp.git"
 
 # Install pipx if missing
 if (-not (Get-Command pipx -ErrorAction SilentlyContinue)) {
