@@ -1,0 +1,46 @@
+# pyproject.toml
+# -----------------------------------------------------------------------------
+# Packaging config for Mimir - a local MCP server that returns dense structural
+# blueprints of source files to cut LLM token usage.
+#
+# Install (creates the `mimir` command on your PATH and pulls dependencies):
+#
+#     pipx install .          # isolated, recommended for a CLI/server tool
+#       - or -
+#     pip install .           # into the current environment
+#       - or -
+#     pip install -e .        # editable install for development
+#
+# After installing, your MCP client config points at `mimir` instead of a
+# venv-python + absolute-script-path pair.
+#
+# Note on names:
+#   * Distribution name is `mimir-mcp` because the bare `mimir` name is already
+#     taken on PyPI (an abandoned 2008-2012 package). This only matters if you
+#     ever PUBLISH; for local `pip install .` the name is irrelevant.
+#   * The import module and the CLI command are both the clean `mimir`.
+#   * If you do plan to publish, verify `mimir-mcp` is still free first, e.g.
+#     `pip index versions mimir-mcp` or check https://pypi.org/project/mimir-mcp/
+# -----------------------------------------------------------------------------
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "mimir-mcp"
+version = "0.1.0"
+description = "Mimir: a lightweight local MCP server returning dense structural blueprints of source files to cut LLM token usage."
+requires-python = ">=3.10"
+dependencies = [
+    "fastmcp>=2.0",
+    "tree-sitter>=0.23",
+    "tree-sitter-language-pack>=1.0",
+]
+
+[project.scripts]
+mimir = "mimir:main"
+mimir-setup = "mimir:setup"
+
+[tool.setuptools]
+py-modules = ["mimir"]
