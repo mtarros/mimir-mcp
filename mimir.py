@@ -44,6 +44,7 @@ import subprocess
 import tempfile
 import time
 from collections import OrderedDict
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from typing import Iterable, Optional
 
@@ -79,6 +80,24 @@ BLACKLIST_DIRS = {
     "Pods", ".dart_tool", "target", "out", "coverage", ".cache",
 }
 
+def _load_mimirignore() -> list[str]:
+    """Read glob patterns from .mimirignore in the workspace root (gitignore-style)."""
+    p = WORKSPACE_ROOT / ".mimirignore"
+    if not p.exists():
+        return []
+    patterns = []
+    for line in p.read_text().splitlines():
+        line = line.strip()
+        if line and not line.startswith("#"):
+            patterns.append(line)
+    return patterns
+
+_MIMIRIGNORE_PATTERNS: list[str] = _load_mimirignore()
+
+# Filename suffixes that indicate machine-generated files — never useful to read or search.
+_GENERATED_SUFFIXES = (".g.cs", ".generated.cs", ".g.dart", ".pb.go", ".pb.swift")
+_GENERATED_NAMES = frozenset({"AssemblyInfo.cs"})
+
 # Map file extensions -> (tree-sitter language name, regex profile key).
 # The tree-sitter name is what tree_sitter_language_pack.get_parser() expects.
 EXT_LANG = {
@@ -103,6 +122,7 @@ EXT_LANG = {
     ".cc":   ("cpp",        "cstyle"),
     ".hpp":  ("cpp",        "cstyle"),
     ".m":    ("objc",       "cstyle"),
+    ".vue":  ("vue",        "cstyle"),
 }
 
 # A node is a "definition" if its type ends with one of these suffixes. This
@@ -120,6 +140,10 @@ DEF_EXCLUDE = frozenset({
     "format_specifier",    # f-string :<5 etc. match _specifier but are not defs
     "decorated_definition", # wrapper around def/class; inner node captured separately
     "variable_declarator",  # always inside lexical_declaration; parent gives const/let sig
+    "import_declaration",   # Java/C# using/import lines are not definitions
+    "using_directive",      # C# `using Foo.Bar;`
+    "import_specifier",     # JS/TS named import items: `import { Foo } from '...'`
+    "namespace_import",     # JS/TS `import * as foo from '...'`
 })
 # A few grammars (notably Ruby) name definitions with bare words. These are only
 # honored when the node is a *named* compound node, which excludes bare keyword
@@ -203,7 +227,7 @@ REGEX_PROFILES: dict[str, list[re.Pattern]] = {
 # OrderedDict gives us cheap FIFO eviction so memory stays bounded no matter how
 # big the repo is - this is part of the anti-heaviness contract.
 _CACHE: "OrderedDict[str, tuple[float, int, str]]" = OrderedDict()
-_CACHE_MAX = 2048
+_CACHE_MAX = 8192  # raised from 2048 — blueprints are ~2KB each so 8192 ≈ 16MB
 
 
 def _cache_get(path: Path) -> Optional[str]:
@@ -234,7 +258,13 @@ def _cache_put(path: Path, blueprint: str) -> None:
 # Path helpers / safety
 # --------------------------------------------------------------------------- #
 def _is_blacklisted(path: Path) -> bool:
-    return any(part in BLACKLIST_DIRS for part in path.parts)
+    if any(part in BLACKLIST_DIRS for part in path.parts):
+        return True
+    for pat in _MIMIRIGNORE_PATTERNS:
+        # Path.match supports ** for recursive matching
+        if path.match(pat):
+            return True
+    return False
 
 
 def _resolve_in_workspace(rel_path: str) -> Path:
@@ -247,14 +277,44 @@ def _resolve_in_workspace(rel_path: str) -> Path:
     return candidate
 
 
-def _iter_source_files() -> Iterable[Path]:
-    """Walk the workspace, pruning blacklisted dirs as early as possible."""
+_FILE_LIST: list[Path] = []
+_FILE_LIST_TS: float = 0.0
+_FILE_LIST_TTL: float = 30.0  # seconds between re-walks
+
+
+def _iter_source_files() -> list[Path]:
+    """Return the list of indexable source files, re-walking at most every 30 s."""
+    global _FILE_LIST, _FILE_LIST_TS
+    now = time.monotonic()
+    if _FILE_LIST and now - _FILE_LIST_TS < _FILE_LIST_TTL:
+        return _FILE_LIST
+    result: list[Path] = []
     for root, dirs, files in os.walk(WORKSPACE_ROOT):
-        # In-place prune so os.walk never even descends into junk dirs.
         dirs[:] = [d for d in dirs if d not in BLACKLIST_DIRS]
         for name in files:
-            if Path(name).suffix in EXT_LANG:
-                yield Path(root) / name
+            if Path(name).suffix not in EXT_LANG:
+                continue
+            if name in _GENERATED_NAMES or any(name.endswith(s) for s in _GENERATED_SUFFIXES):
+                continue
+            p = Path(root) / name
+            if not _is_blacklisted(p):
+                result.append(p)
+    _FILE_LIST = result
+    _FILE_LIST_TS = now
+    # Auto-scale cache so it always fits the whole workspace — prevents thrashing.
+    global _CACHE_MAX
+    if len(result) > _CACHE_MAX:
+        _CACHE_MAX = len(result) + 256
+    return result
+
+
+def _warm_cache() -> None:
+    """Parse all source files in parallel so the first search is fast."""
+    files = _iter_source_files()
+    workers = min(8, os.cpu_count() or 4)
+    with ThreadPoolExecutor(max_workers=workers) as ex:
+        for _ in as_completed(ex.submit(_build_blueprint, p) for p in files):
+            pass
 
 
 # --------------------------------------------------------------------------- #
@@ -407,10 +467,35 @@ def _build_blueprint(path: Path) -> str:
     except OSError as e:
         return f"Error: cannot read '{rel}' ({e.strerror})."
 
+    # Skip minified files: if average line length > 500 bytes the file is almost
+    # certainly a bundled/minified artifact — parsing it produces a useless
+    # single-line blob and pollutes search results.
+    if size > 1000:
+        newlines = raw.count(b"\n") or 1
+        if size / newlines > 500:
+            blueprint = f"# {rel}  [skipped: minified/bundled file]"
+            _cache_put(path, blueprint)
+            return blueprint
+
+    # Vue SFCs store script content as opaque raw_text in the Vue AST.
+    # Extract the <script> block and reparse it as TypeScript so the normal
+    # AST walker finds real definitions.
+    parse_raw, parse_lang = raw, ts_lang
+    if suffix == ".vue":
+        m = re.search(
+            rb'<script(?:\s[^>]*)?>[ \t]*\n?(.*?)</script>',
+            raw, re.DOTALL | re.IGNORECASE,
+        )
+        if m:
+            parse_raw = m.group(1)
+            parse_lang = "typescript"
+        else:
+            parse_lang = None  # no <script> block — fall through to regex
+
     engine = "regex"
     body: Optional[str] = None
-    if ts_lang:
-        body = _extract_tree_sitter(path, raw, ts_lang)
+    if parse_lang:
+        body = _extract_tree_sitter(path, parse_raw, parse_lang)
         if body is not None:
             engine = "tree-sitter"
     if body is None:
@@ -428,18 +513,24 @@ def _build_blueprint(path: Path) -> str:
 
 def _symbol_hits(name: str, max_results: int = 25) -> list[tuple[str, str, str]]:
     """Search blueprints for definitions of *name*. Returns (rel_path, line_no, sig) tuples."""
-    needle = name.encode("utf-8")
     word_def = re.compile(rf"(?<![\w]){re.escape(name)}(?![\w])")
     hits: list[tuple[str, str, str]] = []
     for path in _iter_source_files():
         if len(hits) >= max_results:
             break
-        try:
-            if needle not in path.read_bytes():
+        # Use cached blueprint for needle check — avoids re-reading disk on warm calls.
+        cached = _cache_get(path)
+        if cached is not None:
+            if name not in cached:
                 continue
-        except OSError:
-            continue
-        blueprint = _build_blueprint(path)
+            blueprint = cached
+        else:
+            try:
+                if name.encode() not in path.read_bytes():
+                    continue
+            except OSError:
+                continue
+            blueprint = _build_blueprint(path)
         rel = str(path.relative_to(WORKSPACE_ROOT))
         for bl in blueprint.splitlines():
             if bl.startswith("#") or not word_def.search(bl):
@@ -449,6 +540,42 @@ def _symbol_hits(name: str, max_results: int = 25) -> list[tuple[str, str, str]]
                 hits.append((rel, m.group(1), m.group(2).strip()))
                 if len(hits) >= max_results:
                     break
+    return hits
+
+
+def _symbol_hits_multi(
+    names: list[str], max_per_kw: int = 10
+) -> dict[str, list[tuple[str, str, str]]]:
+    """Single-pass multi-keyword search — faster than calling _symbol_hits N times.
+
+    Returns {keyword: [(rel_path, line_no, sig), ...]} for all keywords in one
+    walk through the blueprint cache.
+    """
+    patterns = {n: re.compile(rf"(?<![\w]){re.escape(n)}(?![\w])") for n in names}
+    hits: dict[str, list[tuple[str, str, str]]] = {n: [] for n in names}
+    saturated: set[str] = set()
+
+    for path in _iter_source_files():
+        if len(saturated) == len(names):
+            break
+        cached = _cache_get(path)
+        blueprint = cached if cached is not None else _build_blueprint(path)
+        rel = str(path.relative_to(WORKSPACE_ROOT))
+
+        for name in names:
+            if name in saturated or name not in blueprint:
+                continue
+            pat = patterns[name]
+            for bl in blueprint.splitlines():
+                if bl.startswith("#") or not pat.search(bl):
+                    continue
+                m = re.match(r"L(\d+)\s*(.*)", bl.strip())
+                if m:
+                    hits[name].append((rel, m.group(1), m.group(2).strip()))
+                    if len(hits[name]) >= max_per_kw:
+                        saturated.add(name)
+                        break
+
     return hits
 
 
@@ -562,6 +689,35 @@ def _parse_import_entries(path: Path, text: str) -> list[tuple[str, str]]:
 
 
 _NS_CACHE: dict[str, str] = {}  # suffix → detected root namespace
+_TS_ALIAS_CACHE: "dict[str, dict[str, Path]]" = {}  # tsconfig path → {alias_prefix → base_dir}
+
+
+def _find_ts_aliases(source_file: Path) -> "dict[str, Path]":
+    """Walk up from source_file looking for tsconfig.json with compilerOptions.paths."""
+    import json as _json
+    for parent in (source_file.parent, *source_file.parents):
+        cfg = parent / "tsconfig.json"
+        key = str(cfg)
+        if key in _TS_ALIAS_CACHE:
+            return _TS_ALIAS_CACHE[key]
+        if cfg.is_file():
+            try:
+                data = _json.loads(cfg.read_text(encoding="utf-8", errors="replace"))
+                paths = data.get("compilerOptions", {}).get("paths", {})
+                result: dict[str, Path] = {}
+                for alias, targets in paths.items():
+                    if alias.endswith("/*") and targets:
+                        prefix = alias[:-1]          # "@/*" → "@/"
+                        target = targets[0].rstrip("/*").rstrip("/") or "."
+                        result[prefix] = (parent / target).resolve()
+                _TS_ALIAS_CACHE[key] = result
+                return result
+            except Exception:
+                _TS_ALIAS_CACHE[key] = {}
+                return {}
+        if parent == WORKSPACE_ROOT or parent == parent.parent:
+            break
+    return {}
 
 
 def _detect_root_namespace(suffix: str) -> str:
@@ -621,20 +777,29 @@ def _resolve_import(specifier: str, source_file: Path) -> tuple[str, str]:
                         pass
             return ('unresolved', specifier)
 
-        if specifier.startswith('@/'):
-            rel = specifier[2:]
-            base = WORKSPACE_ROOT / rel
-            candidates = [
-                base,
-                *[Path(str(base) + ext) for ext in ('.ts', '.tsx', '.js', '.jsx')],
-                *[base / f'index{ext}' for ext in ('.ts', '.tsx', '.js', '.jsx')],
-            ]
-            for c in candidates:
-                if c.is_file():
-                    try:
-                        return ('workspace', str(c.relative_to(WORKSPACE_ROOT)))
-                    except ValueError:
-                        pass
+        if specifier.startswith('@/') or any(specifier.startswith(p) for p in _find_ts_aliases(source_file)):
+            # Try each alias defined in the nearest tsconfig.json paths config
+            aliases = _find_ts_aliases(source_file)
+            bases_to_try: list[Path] = []
+            for prefix, base_dir in aliases.items():
+                if specifier.startswith(prefix):
+                    bases_to_try.append(base_dir / specifier[len(prefix):])
+            # Fallback: @/ relative to workspace root
+            if specifier.startswith('@/') and not bases_to_try:
+                bases_to_try.append(WORKSPACE_ROOT / specifier[2:])
+            for base in bases_to_try:
+                candidates = [
+                    base,
+                    *[Path(str(base) + ext) for ext in ('.ts', '.tsx', '.js', '.jsx', '.mjs')],
+                    *[base / f'index{ext}' for ext in ('.ts', '.tsx', '.js', '.jsx')],
+                ]
+                for c in candidates:
+                    if c.is_file():
+                        try:
+                            return ('workspace', str(c.relative_to(WORKSPACE_ROOT)))
+                        except ValueError:
+                            pass
+            rel = specifier[2:] if specifier.startswith('@/') else specifier
             return ('unresolved', rel)
 
         return ('external', specifier)
@@ -782,16 +947,14 @@ def scope_task(task: str, max_files: int = 5) -> str:
         r'(?:export\s+)?(?:const|let|var)\s+\w+\s*[=(]'
     )
 
-    for kw in keywords:
-        if not re.match(r"^\w[\w]*$", kw):
-            continue
-        try:
-            hits = _symbol_hits(kw, max_results=10)
-        except Exception:
-            continue
-        for rel, line, sig in hits:
+    valid_kws = [kw for kw in keywords if re.match(r"^\w[\w]*$", kw)]
+    try:
+        multi_hits = _symbol_hits_multi(valid_kws, max_per_kw=10)
+    except Exception:
+        multi_hits = {}
+    for kw in valid_kws:
+        for rel, line, sig in multi_hits.get(kw, []):
             all_hits.append((kw, rel, line, sig))
-            # Definition hits outrank usage hits so the source file surfaces first
             weight = 3 if _def_line_pat.search(sig) else 1
             file_hit_count[rel] = file_hit_count.get(rel, 0) + weight
 
@@ -1066,6 +1229,9 @@ def main() -> None:
         f"sandbox={'on' if SANDBOX_ENABLED else 'off'}",
         file=sys.stderr,
     )
+    # Kick off parallel cache warm-up in the background so the first search is fast.
+    import threading
+    threading.Thread(target=_warm_cache, daemon=True, name="mimir-warmup").start()
     mcp.run()  # defaults to stdio transport
 
 
