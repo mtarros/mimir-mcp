@@ -8,7 +8,21 @@ Mimir is a local MCP server that gives Claude a set of tools to explore a codeba
 
 ## Installation
 
-### Option A — From GitHub (recommended for development)
+### Option A — Automated install (recommended)
+
+**macOS / Linux:**
+```bash
+curl -fsSL https://raw.githubusercontent.com/mtarros/mimir-mcp/main/install.sh | bash
+```
+
+**Windows (PowerShell):**
+```powershell
+irm https://raw.githubusercontent.com/mtarros/mimir-mcp/main/install.ps1 | iex
+```
+
+The script installs pipx if needed, then installs mimir. To update, run it again.
+
+### Option B — Manual install
 
 ```bash
 pipx install git+https://github.com/mtarros/mimir-mcp.git
@@ -19,20 +33,29 @@ To update later:
 pipx install --force git+https://github.com/mtarros/mimir-mcp.git
 ```
 
-### Option B — From a local clone
+### Option C — Local development clone
 
 ```bash
 git clone https://github.com/mtarros/mimir-mcp.git
 cd mimir-mcp
-pipx install .
-```
-
-For development (changes take effect immediately, no reinstall):
-```bash
 pipx install -e .
 ```
 
-> **Requires:** Python 3.9+ and [pipx](https://pipx.pypa.io). Install pipx with `pip install pipx` if you don't have it.
+Changes to `mimir.py` take effect immediately without reinstalling.
+
+> **Requires:** Python 3.10+ and [pipx](https://pipx.pypa.io). Install pipx with `pip install pipx` if you don't have it.
+
+### After installing — set up a project
+
+Run this once in the root of any project you want to use mimir with:
+
+```bash
+mimir-setup
+```
+
+This drops both config files automatically:
+- `.mcp.json` — for Claude Code
+- `.vscode/mcp.json` — for GitHub Copilot in VS Code
 
 ---
 
