@@ -1000,8 +1000,11 @@ def _build_symbol_index() -> None:
     if _DISK_CACHE is None:
         return
     try:
-        count = _DISK_CACHE.execute("SELECT COUNT(*) FROM symbols").fetchone()[0]
-        if count > 0:
+        indexed = _DISK_CACHE.execute(
+            "SELECT COUNT(DISTINCT file) FROM symbols"
+        ).fetchone()[0]
+        total = len(_iter_source_files())
+        if indexed > 0 and indexed >= total:
             _FTS_READY = True
             return
     except Exception:
@@ -1749,17 +1752,71 @@ def setup() -> None:
     print("\nDone. Restart Claude Code or reload VS Code to pick up the config.")
 
 
-def main() -> None:
-    """Console-script / module entry point. Starts the stdio MCP server.
+_CLI_HELP = """\
+mimir — structural code index for Claude Code and GitHub Copilot
 
-    This is what the `mimir` command (declared in pyproject.toml under
-    [project.scripts]) calls, and it's also what runs on `python mcp_optimized_mapper.py`.
+Usage:
+  mimir                          Start the MCP server (stdio transport)
+  mimir scope  "<task>"          Find files relevant to a task description
+  mimir find   <SymbolName>      Locate a symbol's definition across the workspace
+  mimir callers <SymbolName>     Find every call site and usage of a symbol
+  mimir status                   Show index state, file count, and ignore patterns
+
+Examples:
+  mimir scope "change how jobs are retried on failure"
+  mimir find   JobScheduler
+  mimir callers authenticate
+  mimir status
+
+When run without arguments, mimir starts as an MCP server on stdio and is
+controlled by your AI client (Claude Code, GitHub Copilot). Run with a
+subcommand to query the index directly from your terminal.
+"""
+
+
+def _cli_run(subcommand: str, arg: str) -> None:
+    """Run a single tool query, print the result, and exit."""
+    _load_disk_cache()
+    _warm_cache()   # synchronous — small wait for full accuracy on first run
+
+    if subcommand == "scope":
+        print(scope_task(arg))
+    elif subcommand == "find":
+        print(verify_symbol_existence(arg))
+    elif subcommand == "callers":
+        print(find_callers(arg))
+    elif subcommand == "status":
+        print(get_status())
+    else:
+        print(f"Unknown subcommand '{subcommand}'. Run `mimir` with no arguments for help.")
+        sys.exit(1)
+
+
+def main() -> None:
+    """Console-script / module entry point.
+
+    Without arguments: starts the MCP stdio server (used by AI clients).
+    With a subcommand:  runs a single query and prints the result.
     """
-    # Load persisted blueprints synchronously before the warm-up thread fires.
+    args = sys.argv[1:]
+
+    if args and args[0] in ("scope", "find", "callers", "status"):
+        subcommand = args[0]
+        arg = " ".join(args[1:]) if len(args) > 1 else ""
+        if subcommand != "status" and not arg:
+            print(f"Usage: mimir {subcommand} <{'task description' if subcommand == 'scope' else 'SymbolName'}>")
+            sys.exit(1)
+        _cli_run(subcommand, arg)
+        return
+
+    if args and args[0] in ("-h", "--help", "help"):
+        print(_CLI_HELP)
+        return
+
+    # No subcommand — start as MCP server
     disk_loaded = _load_disk_cache()
     total_files = len(_iter_source_files())
 
-    # A short banner on stderr (NOT stdout - stdout is the JSON-RPC channel).
     disk_status = f"disk_cache={disk_loaded}/{total_files} loaded" if _DISK_CACHE else "disk_cache=off"
     fts_status = f"symbol_index={'warm' if _FTS_READY else 'building'}"
     print(
@@ -1768,10 +1825,9 @@ def main() -> None:
         f"sandbox={'on' if SANDBOX_ENABLED else 'off'}  {disk_status}  {fts_status}",
         file=sys.stderr,
     )
-    # Kick off parallel cache warm-up in the background so the first search is fast.
     import threading
     threading.Thread(target=_warm_cache, daemon=True, name="mimir-warmup").start()
-    mcp.run()  # defaults to stdio transport
+    mcp.run()
 
 
 if __name__ == "__main__":

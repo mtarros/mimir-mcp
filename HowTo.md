@@ -50,39 +50,44 @@ Changes to `mimir.py` take effect immediately without reinstalling.
 Run this once in the root of any project you want to use mimir with:
 
 ```bash
+cd /path/to/your-project
 mimir-setup
 ```
 
-This drops both config files automatically:
-- `.mcp.json` — for Claude Code
-- `.vscode/mcp.json` — for GitHub Copilot in VS Code
+This creates three files:
+
+| File | Purpose |
+|---|---|
+| `.mcp.json` | Registers mimir with Claude Code |
+| `.vscode/mcp.json` | Registers mimir with GitHub Copilot in VS Code |
+| `CLAUDE.md` | Tells Claude when and how to use each tool consistently |
+
+That's it. Restart Claude Code (or reload VS Code) and mimir is active.
+
+The command is safe to re-run — it skips any file that already exists, and only appends to `CLAUDE.md` if the mimir section isn't already there.
 
 ---
 
-## Connecting to Claude Code
+## Using mimir from the command line
 
-Drop a `.mcp.json` file in the root of each project you want to use mimir with:
+You don't need an AI client to query the index. Run these directly in your terminal from inside any project that has mimir set up:
 
-```json
-{
-  "mcpServers": {
-    "mimir": {
-      "command": "mimir",
-      "env": {
-        "MCP_WORKSPACE_ROOT": "."
-      }
-    }
-  }
-}
+```bash
+mimir scope "change how jobs are retried on failure"   # find relevant files
+mimir find   JobScheduler                              # locate a symbol definition
+mimir callers authenticate                             # find every call site
+mimir status                                           # check index state + exclusions
 ```
 
-Claude Code picks this up automatically when you open that folder. The `"."` resolves to the project root so you never need to change it per-machine.
+These are the same tools Claude uses — you can explore a codebase, verify a symbol exists, or trace call chains without opening a chat session.
 
-### Making Claude always use mimir (CLAUDE.md)
+---
 
-Claude Code reads a `CLAUDE.md` file in the project root as persistent instructions for every session. Without it, Claude may use mimir when it judges the task warrants it, but won't consistently call `scope_task` before reading files or `get_status` on first connection.
+## How Claude knows to use mimir
 
-Add this section to your project's `CLAUDE.md` (create the file if it doesn't exist):
+`mimir-setup` writes a `CLAUDE.md` section that instructs Claude to call `get_status` first and `scope_task` before reading files. Without it, Claude uses mimir when it judges the task warrants it but won't follow the workflow consistently.
+
+The section looks like this (you can edit it to suit your project):
 
 ```markdown
 ## Code exploration — use mimir tools
@@ -102,15 +107,32 @@ For any task involving existing code:
 - Use `get_imports` when an unfamiliar symbol appears and you need to trace its origin
 ```
 
-This tells Claude exactly when and how to use each tool, so it doesn't have to infer it from the tool descriptions alone.
+---
+
+## Connecting to Claude Code (manual setup)
+
+`mimir-setup` handles this automatically. If you prefer to configure manually, drop a `.mcp.json` file in the project root:
+
+```json
+{
+  "mcpServers": {
+    "mimir": {
+      "command": "mimir",
+      "env": {
+        "MCP_WORKSPACE_ROOT": "."
+      }
+    }
+  }
+}
+```
+
+Claude Code picks this up automatically when you open that folder. The `"."` resolves to the project root so you never need to change it per-machine.
 
 ---
 
-## Connecting to GitHub Copilot (VS Code)
+## Connecting to GitHub Copilot (VS Code) (manual setup)
 
-Requires VS Code 1.99+ and a Copilot Individual, Business, or Enterprise plan. Tools are available in Copilot Chat agent mode only — not in inline completions.
-
-Drop a `.vscode/mcp.json` file in the project root:
+`mimir-setup` handles this automatically. If you prefer to configure manually, or need to understand what it created, drop a `.vscode/mcp.json` file in the project root:
 
 ```json
 {
