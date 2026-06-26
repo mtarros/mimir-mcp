@@ -939,17 +939,26 @@ def _build_cs_ns_index() -> None:
 
 
 def _extract_blueprint_lines(rel: str, blueprint: str) -> list[tuple[str, str, str]]:
-    """Extract (file, lineno, context) rows for the lines table from a blueprint."""
+    """Extract (file, lineno, context) rows for the lines table from a blueprint.
+
+    Deduplicates by lineno, keeping the first occurrence (the outermost/most
+    descriptive node when tree-sitter emits multiple nodes at the same line).
+    """
     rows = []
+    seen: set[str] = set()
     for line in blueprint.splitlines():
         if not line or line.startswith('#'):
             continue
         m = re.match(r'L(\d+)\s*(.*)', line.strip())
         if not m:
             continue
+        lineno = m.group(1)
+        if lineno in seen:
+            continue
+        seen.add(lineno)
         context = m.group(2).strip()
         if context:
-            rows.append((rel, m.group(1), context))
+            rows.append((rel, lineno, context))
     return rows
 
 

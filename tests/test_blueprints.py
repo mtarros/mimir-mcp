@@ -58,6 +58,23 @@ class TestBlueprintHeader:
         assert "cs" in header
         assert "lines]" in header
 
+    def test_cs_array_params_no_duplicate_line_numbers(self):
+        # Regression: tree-sitter used to emit the same line number twice for
+        # C# methods with array parameters (once for the method declaration node
+        # and again for the inner array-type node), causing UNIQUE constraint
+        # failures when writing to the symbol index.
+        content = (
+            "public class DocumentationService {\n"
+            "    public static void Write(string content, string[] args) {}\n"
+            "    public static string Read(byte[] data, int[] offsets) { return \"\"; }\n"
+            "}\n"
+        )
+        bp = self._blueprint_for(content, suffix=".cs")
+        l_lines = [l for l in bp.splitlines() if l.startswith("L")]
+        line_numbers = [l.split()[0] for l in l_lines]
+        duplicates = [ln for ln in set(line_numbers) if line_numbers.count(ln) > 1]
+        assert duplicates == [], f"Duplicate line numbers in C# blueprint: {duplicates}"
+
 
 # ---------------------------------------------------------------------------
 # get_directory_structure

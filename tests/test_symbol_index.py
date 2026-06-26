@@ -105,6 +105,23 @@ class TestExtractBlueprintLines:
         rows = mimir._extract_blueprint_lines(CS_REL, SAMPLE_CS)
         assert all(r[1].isdigit() for r in rows)
 
+    def test_no_duplicate_file_lineno_pairs(self):
+        # Regression: tree-sitter extraction previously emitted duplicate line
+        # numbers for C# methods with array parameters, causing UNIQUE constraint
+        # failures in the symbol index. This ensures extraction always yields
+        # unique (file, lineno) pairs so INSERT OR IGNORE can serve as safety net.
+        bp_with_dups = (
+            "# src/Svc.cs  [cs · tree-sitter]\n"
+            "L5    public class Svc\n"
+            "L10     public void Write(string content, string[] args)\n"
+            "L10       []\n"   # simulates old broken extraction output
+            "L15     public string Read(byte[] data)\n"
+            "L15       []\n"
+        )
+        rows = mimir._extract_blueprint_lines("src/Svc.cs", bp_with_dups)
+        keys = [(r[0], r[1]) for r in rows]
+        assert len(keys) == len(set(keys)), "Duplicate (file, lineno) pairs in output"
+
 
 # ---------------------------------------------------------------------------
 # _index_blueprint_rows  (stopwords + normalization)
