@@ -128,6 +128,11 @@ _SYMBOL_STOPWORDS = frozenset({
 })
 
 
+# Increment when the blueprint text format changes so cached blueprints are
+# automatically invalidated and re-parsed on the next server start.
+BLUEPRINT_VERSION = "2"
+
+
 def _init_disk_cache() -> "Optional[object]":
     """Open (or create) a per-workspace SQLite blueprint cache in ~/.cache/mimir/."""
     try:
@@ -164,6 +169,21 @@ def _init_disk_cache() -> "Optional[object]":
         db.execute(
             "CREATE INDEX IF NOT EXISTS idx_symbols_token ON symbols (token)"
         )
+        db.execute(
+            "CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT)"
+        )
+        # Invalidate all cached blueprints when the format version changes.
+        stored = db.execute(
+            "SELECT value FROM meta WHERE key='blueprint_version'"
+        ).fetchone()
+        if stored is None or stored[0] != BLUEPRINT_VERSION:
+            db.execute("DELETE FROM blueprints")
+            db.execute("DELETE FROM lines")
+            db.execute("DELETE FROM symbols")
+            db.execute(
+                "INSERT OR REPLACE INTO meta VALUES ('blueprint_version', ?)",
+                (BLUEPRINT_VERSION,)
+            )
         db.commit()
         return db
     except Exception:
@@ -631,7 +651,8 @@ def _build_blueprint(path: Path) -> str:
     if body is None:
         body = _extract_regex(raw.decode("utf-8", "replace"), profile)
 
-    header = f"# {rel}  [{suffix.lstrip('.') or '?'} · {engine}]"
+    line_count = raw.count(b"\n") + 1
+    header = f"# {rel}  [{suffix.lstrip('.') or '?'} · {engine} · {line_count} lines]"
     blueprint = header + "\n" + (body if body.strip() else "  (no top-level symbols found)")
     _cache_put(path, blueprint)
     return blueprint
@@ -1410,6 +1431,63 @@ def find_callers(symbol_name: str, max_results: int = 20) -> str:
     if len(results) >= max_results:
         lines.append(f"\n... capped at {max_results}; use a more specific name to narrow down")
     return '\n'.join(lines)
+
+
+@mcp.tool()
+def get_directory_structure(dir_path: str, max_files: int = 10) -> str:
+    """Get structural blueprints for every source file under a directory.
+
+    Use this to understand a module, layer, or namespace at a glance — before
+    diving into individual files. Good for orientation when scope_task points
+    you at a file and you want to see what else lives alongside it.
+
+    WHEN TO USE: when you know WHERE to look but not WHICH file — e.g.
+    "show me all the controllers", "what services are in this layer?".
+    For finding code by what it DOES, use scope_task instead.
+
+    Args:
+        dir_path: path relative to workspace root, e.g. "src/api/controllers".
+        max_files: cap on blueprints returned (default 10). Increase if the
+                   directory is large, or narrow the path to a subdirectory.
+    """
+    try:
+        target = (WORKSPACE_ROOT / dir_path).resolve()
+        target.relative_to(WORKSPACE_ROOT)   # safety: must stay inside workspace
+    except ValueError:
+        return f"Error: '{dir_path}' resolves outside the workspace root."
+    except Exception as e:
+        return f"Error: invalid path '{dir_path}': {e}."
+
+    if not target.exists():
+        return f"Not found: '{dir_path}' does not exist in the workspace."
+    if not target.is_dir():
+        return f"'{dir_path}' is a file, not a directory — use get_file_structure instead."
+
+    target_str = str(target) + os.sep
+    matches = sorted(
+        (p for p in _iter_source_files() if str(p).startswith(target_str)),
+        key=lambda p: str(p),
+    )
+    total = len(matches)
+    if not matches:
+        return f"No source files found under '{dir_path}'."
+
+    shown = matches[:max_files]
+    parts = [f"# {dir_path}  ({total} source file{'s' if total != 1 else ''}"
+             f"{', showing first ' + str(len(shown)) if total > max_files else ''})\n"]
+    for path in shown:
+        try:
+            parts.append(_build_blueprint(path))
+            parts.append("")
+        except Exception:
+            pass
+
+    if total > max_files:
+        parts.append(
+            f"... {total - max_files} more file{'s' if total - max_files != 1 else ''} not shown."
+            f" Increase max_files or narrow dir_path to a subdirectory."
+        )
+    return "\n".join(parts)
 
 
 @mcp.tool()

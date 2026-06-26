@@ -180,7 +180,20 @@ Works for: TypeScript, JavaScript, Python, Kotlin, Swift, C#, Go, Rust.
 
 ---
 
-### 4. `verify_symbol_existence` — confirm a symbol is real
+### 4. `get_directory_structure` — browse a module
+
+Returns structural blueprints for every source file under a directory. Use this when you know *where* to look but not *which* file — for example to see all controllers in a layer, or to understand what a namespace contains.
+
+**Example:**
+> `get_directory_structure("src/api/controllers", max_files=10)`
+
+Returns: one blueprint per file in that directory, with a file count summary.
+
+Use `scope_task` when you don't know where to look. Use `get_directory_structure` when you already know the directory and want to see everything in it.
+
+---
+
+### 5. `verify_symbol_existence` — confirm a symbol is real
 
 Searches the entire workspace for a symbol definition and returns its exact location and signature.
 
@@ -191,7 +204,18 @@ Use this before assuming a function or type exists, before importing it, or when
 
 ---
 
-### 5. `execute_local_sandbox` — run a quick snippet
+### 6. `find_callers` — trace who calls a symbol
+
+Searches raw source text across the entire workspace for every call site and usage of a symbol. Unlike `verify_symbol_existence` (which only finds definitions), this finds where a symbol is called, passed, or referenced in implementation code.
+
+**Example:**
+> `find_callers("AuthenticationService", max_results=20)`
+
+WHEN TO USE: after `verify_symbol_existence` tells you where something is defined, use `find_callers` to trace who calls it — for impact analysis, understanding data flow, or finding all consumers of an interface.
+
+---
+
+### 7. `execute_local_sandbox` — run a quick snippet
 
 Runs a Python or bash snippet locally with a timeout, captures output, and returns it.
 
@@ -252,7 +276,7 @@ pip install pytest
 pytest tests/ -v
 ```
 
-Expected output: **33 passed** in under 1 second.
+Expected output: **49 passed** in under 1 second.
 
 ### Run only the performance benchmarks
 
@@ -266,6 +290,9 @@ This prints SQL vs linear-scan timing and speedup numbers.
 
 | Class | What it tests |
 |---|---|
+| `TestBlueprintHeader` | Line count appears in blueprint header; accurate for Python and C# |
+| `TestGetDirectoryStructure` | Returns correct files; respects max_files; rejects paths outside workspace |
+| `TestBlueprintVersion` | Stale cache is cleared on version mismatch; valid cache is preserved |
 | `TestExtractBlueprintLines` | Blueprint lines parsed into `(file, lineno, context)` correctly |
 | `TestIndexBlueprintRows` | Stopwords excluded; symbol names indexed; no context in rows |
 | `TestNormalizedSchema` | `lines` holds context; `symbols` holds only tokens; no duplication |
