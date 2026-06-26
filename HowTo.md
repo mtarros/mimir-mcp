@@ -226,6 +226,54 @@ Following this order means Claude reads raw file contents as little as possible,
 
 ---
 
+## Running the tests
+
+The test suite lives in `tests/` and covers the symbol index: stopword filtering, normalized schema correctness, SQL vs linear-scan equivalence, and performance benchmarks.
+
+### Prerequisites
+
+Requires the mimir development install (Option C) and pytest:
+
+```bash
+# Install pytest into the mimir venv
+/Users/mtarros/.local/pipx/venvs/mimir-mcp/bin/python3 -m pip install pytest
+```
+
+Or if you installed with `pip install -e .` into an active virtualenv:
+
+```bash
+pip install pytest
+```
+
+### Run all tests
+
+```bash
+# From the mimir-mcp project root
+pytest tests/ -v
+```
+
+Expected output: **33 passed** in under 1 second.
+
+### Run only the performance benchmarks
+
+```bash
+pytest tests/ -v -k Performance -s
+```
+
+This prints SQL vs linear-scan timing and speedup numbers.
+
+### What the tests cover
+
+| Class | What it tests |
+|---|---|
+| `TestExtractBlueprintLines` | Blueprint lines parsed into `(file, lineno, context)` correctly |
+| `TestIndexBlueprintRows` | Stopwords excluded; symbol names indexed; no context in rows |
+| `TestNormalizedSchema` | `lines` holds context; `symbols` holds only tokens; no duplication |
+| `TestSearchCorrectness` | SQL JOIN results match linear-scan results for 7 symbol types |
+| `TestPerformance` | SQL lookup is <1ms and ≥10× faster than scanning blueprints |
+
+---
+
 ## Supported languages
 
 | Language | Blueprints | Imports |
