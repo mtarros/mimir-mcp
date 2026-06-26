@@ -78,6 +78,32 @@ Drop a `.mcp.json` file in the root of each project you want to use mimir with:
 
 Claude Code picks this up automatically when you open that folder. The `"."` resolves to the project root so you never need to change it per-machine.
 
+### Making Claude always use mimir (CLAUDE.md)
+
+Claude Code reads a `CLAUDE.md` file in the project root as persistent instructions for every session. Without it, Claude may use mimir when it judges the task warrants it, but won't consistently call `scope_task` before reading files or `get_status` on first connection.
+
+Add this section to your project's `CLAUDE.md` (create the file if it doesn't exist):
+
+```markdown
+## Code exploration — use mimir tools
+
+This project has mimir MCP tools available. Use them before reading raw files.
+
+At the start of any coding session:
+1. Call `get_status` to check the index is ready and see any active exclusions
+2. Call `scope_task("describe what you want to do")` to find relevant files
+
+For any task involving existing code:
+- Use `scope_task` before opening files — it finds the right files in one call
+- Use `get_file_structure` to see a file's symbol map before reading it line by line
+- Use `verify_symbol_existence` before assuming a function or type exists
+- Use `find_callers` after `verify_symbol_existence` to trace impact — who calls this?
+- Use `get_directory_structure` when you know the directory but not which file
+- Use `get_imports` when an unfamiliar symbol appears and you need to trace its origin
+```
+
+This tells Claude exactly when and how to use each tool, so it doesn't have to infer it from the tool descriptions alone.
+
 ---
 
 ## Connecting to GitHub Copilot (VS Code)
@@ -103,6 +129,8 @@ Drop a `.vscode/mcp.json` file in the project root:
 `${workspaceFolder}` is a VS Code variable that resolves to the project root automatically.
 
 To use the tools in Copilot Chat, open the chat panel, switch to agent mode, and the mimir tools will be available alongside the built-in Copilot tools.
+
+> **Note:** Copilot only uses MCP tools in agent mode — not in regular chat or inline completions. You may need to prompt it explicitly ("use mimir to find where X is defined") since Copilot doesn't read `CLAUDE.md`. There is no equivalent persistent instruction file for Copilot today.
 
 ### Both on the same project
 

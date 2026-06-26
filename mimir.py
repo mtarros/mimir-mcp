@@ -1722,6 +1722,30 @@ def setup() -> None:
         }, indent=2) + "\n")
         print(f"created  {copilot_cfg}")
 
+    claude_md = cwd / "CLAUDE.md"
+    mimir_marker = "## Code exploration — use mimir tools"
+    if claude_md.exists() and mimir_marker in claude_md.read_text(encoding="utf-8"):
+        print(f"skipped  {claude_md}  (mimir section already present)")
+    else:
+        snippet = (
+            f"\n{mimir_marker}\n\n"
+            "This project has mimir MCP tools available. Use them before reading raw files.\n\n"
+            "At the start of any coding session:\n"
+            "1. Call `get_status` to check the index is ready and see any active exclusions\n"
+            "2. Call `scope_task(\"describe what you want to do\")` to find relevant files\n\n"
+            "For any task involving existing code:\n"
+            "- Use `scope_task` before opening files — it finds the right files in one call\n"
+            "- Use `get_file_structure` to see a file's symbol map before reading it line by line\n"
+            "- Use `verify_symbol_existence` before assuming a function or type exists\n"
+            "- Use `find_callers` after `verify_symbol_existence` to trace impact\n"
+            "- Use `get_directory_structure` when you know the directory but not which file\n"
+            "- Use `get_imports` when an unfamiliar symbol appears and you need to trace its origin\n"
+        )
+        with open(claude_md, "a", encoding="utf-8") as f:
+            f.write(snippet)
+        action = "updated" if claude_md.exists() else "created"
+        print(f"{action}  {claude_md}  (mimir section appended)")
+
     print("\nDone. Restart Claude Code or reload VS Code to pick up the config.")
 
 
