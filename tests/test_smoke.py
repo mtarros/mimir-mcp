@@ -92,7 +92,7 @@ def workspace(tmp_path):
 
 class TestToolRegistration:
     async def test_all_tools_listed(self, workspace):
-        """Seven tools must be registered — any missing tool fails silently in production."""
+        """Eight tools must be registered — any missing tool fails silently in production."""
         async with Client(_make_transport(workspace)) as client:
             tools = await client.list_tools()
             names = {t.name for t in tools}
@@ -103,6 +103,7 @@ class TestToolRegistration:
             "get_imports",
             "find_callers",
             "get_directory_structure",
+            "get_status",
             "execute_local_sandbox",
         }
         assert expected == names, f"Tool mismatch. Extra: {names - expected}, Missing: {expected - names}"
@@ -259,6 +260,48 @@ class TestGetDirectoryStructureWire:
         text = _text(r)
         assert "EXCEPTION" not in text
         assert "not found" in text.lower() or "No source" in text
+
+
+# ---------------------------------------------------------------------------
+# get_status
+# ---------------------------------------------------------------------------
+
+class TestGetStatusWire:
+    async def test_returns_workspace_path(self, workspace):
+        async with Client(_make_transport(workspace)) as client:
+            r = await client.call_tool("get_status", {})
+        text = _text(r)
+        assert str(workspace) in text
+        assert "EXCEPTION" not in text
+
+    async def test_shows_source_file_count(self, workspace):
+        async with Client(_make_transport(workspace)) as client:
+            r = await client.call_tool("get_status", {})
+        text = _text(r)
+        assert "source_files" in text
+        assert "3" in text  # workspace fixture has 3 .py files
+
+    async def test_shows_index_state(self, workspace):
+        async with Client(_make_transport(workspace)) as client:
+            r = await client.call_tool("get_status", {})
+        text = _text(r)
+        assert "symbol_index" in text
+        # Either warm or building — both are valid immediately after startup
+        assert "warm" in text or "building" in text
+
+    async def test_shows_mimirignore_hint_when_no_file(self, workspace):
+        """When .mimirignore doesn't exist, get_status should tell the user how to create one."""
+        async with Client(_make_transport(workspace)) as client:
+            r = await client.call_tool("get_status", {})
+        text = _text(r)
+        assert ".mimirignore" in text
+
+    async def test_shows_active_patterns_when_file_exists(self, workspace):
+        (workspace / ".mimirignore").write_text("**/vendor/**\n**/obj/**\n")
+        async with Client(_make_transport(workspace)) as client:
+            r = await client.call_tool("get_status", {})
+        text = _text(r)
+        assert "**/vendor/**" in text or "2 active" in text
 
 
 # ---------------------------------------------------------------------------

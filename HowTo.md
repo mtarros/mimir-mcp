@@ -134,6 +134,39 @@ All tools work on Windows. The one exception: `execute_local_sandbox` with `lang
 
 ## Tools and when to use them
 
+### 0. `get_status` — check the index before you start
+
+Call this at the start of a session to see how much of the workspace is indexed and whether the symbol index is ready.
+
+**Example output:**
+```
+workspace:          /your/project
+source_files:       8605
+blueprints_cached:  8605 in memory, 8605 on disk
+symbol_index:       warm
+  indexed_tokens:   267,034
+warmup:             complete
+tree_sitter:        on
+sandbox:            on
+
+ignored_patterns: none  (.mimirignore not found)
+  → create .mimirignore in the workspace root to exclude noisy directories
+    e.g. '**/obj/**', '**/bin/**', '**/*.generated.cs', '**/vendor/**'
+```
+
+If `symbol_index: building`, the other tools still work but `scope_task` and `verify_symbol_existence` use a slower fallback until indexing completes (typically under 60s for large repos).
+
+**Excluding noisy files:** Create a `.mimirignore` file in the workspace root with gitignore-style patterns. Mimir reloads it automatically. For example:
+```
+**/obj/**
+**/bin/**
+**/*.generated.cs
+**/node_modules/**
+**/vendor/**
+```
+
+---
+
 ### 1. `scope_task` — start here
 
 Call this **first** on any task involving existing code. Give it a plain-English description of what you want to do. It extracts symbol names, searches the workspace, and returns blueprints for the most relevant files.
@@ -215,7 +248,7 @@ WHEN TO USE: after `verify_symbol_existence` tells you where something is define
 
 ---
 
-### 7. `execute_local_sandbox` — run a quick snippet
+### 8. `execute_local_sandbox` — run a quick snippet
 
 Runs a Python or bash snippet locally with a timeout, captures output, and returns it.
 
@@ -317,13 +350,14 @@ This prints SQL vs linear-scan timing and speedup numbers.
 | `test_symbol_index.py` | `TestNormalizedSchema` | `lines` holds context; `symbols` holds only tokens; no duplication |
 | `test_symbol_index.py` | `TestSearchCorrectness` | SQL JOIN results match linear-scan results for 7 symbol types |
 | `test_symbol_index.py` | `TestPerformance` | SQL lookup is <1ms and ≥10× faster than scanning blueprints |
-| `test_smoke.py` | `TestToolRegistration` | All 7 tools registered with descriptions over MCP wire protocol |
+| `test_smoke.py` | `TestToolRegistration` | All 8 tools registered with descriptions over MCP wire protocol |
 | `test_smoke.py` | `TestGetFileStructureWire` | Blueprint returned; missing file and path traversal handled gracefully |
 | `test_smoke.py` | `TestScopeTaskWire` | Finds relevant files; returns non-empty response |
 | `test_smoke.py` | `TestVerifySymbolExistenceWire` | Finds known symbol; graceful "not found" message |
 | `test_smoke.py` | `TestGetImportsWire` | Resolves workspace imports; handles files with no imports |
 | `test_smoke.py` | `TestFindCallersWire` | Finds call sites; rejects dotted names end-to-end |
 | `test_smoke.py` | `TestGetDirectoryStructureWire` | Returns blueprints; path traversal rejected |
+| `test_smoke.py` | `TestGetStatusWire` | Reports workspace, file count, index state, and `.mimirignore` patterns |
 | `test_smoke.py` | `TestSandboxWire` | Python snippet executes; disabled sandbox returns error; runtime errors captured |
 
 ---

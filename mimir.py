@@ -191,7 +191,8 @@ def _init_disk_cache() -> "Optional[object]":
 
 
 _DISK_CACHE = _init_disk_cache()
-_FTS_READY = False  # True once the symbols inverted index is built and queryable
+_FTS_READY = False       # True once the symbols inverted index is built and queryable
+_WARMUP_COMPLETE = False  # True once _warm_cache() finishes its first full pass
 
 
 def _load_disk_cache() -> int:
@@ -458,6 +459,7 @@ def _iter_source_files() -> list[Path]:
 
 def _warm_cache() -> None:
     """Parse all source files in parallel so the first search is fast."""
+    global _WARMUP_COMPLETE
     files = _iter_source_files()
     workers = min(8, os.cpu_count() or 4)
     with ThreadPoolExecutor(max_workers=workers) as ex:
@@ -465,6 +467,7 @@ def _warm_cache() -> None:
             pass
     _build_cs_ns_index()
     _build_symbol_index()
+    _WARMUP_COMPLETE = True
 
 
 # --------------------------------------------------------------------------- #
@@ -1499,7 +1502,88 @@ def get_directory_structure(dir_path: str, max_files: int = 10) -> str:
             f"... {total - max_files} more file{'s' if total - max_files != 1 else ''} not shown."
             f" Increase max_files or narrow dir_path to a subdirectory."
         )
+
+    ignore_hint = (
+        f"\nTip: to exclude noisy files or subdirectories from mimir's index, add"
+        f" gitignore-style patterns to .mimirignore in the workspace root"
+        f" (e.g. '**/obj/**' or '**/*.generated.cs')."
+    )
+    if not (WORKSPACE_ROOT / ".mimirignore").exists():
+        parts.append(ignore_hint)
+
     return "\n".join(parts)
+
+
+@mcp.tool()
+def get_status() -> str:
+    """Report the current state of the mimir index for this workspace.
+
+    Call this at the start of a session to understand what mimir knows about
+    the workspace before using other tools. Key things to check:
+
+    - symbol_index=warm means scope_task and verify_symbol_existence use a fast
+      SQL index; symbol_index=building means they fall back to a slower linear
+      scan and may miss recently added symbols
+    - blueprints_cached shows how many files are already parsed
+    - ignored_patterns lists active .mimirignore rules
+
+    If the index is still building, you can proceed — tools still work, just
+    slower. For large repos (8000+ files) the index typically builds in <60s.
+    """
+    try:
+        total_files = len(_iter_source_files())
+        cached = len(_CACHE)
+        disk_count = 0
+        if _DISK_CACHE is not None:
+            try:
+                disk_count = _DISK_CACHE.execute(
+                    "SELECT COUNT(*) FROM blueprints"
+                ).fetchone()[0]
+            except Exception:
+                pass
+
+        sym_count = 0
+        if _FTS_READY and _DISK_CACHE is not None:
+            try:
+                sym_count = _DISK_CACHE.execute(
+                    "SELECT COUNT(DISTINCT token) FROM symbols"
+                ).fetchone()[0]
+            except Exception:
+                pass
+
+        index_state = "warm" if _FTS_READY else "building (tools still work, slower until complete)"
+        warmup_state = "complete" if _WARMUP_COMPLETE else "in progress"
+
+        ignore_path = WORKSPACE_ROOT / ".mimirignore"
+        if _MIMIRIGNORE_PATTERNS:
+            ignore_section = (
+                f"ignored_patterns ({len(_MIMIRIGNORE_PATTERNS)} active):\n"
+                + "\n".join(f"  {p}" for p in _MIMIRIGNORE_PATTERNS)
+            )
+        elif ignore_path.exists():
+            ignore_section = "ignored_patterns: .mimirignore exists but contains no active patterns"
+        else:
+            ignore_section = (
+                "ignored_patterns: none  (.mimirignore not found)\n"
+                "  → create .mimirignore in the workspace root to exclude noisy directories\n"
+                "    e.g. '**/obj/**', '**/bin/**', '**/*.generated.cs', '**/vendor/**'"
+            )
+
+        lines = [
+            f"workspace:          {WORKSPACE_ROOT}",
+            f"source_files:       {total_files}",
+            f"blueprints_cached:  {cached} in memory, {disk_count} on disk",
+            f"symbol_index:       {index_state}",
+            f"  indexed_tokens:   {sym_count:,}" if _FTS_READY else "  indexed_tokens:   (not yet built)",
+            f"warmup:             {warmup_state}",
+            f"tree_sitter:        {'on' if TREE_SITTER_OK else 'off (regex fallback)'}",
+            f"sandbox:            {'on' if SANDBOX_ENABLED else 'off'}",
+            "",
+            ignore_section,
+        ]
+        return "\n".join(lines)
+    except Exception as e:
+        return f"EXCEPTION in get_status: {e}"
 
 
 @mcp.tool()
