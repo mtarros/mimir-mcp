@@ -276,7 +276,7 @@ pip install pytest
 pytest tests/ -v
 ```
 
-Expected output: **49 passed** in under 1 second.
+Expected output: **79 passed** in under 1 second.
 
 ### Run only the performance benchmarks
 
@@ -293,6 +293,10 @@ This prints SQL vs linear-scan timing and speedup numbers.
 | `TestBlueprintHeader` | Line count appears in blueprint header; accurate for Python and C# |
 | `TestGetDirectoryStructure` | Returns correct files; respects max_files; rejects paths outside workspace |
 | `TestBlueprintVersion` | Stale cache is cleared on version mismatch; valid cache is preserved |
+| `TestIsBlacklisted` | BLACKLIST_DIRS and `.mimirignore` pattern matching including `**` globs |
+| `TestExtractScopeKeywords` | CamelCase/snake_case/plain-word extraction; stopwords and deduplication |
+| `TestFindCallersValidation` | Rejects dotted names/parens; accepts valid bare identifiers |
+| `TestGeneratedFileExclusion` | `.g.cs`, `.generated.cs`, `AssemblyInfo.cs` excluded from index |
 | `TestExtractBlueprintLines` | Blueprint lines parsed into `(file, lineno, context)` correctly |
 | `TestIndexBlueprintRows` | Stopwords excluded; symbol names indexed; no context in rows |
 | `TestNormalizedSchema` | `lines` holds context; `symbols` holds only tokens; no duplication |
