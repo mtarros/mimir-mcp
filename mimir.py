@@ -130,7 +130,7 @@ _SYMBOL_STOPWORDS = frozenset({
 
 # Increment when the blueprint text format changes so cached blueprints are
 # automatically invalidated and re-parsed on the next server start.
-BLUEPRINT_VERSION = "2"
+BLUEPRINT_VERSION = "3"
 
 
 def _init_disk_cache() -> "Optional[object]":
@@ -394,9 +394,9 @@ def _cache_put(path: Path, blueprint: str) -> None:
                 _DISK_CACHE.execute("DELETE FROM symbols WHERE file = ?", (rel,))
                 _DISK_CACHE.execute("DELETE FROM lines WHERE file = ?", (rel,))
                 if line_rows:
-                    _DISK_CACHE.executemany("INSERT INTO lines VALUES (?,?,?)", line_rows)
+                    _DISK_CACHE.executemany("INSERT OR IGNORE INTO lines VALUES (?,?,?)", line_rows)
                 if sym_rows:
-                    _DISK_CACHE.executemany("INSERT INTO symbols VALUES (?,?,?)", sym_rows)
+                    _DISK_CACHE.executemany("INSERT OR IGNORE INTO symbols VALUES (?,?,?)", sym_rows)
             _DISK_CACHE.commit()
         except Exception:
             pass
@@ -556,6 +556,7 @@ def _extract_tree_sitter(path: Path, src: bytes, ts_lang: str) -> Optional[str]:
         return None
 
     lines: list[str] = []
+    seen_line_nos: set[int] = set()
 
     # Signatures that are just bare keywords have no name to reference — skip them
     _anon = re.compile(r'^(?:async\s+)?(?:function|class|interface|enum)\s*[<({]?$')
@@ -566,8 +567,10 @@ def _extract_tree_sitter(path: Path, src: bytes, ts_lang: str) -> Optional[str]:
             sig = _signature_from_node(node, src)
             if sig and not _anon.match(sig):
                 line_no = node.start_position().row + 1
-                indent = "  " * min(depth, 6)
-                lines.append(f"L{line_no:<5}{indent}{sig}")
+                if line_no not in seen_line_nos:
+                    seen_line_nos.add(line_no)
+                    indent = "  " * min(depth, 6)
+                    lines.append(f"L{line_no:<5}{indent}{sig}")
                 child_depth = depth + 1
         for i in range(node.child_count()):
             walk(node.child(i), child_depth)
@@ -1003,8 +1006,8 @@ def _build_symbol_index() -> None:
     try:
         _DISK_CACHE.execute("DELETE FROM lines")
         _DISK_CACHE.execute("DELETE FROM symbols")
-        _DISK_CACHE.executemany("INSERT INTO lines VALUES (?,?,?)", line_rows)
-        _DISK_CACHE.executemany("INSERT INTO symbols VALUES (?,?,?)", sym_rows)
+        _DISK_CACHE.executemany("INSERT OR IGNORE INTO lines VALUES (?,?,?)", line_rows)
+        _DISK_CACHE.executemany("INSERT OR IGNORE INTO symbols VALUES (?,?,?)", sym_rows)
         _DISK_CACHE.commit()
         _DISK_CACHE.execute("PRAGMA wal_checkpoint(TRUNCATE)")
         _FTS_READY = True
