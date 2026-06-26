@@ -104,9 +104,17 @@ def _init_disk_cache() -> "Optional[object]":
         cache_dir.mkdir(parents=True, exist_ok=True)
         db = sqlite3.connect(str(cache_dir / f"{ws_hash}.db"), check_same_thread=False)
         db.execute("PRAGMA journal_mode=WAL")
+        db.execute("PRAGMA cache_size=-32768")   # 32MB page cache
         db.execute(
             "CREATE TABLE IF NOT EXISTS blueprints"
             " (path TEXT PRIMARY KEY, mtime REAL, size INTEGER, blueprint TEXT)"
+        )
+        db.execute(
+            "CREATE TABLE IF NOT EXISTS symbols"
+            " (token TEXT NOT NULL, file TEXT NOT NULL, lineno TEXT NOT NULL, context TEXT NOT NULL)"
+        )
+        db.execute(
+            "CREATE INDEX IF NOT EXISTS idx_symbols_token ON symbols (token)"
         )
         db.commit()
         return db
@@ -115,10 +123,12 @@ def _init_disk_cache() -> "Optional[object]":
 
 
 _DISK_CACHE = _init_disk_cache()
+_FTS_READY = False  # True once the symbols inverted index is built and queryable
 
 
 def _load_disk_cache() -> int:
     """Populate the in-memory cache from SQLite. Returns number of valid entries loaded."""
+    global _FTS_READY
     if _DISK_CACHE is None:
         return 0
     loaded = 0
@@ -134,6 +144,12 @@ def _load_disk_cache() -> int:
                     loaded += 1
             except OSError:
                 pass
+    except Exception:
+        pass
+    try:
+        count = _DISK_CACHE.execute("SELECT COUNT(*) FROM symbols").fetchone()[0]
+        if count > 0:
+            _FTS_READY = True
     except Exception:
         pass
     return loaded
@@ -299,10 +315,16 @@ def _cache_put(path: Path, blueprint: str) -> None:
         _CACHE.popitem(last=False)  # evict oldest
     if _DISK_CACHE is not None:
         try:
+            rel = str(path.relative_to(WORKSPACE_ROOT))
             _DISK_CACHE.execute(
                 "INSERT OR REPLACE INTO blueprints VALUES (?,?,?,?)",
                 (str(path), st.st_mtime, st.st_size, blueprint),
             )
+            if _FTS_READY:
+                rows = _index_blueprint_rows(rel, blueprint)
+                _DISK_CACHE.execute("DELETE FROM symbols WHERE file = ?", (rel,))
+                if rows:
+                    _DISK_CACHE.executemany("INSERT INTO symbols VALUES (?,?,?,?)", rows)
             _DISK_CACHE.commit()
         except Exception:
             pass
@@ -370,6 +392,7 @@ def _warm_cache() -> None:
         for _ in as_completed(ex.submit(_build_blueprint, p) for p in files):
             pass
     _build_cs_ns_index()
+    _build_symbol_index()
 
 
 # --------------------------------------------------------------------------- #
@@ -568,12 +591,23 @@ def _build_blueprint(path: Path) -> str:
 
 def _symbol_hits(name: str, max_results: int = 25) -> list[tuple[str, str, str]]:
     """Search blueprints for definitions of *name*. Returns (rel_path, line_no, sig) tuples."""
+    if _FTS_READY and _DISK_CACHE is not None:
+        try:
+            word_re = re.compile(rf"(?<![\w]){re.escape(name)}(?![\w])")
+            rows = _DISK_CACHE.execute(
+                "SELECT file, lineno, context FROM symbols WHERE token = ? LIMIT ?",
+                (name, max_results * 4),
+            ).fetchall()
+            hits = [(f, l, c) for f, l, c in rows if word_re.search(c)]
+            return hits[:max_results]
+        except Exception:
+            pass  # fall through to linear scan
+
     word_def = re.compile(rf"(?<![\w]){re.escape(name)}(?![\w])")
     hits: list[tuple[str, str, str]] = []
     for path in _iter_source_files():
         if len(hits) >= max_results:
             break
-        # Use cached blueprint for needle check — avoids re-reading disk on warm calls.
         cached = _cache_get(path)
         if cached is not None:
             if name not in cached:
@@ -601,13 +635,32 @@ def _symbol_hits(name: str, max_results: int = 25) -> list[tuple[str, str, str]]
 def _symbol_hits_multi(
     names: list[str], max_per_kw: int = 10
 ) -> dict[str, list[tuple[str, str, str]]]:
-    """Single-pass multi-keyword search — faster than calling _symbol_hits N times.
+    """Multi-keyword search across blueprints.
 
-    Returns {keyword: [(rel_path, line_no, sig), ...]} for all keywords in one
-    walk through the blueprint cache.
+    Uses the SQLite inverted index when available (fast path), otherwise
+    falls back to a single-pass linear scan through the blueprint cache.
+    Returns {keyword: [(rel_path, line_no, sig), ...]} for every keyword.
     """
+    if _FTS_READY and _DISK_CACHE is not None:
+        try:
+            hits: dict[str, list[tuple[str, str, str]]] = {n: [] for n in names}
+            for name in names:
+                word_re = re.compile(rf"(?<![\w]){re.escape(name)}(?![\w])")
+                rows = _DISK_CACHE.execute(
+                    "SELECT file, lineno, context FROM symbols WHERE token = ? LIMIT ?",
+                    (name, max_per_kw * 4),
+                ).fetchall()
+                for f, l, c in rows:
+                    if word_re.search(c):
+                        hits[name].append((f, l, c))
+                        if len(hits[name]) >= max_per_kw:
+                            break
+            return hits
+        except Exception:
+            pass  # fall through to linear scan
+
     patterns = {n: re.compile(rf"(?<![\w]){re.escape(n)}(?![\w])") for n in names}
-    hits: dict[str, list[tuple[str, str, str]]] = {n: [] for n in names}
+    hits = {n: [] for n in names}
     saturated: set[str] = set()
 
     for path in _iter_source_files():
@@ -803,6 +856,61 @@ def _build_cs_ns_index() -> None:
                 break  # one namespace declaration per file
     _CS_NS_INDEX = index
     _CS_NS_INDEX_READY = True
+
+
+def _index_blueprint_rows(rel: str, blueprint: str) -> list[tuple[str, str, str, str]]:
+    """Extract (token, file, lineno, context) rows from a blueprint for the symbols table."""
+    rows = []
+    for line in blueprint.splitlines():
+        if not line or line.startswith('#'):
+            continue
+        m = re.match(r'L(\d+)\s*(.*)', line.strip())
+        if not m:
+            continue
+        lineno, context = m.group(1), m.group(2).strip()
+        if not context:
+            continue
+        seen: set[str] = set()
+        for tok in re.findall(r'\w+', context):
+            if len(tok) >= 2 and tok not in seen:
+                seen.add(tok)
+                rows.append((tok, rel, lineno, context))
+    return rows
+
+
+def _build_symbol_index() -> None:
+    """Build the inverted symbol index in SQLite from all cached blueprints.
+
+    Called at the end of _warm_cache(). If the symbols table is already
+    populated (persisted from a previous run), skip the rebuild — the
+    persistent index is valid as long as blueprints haven't changed.
+    Individual file updates happen via _cache_put.
+    """
+    global _FTS_READY
+    if _DISK_CACHE is None:
+        return
+    try:
+        count = _DISK_CACHE.execute("SELECT COUNT(*) FROM symbols").fetchone()[0]
+        if count > 0:
+            _FTS_READY = True
+            return
+    except Exception:
+        pass
+    rows: list[tuple[str, str, str, str]] = []
+    for path in _iter_source_files():
+        cached = _cache_get(path)
+        if cached is None:
+            continue
+        rel = str(path.relative_to(WORKSPACE_ROOT))
+        rows.extend(_index_blueprint_rows(rel, cached))
+    try:
+        _DISK_CACHE.execute("DELETE FROM symbols")
+        _DISK_CACHE.executemany("INSERT INTO symbols VALUES (?,?,?,?)", rows)
+        _DISK_CACHE.commit()
+        _DISK_CACHE.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+        _FTS_READY = True
+    except Exception:
+        pass
 
 
 def _detect_root_namespace(suffix: str) -> str:
@@ -1377,10 +1485,11 @@ def main() -> None:
 
     # A short banner on stderr (NOT stdout - stdout is the JSON-RPC channel).
     disk_status = f"disk_cache={disk_loaded}/{total_files} loaded" if _DISK_CACHE else "disk_cache=off"
+    fts_status = f"symbol_index={'warm' if _FTS_READY else 'building'}"
     print(
         f"[mimir] root={WORKSPACE_ROOT} "
         f"tree_sitter={'on' if TREE_SITTER_OK else 'off (regex fallback)'} "
-        f"sandbox={'on' if SANDBOX_ENABLED else 'off'}  {disk_status}",
+        f"sandbox={'on' if SANDBOX_ENABLED else 'off'}  {disk_status}  {fts_status}",
         file=sys.stderr,
     )
     # Kick off parallel cache warm-up in the background so the first search is fast.
