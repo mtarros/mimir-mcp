@@ -95,6 +95,39 @@ def _load_mimirignore() -> list[str]:
 _MIMIRIGNORE_PATTERNS: list[str] = _load_mimirignore()
 
 
+# Tokens that appear on almost every blueprint line but are never searched as
+# symbol names. Filtering these cuts ~40% of symbol index rows.
+_SYMBOL_STOPWORDS = frozenset({
+    # Visibility / access modifiers
+    "public", "private", "protected", "internal", "extern",
+    # Storage / mutability
+    "static", "readonly", "const", "volatile", "transient",
+    # Inheritance / polymorphism
+    "abstract", "virtual", "override", "sealed", "final",
+    # Type modifiers
+    "partial", "async", "await", "synchronized", "native",
+    # Structural keywords
+    "class", "interface", "struct", "enum", "namespace", "package",
+    # Imports
+    "using", "import", "require",
+    # Primitive / built-in types
+    "void", "bool", "boolean", "int", "uint", "long", "ulong",
+    "short", "ushort", "byte", "sbyte", "char", "float", "double",
+    "decimal", "string", "str", "object", "var", "dynamic", "any",
+    # Python-specific
+    "def", "self", "cls", "pass",
+    # JS/TS-specific
+    "export", "default", "function", "let", "extends",
+    "implements", "typeof", "instanceof",
+    # Go-specific
+    "func",
+    # Literal values
+    "null", "true", "false", "undefined", "nil", "None", "True", "False",
+    # Object-orientation keywords
+    "new", "this", "base", "super",
+})
+
+
 def _init_disk_cache() -> "Optional[object]":
     """Open (or create) a per-workspace SQLite blueprint cache in ~/.cache/mimir/."""
     try:
@@ -109,9 +142,24 @@ def _init_disk_cache() -> "Optional[object]":
             "CREATE TABLE IF NOT EXISTS blueprints"
             " (path TEXT PRIMARY KEY, mtime REAL, size INTEGER, blueprint TEXT)"
         )
+        # Normalized symbol index: lines holds context (one row per definition line),
+        # symbols holds tokens (one row per token — no context duplication).
+        # Migrate from the old denormalized schema if needed.
+        try:
+            db.execute("SELECT context FROM symbols LIMIT 0")
+            # Old schema with context column present — rebuild both tables.
+            db.execute("DROP TABLE symbols")
+            db.execute("DROP TABLE IF EXISTS lines")
+        except Exception:
+            pass
+        db.execute(
+            "CREATE TABLE IF NOT EXISTS lines"
+            " (file TEXT NOT NULL, lineno TEXT NOT NULL, context TEXT NOT NULL,"
+            "  PRIMARY KEY (file, lineno))"
+        )
         db.execute(
             "CREATE TABLE IF NOT EXISTS symbols"
-            " (token TEXT NOT NULL, file TEXT NOT NULL, lineno TEXT NOT NULL, context TEXT NOT NULL)"
+            " (token TEXT NOT NULL, file TEXT NOT NULL, lineno TEXT NOT NULL)"
         )
         db.execute(
             "CREATE INDEX IF NOT EXISTS idx_symbols_token ON symbols (token)"
@@ -321,10 +369,14 @@ def _cache_put(path: Path, blueprint: str) -> None:
                 (str(path), st.st_mtime, st.st_size, blueprint),
             )
             if _FTS_READY:
-                rows = _index_blueprint_rows(rel, blueprint)
+                line_rows = _extract_blueprint_lines(rel, blueprint)
+                sym_rows  = _index_blueprint_rows(rel, blueprint)
                 _DISK_CACHE.execute("DELETE FROM symbols WHERE file = ?", (rel,))
-                if rows:
-                    _DISK_CACHE.executemany("INSERT INTO symbols VALUES (?,?,?,?)", rows)
+                _DISK_CACHE.execute("DELETE FROM lines WHERE file = ?", (rel,))
+                if line_rows:
+                    _DISK_CACHE.executemany("INSERT INTO lines VALUES (?,?,?)", line_rows)
+                if sym_rows:
+                    _DISK_CACHE.executemany("INSERT INTO symbols VALUES (?,?,?)", sym_rows)
             _DISK_CACHE.commit()
         except Exception:
             pass
@@ -595,7 +647,9 @@ def _symbol_hits(name: str, max_results: int = 25) -> list[tuple[str, str, str]]
         try:
             word_re = re.compile(rf"(?<![\w]){re.escape(name)}(?![\w])")
             rows = _DISK_CACHE.execute(
-                "SELECT file, lineno, context FROM symbols WHERE token = ? LIMIT ?",
+                "SELECT l.file, l.lineno, l.context"
+                " FROM symbols s JOIN lines l ON s.file=l.file AND s.lineno=l.lineno"
+                " WHERE s.token=? LIMIT ?",
                 (name, max_results * 4),
             ).fetchall()
             hits = [(f, l, c) for f, l, c in rows if word_re.search(c)]
@@ -647,7 +701,9 @@ def _symbol_hits_multi(
             for name in names:
                 word_re = re.compile(rf"(?<![\w]){re.escape(name)}(?![\w])")
                 rows = _DISK_CACHE.execute(
-                    "SELECT file, lineno, context FROM symbols WHERE token = ? LIMIT ?",
+                    "SELECT l.file, l.lineno, l.context"
+                    " FROM symbols s JOIN lines l ON s.file=l.file AND s.lineno=l.lineno"
+                    " WHERE s.token=? LIMIT ?",
                     (name, max_per_kw * 4),
                 ).fetchall()
                 for f, l, c in rows:
@@ -858,8 +914,27 @@ def _build_cs_ns_index() -> None:
     _CS_NS_INDEX_READY = True
 
 
-def _index_blueprint_rows(rel: str, blueprint: str) -> list[tuple[str, str, str, str]]:
-    """Extract (token, file, lineno, context) rows from a blueprint for the symbols table."""
+def _extract_blueprint_lines(rel: str, blueprint: str) -> list[tuple[str, str, str]]:
+    """Extract (file, lineno, context) rows for the lines table from a blueprint."""
+    rows = []
+    for line in blueprint.splitlines():
+        if not line or line.startswith('#'):
+            continue
+        m = re.match(r'L(\d+)\s*(.*)', line.strip())
+        if not m:
+            continue
+        context = m.group(2).strip()
+        if context:
+            rows.append((rel, m.group(1), context))
+    return rows
+
+
+def _index_blueprint_rows(rel: str, blueprint: str) -> list[tuple[str, str, str]]:
+    """Extract (token, file, lineno) rows for the symbols table from a blueprint.
+
+    Stopwords and tokens shorter than 2 chars are excluded to keep the index small.
+    Context is stored separately in the lines table — no duplication here.
+    """
     rows = []
     for line in blueprint.splitlines():
         if not line or line.startswith('#'):
@@ -872,19 +947,18 @@ def _index_blueprint_rows(rel: str, blueprint: str) -> list[tuple[str, str, str,
             continue
         seen: set[str] = set()
         for tok in re.findall(r'\w+', context):
-            if len(tok) >= 2 and tok not in seen:
+            if len(tok) >= 2 and tok not in _SYMBOL_STOPWORDS and tok not in seen:
                 seen.add(tok)
-                rows.append((tok, rel, lineno, context))
+                rows.append((tok, rel, lineno))
     return rows
 
 
 def _build_symbol_index() -> None:
-    """Build the inverted symbol index in SQLite from all cached blueprints.
+    """Build the normalized symbol index in SQLite from all cached blueprints.
 
-    Called at the end of _warm_cache(). If the symbols table is already
-    populated (persisted from a previous run), skip the rebuild — the
-    persistent index is valid as long as blueprints haven't changed.
-    Individual file updates happen via _cache_put.
+    Called at the end of _warm_cache(). Skips rebuild if the index is already
+    populated (persisted from a previous run). Incremental updates happen via
+    _cache_put when individual files change.
     """
     global _FTS_READY
     if _DISK_CACHE is None:
@@ -896,16 +970,20 @@ def _build_symbol_index() -> None:
             return
     except Exception:
         pass
-    rows: list[tuple[str, str, str, str]] = []
+    line_rows: list[tuple[str, str, str]] = []
+    sym_rows:  list[tuple[str, str, str]] = []
     for path in _iter_source_files():
         cached = _cache_get(path)
         if cached is None:
             continue
         rel = str(path.relative_to(WORKSPACE_ROOT))
-        rows.extend(_index_blueprint_rows(rel, cached))
+        line_rows.extend(_extract_blueprint_lines(rel, cached))
+        sym_rows.extend(_index_blueprint_rows(rel, cached))
     try:
+        _DISK_CACHE.execute("DELETE FROM lines")
         _DISK_CACHE.execute("DELETE FROM symbols")
-        _DISK_CACHE.executemany("INSERT INTO symbols VALUES (?,?,?,?)", rows)
+        _DISK_CACHE.executemany("INSERT INTO lines VALUES (?,?,?)", line_rows)
+        _DISK_CACHE.executemany("INSERT INTO symbols VALUES (?,?,?)", sym_rows)
         _DISK_CACHE.commit()
         _DISK_CACHE.execute("PRAGMA wal_checkpoint(TRUNCATE)")
         _FTS_READY = True
