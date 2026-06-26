@@ -44,3 +44,8 @@ mimir-setup = "mimir:setup"
 
 [tool.setuptools]
 py-modules = ["mimir"]
+
+[tool.pytest.ini_options]
+markers = [
+    "smoke: integration tests that spawn a real mimir subprocess (slow, ~1-2s each)",
+]

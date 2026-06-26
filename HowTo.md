@@ -269,14 +269,29 @@ Or if you installed with `pip install -e .` into an active virtualenv:
 pip install pytest
 ```
 
-### Run all tests
+### Run unit tests (fast)
 
 ```bash
 # From the mimir-mcp project root
-pytest tests/ -v
+pytest tests/ -v --ignore=tests/test_smoke.py
 ```
 
-Expected output: **79 passed** in under 1 second.
+Expected output: **81 passed** in under 1 second.
+
+### Run smoke tests (wire protocol)
+
+```bash
+pytest tests/test_smoke.py -v
+```
+
+Smoke tests spawn a real mimir subprocess and exercise every tool over the MCP
+stdio JSON-RPC protocol. They take ~12s total (21 tests, ~0.5s each).
+
+### Run everything
+
+```bash
+pytest tests/ tests/test_smoke.py -v
+```
 
 ### Run only the performance benchmarks
 
@@ -288,20 +303,28 @@ This prints SQL vs linear-scan timing and speedup numbers.
 
 ### What the tests cover
 
-| Class | What it tests |
-|---|---|
-| `TestBlueprintHeader` | Line count appears in blueprint header; accurate for Python and C# |
-| `TestGetDirectoryStructure` | Returns correct files; respects max_files; rejects paths outside workspace |
-| `TestBlueprintVersion` | Stale cache is cleared on version mismatch; valid cache is preserved |
-| `TestIsBlacklisted` | BLACKLIST_DIRS and `.mimirignore` pattern matching including `**` globs |
-| `TestExtractScopeKeywords` | CamelCase/snake_case/plain-word extraction; stopwords and deduplication |
-| `TestFindCallersValidation` | Rejects dotted names/parens; accepts valid bare identifiers |
-| `TestGeneratedFileExclusion` | `.g.cs`, `.generated.cs`, `AssemblyInfo.cs` excluded from index |
-| `TestExtractBlueprintLines` | Blueprint lines parsed into `(file, lineno, context)` correctly |
-| `TestIndexBlueprintRows` | Stopwords excluded; symbol names indexed; no context in rows |
-| `TestNormalizedSchema` | `lines` holds context; `symbols` holds only tokens; no duplication |
-| `TestSearchCorrectness` | SQL JOIN results match linear-scan results for 7 symbol types |
-| `TestPerformance` | SQL lookup is <1ms and ≥10× faster than scanning blueprints |
+| File | Class | What it tests |
+|---|---|---|
+| `test_blueprints.py` | `TestBlueprintHeader` | Line count in header; C# array params produce no duplicate line numbers |
+| `test_blueprints.py` | `TestGetDirectoryStructure` | Returns correct files; respects max_files; rejects paths outside workspace |
+| `test_blueprints.py` | `TestBlueprintVersion` | Stale cache cleared on version mismatch; valid cache preserved |
+| `test_tools.py` | `TestIsBlacklisted` | BLACKLIST_DIRS and `.mimirignore` pattern matching including `**` globs |
+| `test_tools.py` | `TestExtractScopeKeywords` | CamelCase/snake_case/plain-word extraction; stopwords and deduplication |
+| `test_tools.py` | `TestFindCallersValidation` | Rejects dotted names/parens; accepts valid bare identifiers |
+| `test_tools.py` | `TestGeneratedFileExclusion` | `.g.cs`, `.generated.cs`, `AssemblyInfo.cs` excluded from index |
+| `test_symbol_index.py` | `TestExtractBlueprintLines` | Blueprint lines parsed into `(file, lineno, context)`; deduplicates linenos |
+| `test_symbol_index.py` | `TestIndexBlueprintRows` | Stopwords excluded; symbol names indexed; no context in rows |
+| `test_symbol_index.py` | `TestNormalizedSchema` | `lines` holds context; `symbols` holds only tokens; no duplication |
+| `test_symbol_index.py` | `TestSearchCorrectness` | SQL JOIN results match linear-scan results for 7 symbol types |
+| `test_symbol_index.py` | `TestPerformance` | SQL lookup is <1ms and ≥10× faster than scanning blueprints |
+| `test_smoke.py` | `TestToolRegistration` | All 7 tools registered with descriptions over MCP wire protocol |
+| `test_smoke.py` | `TestGetFileStructureWire` | Blueprint returned; missing file and path traversal handled gracefully |
+| `test_smoke.py` | `TestScopeTaskWire` | Finds relevant files; returns non-empty response |
+| `test_smoke.py` | `TestVerifySymbolExistenceWire` | Finds known symbol; graceful "not found" message |
+| `test_smoke.py` | `TestGetImportsWire` | Resolves workspace imports; handles files with no imports |
+| `test_smoke.py` | `TestFindCallersWire` | Finds call sites; rejects dotted names end-to-end |
+| `test_smoke.py` | `TestGetDirectoryStructureWire` | Returns blueprints; path traversal rejected |
+| `test_smoke.py` | `TestSandboxWire` | Python snippet executes; disabled sandbox returns error; runtime errors captured |
 
 ---
 
