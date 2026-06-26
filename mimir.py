@@ -1755,22 +1755,50 @@ def setup() -> None:
 _CLI_HELP = """\
 mimir — structural code index for Claude Code and GitHub Copilot
 
-Usage:
-  mimir                          Start the MCP server (stdio transport)
-  mimir scope  "<task>"          Find files relevant to a task description
-  mimir find   <SymbolName>      Locate a symbol's definition across the workspace
-  mimir callers <SymbolName>     Find every call site and usage of a symbol
-  mimir status                   Show index state, file count, and ignore patterns
+SETUP (run once per project)
+  cd your-project
+  mimir-setup               Creates .mcp.json, .vscode/mcp.json, and CLAUDE.md
+                            then restart Claude Code or reload VS Code
 
-Examples:
+TERMINAL COMMANDS
+  mimir scope  "<task>"    Find files relevant to a plain-English task description
+  mimir find   <Symbol>    Locate a symbol definition across the workspace
+  mimir callers <Symbol>   Find every call site and usage of a symbol
+  mimir status             Show index state, file count, and active exclusions
+  mimir --help             Show this help
+
+EXAMPLES
   mimir scope "change how jobs are retried on failure"
   mimir find   JobScheduler
   mimir callers authenticate
   mimir status
 
-When run without arguments, mimir starts as an MCP server on stdio and is
-controlled by your AI client (Claude Code, GitHub Copilot). Run with a
-subcommand to query the index directly from your terminal.
+MCP TOOLS (available to Claude Code and GitHub Copilot)
+  get_status               Index state, file count, ignore patterns — call first
+  scope_task               Find relevant files from a task description
+  get_file_structure       Compact symbol map of a single file (classes, methods, line nos)
+  get_directory_structure  Symbol maps for every file under a directory
+  get_imports              Resolve imports to workspace files or external packages
+  verify_symbol_existence  Confirm a symbol is defined and find its location
+  find_callers             Find every call site and usage of a symbol
+  execute_local_sandbox    Run a Python or bash snippet with a timeout
+
+EXCLUDING FILES
+  Create .mimirignore in the project root with gitignore-style patterns:
+    **/obj/**
+    **/bin/**
+    **/*.generated.cs
+    **/vendor/**
+  Mimir reloads it automatically. Run `mimir status` to confirm active patterns.
+
+ENVIRONMENT VARIABLES
+  MCP_WORKSPACE_ROOT       Root of the repo mimir maps (default: current dir)
+  MCP_MAX_FILE_BYTES       Skip files larger than this in bytes (default: 2000000)
+  MCP_ENABLE_SANDBOX       Set to 0 to disable execute_local_sandbox (default: 1)
+  MCP_SANDBOX_TIMEOUT      Max seconds a sandbox snippet can run (default: 10)
+
+Without arguments, mimir starts as an MCP server on stdio — this is what your
+AI client launches. You never need to run this manually.
 """
 
 
