@@ -496,9 +496,16 @@ def _is_blacklisted(path: Path) -> bool:
     if any(part in BLACKLIST_DIRS for part in path.parts):
         return True
     for pat in _MIMIRIGNORE_PATTERNS:
-        # Path.match supports ** for recursive matching
         if path.match(pat):
             return True
+        # Path.match() cannot handle dir-glob patterns (e.g. **/wwwroot/lib/**)
+        # on file paths — the trailing /** never matches a filename. Work around
+        # this by stripping the trailing /** and matching against each parent dir.
+        if '/**' in pat:
+            dir_pat = pat[:pat.index('/**')]
+            for parent in path.parents:
+                if parent.match(dir_pat):
+                    return True
     return False
 
 
