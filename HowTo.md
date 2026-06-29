@@ -242,6 +242,13 @@ If `symbol_index: building`, the other tools still work but `scope_task` and `ve
 **/vendor/**
 ```
 
+**Domain aliases:** When `.mimiraliases` exists, `get_status` lists the active mappings so you can see what's been learned:
+```
+domain_aliases (2 active):
+  corrective actions → RectificationFilter
+  live tutor → LiveTutor, GeminiLive
+```
+
 ---
 
 ### 1. `scope_task` — start here
@@ -326,6 +333,52 @@ Searches raw source text across the entire workspace for every call site and usa
 > `find_callers("AuthenticationService", max_results=20)`
 
 WHEN TO USE: after `verify_symbol_existence` tells you where something is defined, use `find_callers` to trace who calls it — for impact analysis, understanding data flow, or finding all consumers of an interface.
+
+---
+
+### 7. `record_alias` — teach mimir your project's vocabulary
+
+Records a mapping from a domain/feature name to the code name used in the codebase. Once saved, `scope_task` automatically expands matching phrases before searching — so plain-English task descriptions find the right files even when the code uses completely different terminology.
+
+**Example:**
+> `record_alias("corrective actions", "RectificationFilter")`
+
+After this, searching `"corrective actions filter iOS"` automatically also searches for `RectificationFilter`, surfacing `RectificationFilterVC.swift` and `RectificationFilterDialogFragment.java` on the first call.
+
+**How it works:**
+- Writes to `.mimiraliases` in the workspace root (human-editable, checked into git)
+- Applied automatically to every future `scope_task` call in this project
+- `scope_task` output shows `Aliases expanded: RectificationFilter` when a mapping fires
+- `get_status` lists all active aliases
+
+**When to call it:**
+Call `record_alias` whenever you discover that a feature name in a task description maps to a different name in the code. Claude and Copilot are both instructed to do this automatically, but you can also call it manually or edit `.mimiraliases` directly.
+
+**Maintaining `.mimiraliases` manually:**
+
+The file lives in the project root and has a simple format:
+
+```
+# mimir domain aliases — maps feature/domain names to code names
+# Format:  domain phrase = CodeName1, CodeName2
+# scope_task expands these automatically before searching.
+
+corrective actions = RectificationFilter
+live tutor = LiveTutor, GeminiLive
+audit filter = AuditFilter, FilterVC
+push notifications = PushNotificationService, PushManager
+```
+
+Rules:
+- One mapping per line
+- Left side: the plain-English phrase (case-insensitive, matched anywhere in the task)
+- Right side: one or more code names, comma-separated
+- Lines starting with `#` are comments
+- Longer phrases are matched first, so `"corrective actions filter"` takes precedence over `"filter"`
+
+To add entries manually: open `.mimiraliases` in any editor and add lines. Mimir picks them up immediately — no restart needed.
+
+To remove an entry: delete the line or comment it out with `#`.
 
 ---
 

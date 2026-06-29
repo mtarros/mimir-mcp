@@ -104,6 +104,7 @@ class TestToolRegistration:
             "find_callers",
             "get_directory_structure",
             "get_status",
+            "record_alias",
             "execute_local_sandbox",
         }
         assert expected == names, f"Tool mismatch. Extra: {names - expected}, Missing: {expected - names}"
@@ -302,6 +303,39 @@ class TestGetStatusWire:
             r = await client.call_tool("get_status", {})
         text = _text(r)
         assert "**/vendor/**" in text or "2 active" in text
+
+
+# ---------------------------------------------------------------------------
+# record_alias
+# ---------------------------------------------------------------------------
+
+class TestRecordAliasWire:
+    async def test_saves_alias_and_confirms(self, workspace):
+        async with Client(_make_transport(workspace)) as client:
+            r = await client.call_tool(
+                "record_alias",
+                {"domain_term": "live tutor", "code_name": "LiveTutor"},
+            )
+        text = _text(r)
+        assert "live tutor" in text.lower()
+        assert "LiveTutor" in text
+        assert "EXCEPTION" not in text
+        alias_file = workspace / ".mimiraliases"
+        assert alias_file.exists()
+        assert "LiveTutor" in alias_file.read_text()
+
+    async def test_duplicate_returns_already_recorded(self, workspace):
+        async with Client(_make_transport(workspace)) as client:
+            await client.call_tool("record_alias", {"domain_term": "foo feature", "code_name": "FooService"})
+            r = await client.call_tool("record_alias", {"domain_term": "foo feature", "code_name": "FooService"})
+        text = _text(r)
+        assert "already" in text.lower() or "FooService" in text
+
+    async def test_empty_inputs_rejected(self, workspace):
+        async with Client(_make_transport(workspace)) as client:
+            r = await client.call_tool("record_alias", {"domain_term": "", "code_name": "Foo"})
+        text = _text(r)
+        assert "Error" in text
 
 
 # ---------------------------------------------------------------------------

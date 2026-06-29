@@ -95,6 +95,56 @@ def _load_mimirignore() -> list[str]:
 _MIMIRIGNORE_PATTERNS: list[str] = _load_mimirignore()
 
 
+def _load_mimiraliases() -> dict[str, list[str]]:
+    """Read domain→code mappings from .mimiraliases in the workspace root.
+
+    File format (one mapping per line):
+        corrective actions = RectificationFilter
+        live tutor = LiveTutor, GeminiLive
+        # comments are ignored
+    Returns a dict of lowercased domain phrase → list of code name strings.
+    """
+    p = WORKSPACE_ROOT / ".mimiraliases"
+    if not p.exists():
+        return {}
+    aliases: dict[str, list[str]] = {}
+    for line in p.read_text(encoding="utf-8").splitlines():
+        line = line.strip()
+        if not line or line.startswith("#"):
+            continue
+        if "=" not in line:
+            continue
+        domain, _, codes = line.partition("=")
+        domain = domain.strip().lower()
+        code_names = [c.strip() for c in codes.split(",") if c.strip()]
+        if domain and code_names:
+            aliases[domain] = code_names
+    return aliases
+
+
+_MIMIRALIASES: dict[str, list[str]] = _load_mimiraliases()
+
+
+def _expand_task_with_aliases(task: str) -> str:
+    """Append alias code names to a task string when domain phrases match.
+
+    Checks every alias domain phrase (longest first to prefer specific matches)
+    against the lowercased task. Appends matched code names so that
+    scope_task keyword extraction picks them up alongside the original terms.
+    """
+    if not _MIMIRALIASES:
+        return task
+    task_lower = task.lower()
+    additions: list[str] = []
+    for domain in sorted(_MIMIRALIASES, key=len, reverse=True):
+        if domain in task_lower:
+            additions.extend(_MIMIRALIASES[domain])
+    if additions:
+        return task + " " + " ".join(additions)
+    return task
+
+
+
 # Tokens that appear on almost every blueprint line but are never searched as
 # symbol names. Filtering these cuts ~40% of symbol index rows.
 _SYMBOL_STOPWORDS = frozenset({
@@ -1260,7 +1310,8 @@ def scope_task(task: str, max_files: int = 5, include_blueprints: bool = False) 
     Returns a compact context block: keywords searched, matched symbols with
     file:line locations, and ranked files by relevance score.
     """
-    keywords = _extract_scope_keywords(task)
+    expanded = _expand_task_with_aliases(task)
+    keywords = _extract_scope_keywords(expanded)
     if not keywords:
         return (
             "No searchable terms found in task description. "
@@ -1293,7 +1344,7 @@ def scope_task(task: str, max_files: int = 5, include_blueprints: bool = False) 
     # "RectificationFilterDialogFragment.java" outranks generic files that merely
     # live in a directory named "filter". Also boosts files already found via
     # symbol search so cross-platform counterparts (iOS ↔ Android) surface together.
-    path_kws = _extract_path_keywords(task)
+    path_kws = _extract_path_keywords(expanded)
     try:
         for src_path in _iter_source_files():
             rel = str(src_path.relative_to(WORKSPACE_ROOT))
@@ -1322,6 +1373,9 @@ def scope_task(task: str, max_files: int = 5, include_blueprints: bool = False) 
     top_set = set(top_files)
 
     parts: list[str] = [f"# Scope: {task!r}\n"]
+    if expanded != task:
+        alias_additions = expanded[len(task):].strip()
+        parts.append(f"Aliases expanded: {alias_additions}\n")
     parts.append(f"Keywords searched: {', '.join(keywords)}\n")
 
     # Deduplicated symbol hits for top files
@@ -1546,6 +1600,97 @@ def get_directory_structure(dir_path: str, max_files: int = 10) -> str:
 
 
 @mcp.tool()
+def record_alias(domain_term: str, code_name: str) -> str:
+    """Record a domain/feature name → code name mapping so future scope_task
+    calls find the right files even when described in non-technical language.
+
+    WHEN TO USE: call this whenever you discover that a feature name used in
+    task descriptions maps to a different name in the codebase. For example,
+    if searching for "corrective actions filter" returns the wrong files but
+    "RectificationFilter" finds them immediately, call:
+        record_alias("corrective actions", "RectificationFilter")
+
+    The mapping is saved to .mimiraliases in the workspace root and applied
+    automatically to all future scope_task calls in this project.
+
+    Args:
+        domain_term: the plain-English feature/domain name (e.g. "corrective actions filter")
+        code_name: the actual class/module/file prefix used in the codebase
+                   (e.g. "RectificationFilter"). For multiple code names, call
+                   record_alias once per name or separate them with commas.
+
+    Returns a confirmation message showing the saved mapping.
+    """
+    domain = domain_term.strip().lower()
+    code = code_name.strip()
+    if not domain or not code:
+        return "Error: both domain_term and code_name must be non-empty strings."
+
+    alias_path = WORKSPACE_ROOT / ".mimiraliases"
+
+    # Load existing content
+    existing: dict[str, list[str]] = {}
+    lines_raw: list[str] = []
+    if alias_path.exists():
+        lines_raw = alias_path.read_text(encoding="utf-8").splitlines()
+        for line in lines_raw:
+            stripped = line.strip()
+            if stripped and not stripped.startswith("#") and "=" in stripped:
+                d, _, c = stripped.partition("=")
+                d = d.strip().lower()
+                names = [n.strip() for n in c.split(",") if n.strip()]
+                existing[d] = names
+
+    # Merge: add code_name to existing entry or create new one
+    new_codes = [c.strip() for c in code.split(",") if c.strip()]
+    if domain in existing:
+        merged = existing[domain]
+        added = [c for c in new_codes if c not in merged]
+        if not added:
+            return f"Already recorded: '{domain}' → {', '.join(merged)}"
+        merged.extend(added)
+        existing[domain] = merged
+    else:
+        existing[domain] = new_codes
+
+    # Rewrite file preserving comments and blank lines, updating changed entries
+    out_lines: list[str] = []
+    written: set[str] = set()
+    for line in lines_raw:
+        stripped = line.strip()
+        if stripped and not stripped.startswith("#") and "=" in stripped:
+            d, _, _ = stripped.partition("=")
+            d = d.strip().lower()
+            if d in existing:
+                out_lines.append(f"{d} = {', '.join(existing[d])}")
+                written.add(d)
+            else:
+                out_lines.append(line)
+        else:
+            out_lines.append(line)
+
+    # Append any brand-new entries not yet in the file
+    for d, codes in existing.items():
+        if d not in written:
+            out_lines.append(f"{d} = {', '.join(codes)}")
+
+    if not alias_path.exists():
+        out_lines = [
+            "# mimir domain aliases — maps feature/domain names to code names",
+            "# Format:  domain phrase = CodeName1, CodeName2",
+            "# scope_task expands these automatically before searching.",
+            "",
+        ] + out_lines
+
+    alias_path.write_text("\n".join(out_lines) + "\n", encoding="utf-8")
+
+    # Update in-memory cache
+    _MIMIRALIASES[domain] = existing[domain]
+
+    return f"Saved: '{domain}' → {', '.join(existing[domain])}  (.mimiraliases updated)"
+
+
+@mcp.tool()
 def get_status() -> str:
     """Report the current state of the mimir index for this workspace.
 
@@ -1600,6 +1745,21 @@ def get_status() -> str:
                 "    e.g. '**/obj/**', '**/bin/**', '**/*.generated.cs', '**/vendor/**'"
             )
 
+        alias_path = WORKSPACE_ROOT / ".mimiraliases"
+        if _MIMIRALIASES:
+            alias_section = (
+                f"domain_aliases ({len(_MIMIRALIASES)} active):\n"
+                + "\n".join(f"  {d} → {', '.join(codes)}" for d, codes in _MIMIRALIASES.items())
+            )
+        elif alias_path.exists():
+            alias_section = "domain_aliases: .mimiraliases exists but contains no active mappings"
+        else:
+            alias_section = (
+                "domain_aliases: none  (.mimiraliases not found)\n"
+                "  → call record_alias(domain_term, code_name) when you discover a\n"
+                "    feature name maps to a different code name in the codebase"
+            )
+
         lines = [
             f"workspace:          {WORKSPACE_ROOT}",
             f"source_files:       {total_files}",
@@ -1611,6 +1771,8 @@ def get_status() -> str:
             f"sandbox:            {'on' if SANDBOX_ENABLED else 'off'}",
             "",
             ignore_section,
+            "",
+            alias_section,
         ]
         return "\n".join(lines)
     except Exception as e:
@@ -1771,6 +1933,8 @@ def setup() -> None:
             "- Use `find_callers` after `verify_symbol_existence` to trace impact\n"
             "- Use `get_directory_structure` when you know the directory but not which file\n"
             "- Use `get_imports` when an unfamiliar symbol appears and you need to trace its origin\n"
+            "- Call `record_alias(domain_term, code_name)` when you discover a feature name maps\n"
+            "  to a different code name — future scope_task searches will expand it automatically\n"
         )
         with open(claude_md, "a", encoding="utf-8") as f:
             f.write(snippet)
@@ -1794,7 +1958,10 @@ def setup() -> None:
             "   - Tip: use technical/class names when known (e.g. 'RectificationFilter') "
             "rather than feature names (e.g. 'corrective actions filter')\n"
             "3. Call `get_file_structure` on the files scope_task returns before reading raw lines\n"
-            "4. Use `find_callers` or `verify_symbol_existence` to trace symbols\n\n"
+            "4. Use `find_callers` or `verify_symbol_existence` to trace symbols\n"
+            "5. When you discover a domain/feature term maps to a code name "
+            "(e.g. 'corrective actions' → 'RectificationFilter'), call `record_alias` "
+            "to save it — future scope_task searches will expand it automatically\n\n"
             "Do not use built-in file search, glob, or grep if mimir tools are available. "
             "Read the full scope_task output even if it is saved to a temp file — it contains the answer.\n"
         )
@@ -1828,13 +1995,14 @@ EXAMPLES
   mimir status
 
 MCP TOOLS (available to Claude Code and GitHub Copilot)
-  get_status               Index state, file count, ignore patterns — call first
+  get_status               Index state, file count, ignore patterns, domain aliases — call first
   scope_task               Find relevant files from a task description
   get_file_structure       Compact symbol map of a single file (classes, methods, line nos)
   get_directory_structure  Symbol maps for every file under a directory
   get_imports              Resolve imports to workspace files or external packages
   verify_symbol_existence  Confirm a symbol is defined and find its location
   find_callers             Find every call site and usage of a symbol
+  record_alias             Save a domain/feature name → code name mapping for future searches
   execute_local_sandbox    Run a Python or bash snippet with a timeout
 
 EXCLUDING FILES
@@ -1844,6 +2012,13 @@ EXCLUDING FILES
     **/*.generated.cs
     **/vendor/**
   Mimir reloads it automatically. Run `mimir status` to confirm active patterns.
+
+DOMAIN ALIASES
+  Create .mimiraliases in the project root to map feature names to code names:
+    corrective actions = RectificationFilter
+    live tutor = LiveTutor, GeminiLive
+  Or let Claude/Copilot call record_alias() to build it automatically.
+  Mimir applies aliases before every scope_task search.
 
 ENVIRONMENT VARIABLES
   MCP_WORKSPACE_ROOT       Root of the repo mimir maps (default: current dir)
