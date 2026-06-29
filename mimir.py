@@ -801,19 +801,29 @@ def _extract_scope_keywords(task: str) -> list[str]:
 
 
 def _extract_path_keywords(task: str) -> list[str]:
-    """Looser keyword set for path matching — includes short words, fewer stopwords."""
+    """Looser keyword set for path matching — includes short words, fewer stopwords.
+
+    Also splits CamelCase query terms into sub-components so that e.g.
+    'RectificationFilterVC' generates 'rectification' + 'filter' as path keywords,
+    enabling substring-matching against 'RectificationFilterDialogFragment'.
+    """
     _path_stops = frozenset({
         "the", "and", "for", "with", "how", "add", "fix", "new", "get", "set",
         "use", "make", "do", "in", "on", "at", "to", "of", "by", "or", "a",
     })
     words = re.findall(r'[a-zA-Z]{3,}', task.lower())
+    # Split CamelCase terms into sub-components (min 4 chars to avoid noise)
+    for camel in re.findall(r'\b[A-Z][a-zA-Z]{3,}\b', task):
+        for part in re.findall(r'[A-Z][a-z0-9]+', camel):
+            if len(part) >= 4:
+                words.append(part.lower())
     seen: set[str] = set()
     out: list[str] = []
     for w in words:
         if w not in seen and w not in _path_stops:
             seen.add(w)
             out.append(w)
-    return out[:15]
+    return out[:20]
 
 
 def _parse_import_entries(path: Path, text: str) -> list[tuple[str, str]]:
@@ -1279,15 +1289,20 @@ def scope_task(task: str, max_files: int = 5, include_blueprints: bool = False) 
             file_hit_count[rel] = file_hit_count.get(rel, 0) + weight
 
     # Path-based supplement: finds files whose path contains task terms.
-    # Fills gaps when no symbol exists by that name (e.g. "admin" → app/admin/page.tsx).
+    # Filename matches score 3x vs directory matches (score 1x) so that
+    # "RectificationFilterDialogFragment.java" outranks generic files that merely
+    # live in a directory named "filter". Also boosts files already found via
+    # symbol search so cross-platform counterparts (iOS ↔ Android) surface together.
     path_kws = _extract_path_keywords(task)
     try:
         for src_path in _iter_source_files():
             rel = str(src_path.relative_to(WORKSPACE_ROOT))
-            rel_norm = rel.lower().replace("-", " ").replace("/", " ").replace("_", " ")
-            score = sum(1 for kw in path_kws if kw in rel_norm)
-            if score > 0 and rel not in file_hit_count:
-                file_hit_count[rel] = score
+            fname_norm = src_path.stem.lower()
+            dir_norm = str(src_path.parent.relative_to(WORKSPACE_ROOT)).lower()
+            score = sum(3 if kw in fname_norm else (1 if kw in dir_norm else 0)
+                        for kw in path_kws)
+            if score > 0:
+                file_hit_count[rel] = file_hit_count.get(rel, 0) + score
     except Exception:
         pass
 
@@ -1297,10 +1312,11 @@ def scope_task(task: str, max_files: int = 5, include_blueprints: bool = False) 
             "Try more specific terms — class names, function names, or file path segments."
         )
 
-    # Definition files always surface first, then by total score
+    # Rank purely by total score — symbol hits already carry higher per-hit weight (3)
+    # so they naturally outrank path-only matches without a hard binary split that
+    # buries cross-platform counterparts (e.g. Java files alongside Swift files).
     def _file_rank(f: str) -> tuple:
-        has_def = any(_def_line_pat.search(s) for _, r, _, s in all_hits if r == f)
-        return (0 if has_def else 1, -file_hit_count[f])
+        return (-file_hit_count[f],)
 
     top_files = sorted(file_hit_count, key=_file_rank)[:max_files]
     top_set = set(top_files)
