@@ -2335,6 +2335,66 @@ def record_alias(domain_term: str, code_name: str) -> str:
 
 
 @mcp.tool()
+def add_ignore(pattern: str, reason: str = "") -> str:
+    """Add a gitignore-style pattern to .mimirignore to exclude noisy files from the index.
+
+    Call this when you encounter files or directories that add noise without useful
+    symbols — vendor libraries, generated code, test fixtures, build artefacts,
+    minified bundles, resource XML, etc.
+
+    IMPORTANT: Always tell the user what you are about to add and why BEFORE calling
+    this tool — they may want to adjust the pattern or skip it entirely. A pattern
+    that is too broad can silently exclude real source files.
+
+    The pattern is appended immediately and takes effect on the next file walk
+    (within 30 seconds). The architecture map cache is also cleared so the next
+    get_architecture call reflects the updated exclusions.
+
+    Args:
+        pattern: gitignore-style glob, e.g. "**/vendor/**" or "**/*.generated.cs"
+        reason:  short human-readable note saved as a comment above the pattern
+                 so the team knows why it was added (e.g. "vendored jQuery bundles")
+
+    Returns confirmation showing the added pattern.
+    """
+    global _MIMIRIGNORE_PATTERNS, _FILE_LIST, _FILE_LIST_TS, _ARCHITECTURE_MAP
+
+    pattern = pattern.strip()
+    if not pattern or pattern.startswith('#'):
+        return "Error: pattern must be a non-empty, non-comment string."
+    if '..' in pattern:
+        return "Error: pattern must not escape the workspace root."
+
+    ignore_path = WORKSPACE_ROOT / ".mimirignore"
+
+    # Guard against duplicates
+    if ignore_path.exists():
+        for line in ignore_path.read_text(encoding='utf-8').splitlines():
+            if line.strip() == pattern:
+                return f"Pattern already in .mimirignore: {pattern}"
+
+    lines: list[str] = []
+    if reason:
+        lines.append(f"# {reason}")
+    lines.append(pattern)
+    block = '\n'.join(lines) + '\n'
+
+    with open(ignore_path, 'a', encoding='utf-8') as f:
+        if ignore_path.stat().st_size > 0 if ignore_path.exists() else False:
+            f.write('\n')
+        f.write(block)
+
+    # Reload patterns and invalidate file list + architecture cache
+    _MIMIRIGNORE_PATTERNS = _load_mimirignore()
+    _FILE_LIST = []
+    _FILE_LIST_TS = 0.0
+    _ARCHITECTURE_MAP = ''
+
+    suffix = f"  # {reason}" if reason else ""
+    return f"Added to .mimirignore: {pattern}{suffix}"
+
+
+@mcp.tool()
 def get_status() -> str:
     """Report the current state of the mimir index for this workspace.
 
@@ -2582,17 +2642,22 @@ def setup() -> None:
             f"\n{mimir_marker}\n\n"
             "This project has mimir MCP tools available. Use them before reading raw files.\n\n"
             "At the start of any coding session:\n"
-            "1. Call `get_status` to check the index is ready and see any active exclusions\n"
-            "2. Call `scope_task(\"describe what you want to do\")` to find relevant files\n\n"
+            "1. Call `get_status` to check the index is ready and see active exclusions\n"
+            "2. Call `get_architecture()` for a high-level map of the whole codebase (cheap)\n"
+            "3. Call `get_changed_files()` to see what is currently in flight vs main\n"
+            "4. Call `scope_task(\"describe what you want to do\")` to find relevant files\n\n"
             "For any task involving existing code:\n"
             "- Use `scope_task` before opening files — it finds the right files in one call\n"
-            "- Use `get_file_structure` to see a file's symbol map before reading it line by line\n"
+            "- Use `get_symbol(path, name)` to read ONE function or class body instead of the whole file\n"
+            "- Use `get_file_structure` to see a file's full symbol map before reading it line by line\n"
             "- Use `verify_symbol_existence` before assuming a function or type exists\n"
             "- Use `find_callers` after `verify_symbol_existence` to trace impact\n"
-            "- Use `get_directory_structure` when you know the directory but not which file\n"
+            "- Use `get_dependents(path)` to find what else imports a file before changing it\n"
             "- Use `get_imports` when an unfamiliar symbol appears and you need to trace its origin\n"
             "- Call `record_alias(domain_term, code_name)` when you discover a feature name maps\n"
             "  to a different code name — future scope_task searches will expand it automatically\n"
+            "- Call `add_ignore(pattern, reason)` when you encounter vendor/generated/test files\n"
+            "  that add noise — always tell the user what you are adding and why first\n"
         )
         with open(claude_md, "a", encoding="utf-8") as f:
             f.write(snippet)
@@ -2609,24 +2674,83 @@ def setup() -> None:
         copilot_snippet = (
             f"{copilot_marker}\n\n"
             "This project has mimir MCP tools. Always use them before using built-in search or reading files.\n\n"
-            "Workflow for any task involving existing code:\n"
+            "Workflow for any coding session:\n"
             "1. Call `get_status` to confirm the index is ready\n"
-            "2. Call `scope_task` with a description of the task — use its ranked file list, "
-            "do NOT fall back to glob or grep even if the output is large\n"
+            "2. Call `get_architecture()` for a high-level map of the whole codebase (one cheap call)\n"
+            "3. Call `get_changed_files()` to see what is currently in flight vs main\n"
+            "4. Call `scope_task` with a description of the task — use its ranked file list and "
+            "suggested get_symbol calls, do NOT fall back to glob or grep\n"
             "   - Tip: use technical/class names when known (e.g. 'RectificationFilter') "
             "rather than feature names (e.g. 'corrective actions filter')\n"
-            "3. Call `get_file_structure` on the files scope_task returns before reading raw lines\n"
-            "4. Use `find_callers` or `verify_symbol_existence` to trace symbols\n"
-            "5. When you discover a domain/feature term maps to a code name "
-            "(e.g. 'corrective actions' → 'RectificationFilter'), call `record_alias` "
-            "to save it — future scope_task searches will expand it automatically\n\n"
-            "Do not use built-in file search, glob, or grep if mimir tools are available. "
-            "Read the full scope_task output even if it is saved to a temp file — it contains the answer.\n"
+            "5. Call `get_symbol(path, name)` to read ONE function or class body — much cheaper "
+            "than reading the whole file\n"
+            "6. Use `get_dependents(path)` before changing a shared file to see blast radius\n"
+            "7. When you discover a domain/feature term maps to a code name, call `record_alias` "
+            "to save it — future scope_task searches will expand it automatically\n"
+            "8. When you encounter vendor/generated/noisy files, tell the user what you found, "
+            "ask for confirmation, then call `add_ignore(pattern, reason)` to exclude them\n\n"
+            "Do not use built-in file search, glob, or grep if mimir tools are available.\n"
         )
         with open(copilot_instructions, "a", encoding="utf-8") as f:
             f.write(copilot_snippet)
         action = "updated" if copilot_instructions.exists() else "created"
         print(f"{action}  {copilot_instructions}  (mimir section appended)")
+
+    mimirignore = cwd / ".mimirignore"
+    if mimirignore.exists():
+        print(f"skipped  {mimirignore}  (already exists)")
+    else:
+        mimirignore.write_text(
+            "# .mimirignore — gitignore-style patterns for files mimir should skip.\n"
+            "# Generated by mimir-setup. Edit freely; mimir reloads this automatically.\n"
+            "# Use add_ignore(pattern, reason) in Claude/Copilot to add patterns on the fly.\n"
+            "\n"
+            "# Build and compiler output\n"
+            "**/obj/**\n"
+            "**/bin/**\n"
+            "**/build/**\n"
+            "**/dist/**\n"
+            "**/__pycache__/**\n"
+            "**/.next/**\n"
+            "**/.nuxt/**\n"
+            "\n"
+            "# Package managers and vendored dependencies\n"
+            "**/node_modules/**\n"
+            "**/vendor/**\n"
+            "**/Pods/**\n"
+            "**/wwwroot/lib/**\n"
+            "**/Packages/**\n"
+            "\n"
+            "# Generated and migration files\n"
+            "**/Migrations/**\n"
+            "**/*.generated.*\n"
+            "**/Generated/**\n"
+            "\n"
+            "# Minified / bundled JS and CSS\n"
+            "**/*.min.js\n"
+            "**/*.min.css\n"
+            "**/*.bundle.js\n"
+            "**/*.map\n"
+            "\n"
+            "# Android resource XML (layout, drawables — not code symbols)\n"
+            "**/res/layout/**\n"
+            "**/res/drawable/**\n"
+            "**/res/menu/**\n"
+            "**/res/values/**\n"
+            "**/androidTest/**\n"
+            "\n"
+            "# iOS / macOS frameworks and CocoaPods output\n"
+            "**/Pods/**\n"
+            "**/DerivedData/**\n"
+            "\n"
+            "# Test projects (uncomment if test noise outweighs the benefit)\n"
+            "# **/*.Tests/**\n"
+            "# **/*.Specs/**\n"
+            "# **/*Tests.Integration/**\n"
+            "# **/*Tests.Unit/**\n",
+            encoding="utf-8",
+        )
+        print(f"created  {mimirignore}")
 
     print("\nDone. Restart Claude Code or reload VS Code to pick up the config.")
 
@@ -2665,15 +2789,15 @@ MCP TOOLS (available to Claude Code and GitHub Copilot)
   verify_symbol_existence  Confirm a symbol is defined and find its location
   find_callers             Find every call site and usage of a symbol
   record_alias             Save a domain/feature name → code name mapping for future searches
+  add_ignore               Add a glob pattern to .mimirignore to exclude noisy files
   execute_local_sandbox    Run a Python or bash snippet with a timeout
 
 EXCLUDING FILES
-  Create .mimirignore in the project root with gitignore-style patterns:
-    **/obj/**
-    **/bin/**
-    **/*.generated.cs
-    **/vendor/**
-  Mimir reloads it automatically. Run `mimir status` to confirm active patterns.
+  mimir-setup creates a starter .mimirignore covering common noise (build output,
+  node_modules, vendored assets, minified JS). To refine it:
+  - Edit .mimirignore directly with gitignore-style patterns
+  - Ask Claude/Copilot to call add_ignore(pattern, reason) when it spots noisy files
+  Run `mimir status` to confirm active patterns.
 
 DOMAIN ALIASES
   Create .mimiraliases in the project root to map feature names to code names:

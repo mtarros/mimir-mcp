@@ -92,7 +92,7 @@ def workspace(tmp_path):
 
 class TestToolRegistration:
     async def test_all_tools_listed(self, workspace):
-        """All 13 tools must be registered — any missing tool fails silently in production."""
+        """All 14 tools must be registered — any missing tool fails silently in production."""
         async with Client(_make_transport(workspace)) as client:
             tools = await client.list_tools()
             names = {t.name for t in tools}
@@ -106,6 +106,7 @@ class TestToolRegistration:
             "get_directory_structure",
             "get_status",
             "record_alias",
+            "add_ignore",
             "execute_local_sandbox",
             "get_symbol",
             "get_changed_files",
@@ -366,6 +367,47 @@ class TestRecordAliasWire:
             r = await client.call_tool("record_alias", {"domain_term": "", "code_name": "Foo"})
         text = _text(r)
         assert "Error" in text
+
+
+# ---------------------------------------------------------------------------
+# add_ignore
+# ---------------------------------------------------------------------------
+
+class TestAddIgnoreWire:
+    async def test_adds_pattern_and_writes_file(self, workspace):
+        async with Client(_make_transport(workspace)) as client:
+            r = await client.call_tool(
+                "add_ignore",
+                {"pattern": "**/vendor/**", "reason": "third-party libs"},
+            )
+        text = _text(r)
+        assert "**/vendor/**" in text
+        assert "EXCEPTION" not in text
+        ignore_file = workspace / ".mimirignore"
+        assert ignore_file.exists()
+        assert "**/vendor/**" in ignore_file.read_text()
+
+    async def test_duplicate_pattern_rejected(self, workspace):
+        async with Client(_make_transport(workspace)) as client:
+            await client.call_tool("add_ignore", {"pattern": "**/dist/**"})
+            r = await client.call_tool("add_ignore", {"pattern": "**/dist/**"})
+        text = _text(r)
+        assert "already" in text.lower()
+        assert "EXCEPTION" not in text
+
+    async def test_empty_pattern_rejected(self, workspace):
+        async with Client(_make_transport(workspace)) as client:
+            r = await client.call_tool("add_ignore", {"pattern": ""})
+        text = _text(r)
+        assert "Error" in text
+        assert "EXCEPTION" not in text
+
+    async def test_path_traversal_rejected(self, workspace):
+        async with Client(_make_transport(workspace)) as client:
+            r = await client.call_tool("add_ignore", {"pattern": "../../etc/**"})
+        text = _text(r)
+        assert "Error" in text
+        assert "EXCEPTION" not in text
 
 
 # ---------------------------------------------------------------------------
