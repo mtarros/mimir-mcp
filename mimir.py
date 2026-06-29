@@ -582,6 +582,22 @@ _BLUEPRINT_TOPLEVEL_KWS = (
     'var ', 'type ', 'interface ', 'struct ', 'enum ', 'impl ',
 )
 
+# Names that look like symbols but are actually declarations/keywords (Java
+# package, C# namespace/internal, import statements). Filter them from the
+# architecture map so they don't pollute the symbol list.
+_ARCH_EXCLUDE_NAMES = frozenset({
+    'package', 'namespace', 'import', 'using', 'internal', 'extern',
+    'module', 'require', 'include', 'pragma', 'partial',
+})
+
+# Directories with more files than this are summarised as a symbol list rather
+# than a file-by-file listing — keeps large Java/C# modules to one compact line.
+_ARCH_LARGE_DIR_THRESHOLD = 12
+
+# Max directory sections shown. Dirs are ranked by file count so the most
+# populated (most important) modules always appear first.
+_ARCH_MAX_DIRS = 60
+
 
 def _toplevel_names_from_blueprint(blueprint: str) -> list[str]:
     """Return top-level symbol names from a blueprint string (depth-0 only)."""
@@ -598,7 +614,7 @@ def _toplevel_names_from_blueprint(blueprint: str) -> list[str]:
             if sig.startswith(kw):
                 sig = sig[len(kw):]
         m = re.match(r'([A-Za-z_]\w*)', sig)
-        if m:
+        if m and m.group(1) not in _ARCH_EXCLUDE_NAMES:
             names.append(m.group(1))
     return names
 
@@ -606,9 +622,12 @@ def _toplevel_names_from_blueprint(blueprint: str) -> list[str]:
 def _build_architecture_map() -> str:
     """Build a compact directory → file → symbols overview of the workspace.
 
-    Groups source files by their parent directory, lists top-level symbol names
-    for each file. Built once at warmup from already-cached blueprints so there
-    is no extra I/O cost.
+    Small directories (≤ _ARCH_LARGE_DIR_THRESHOLD files) are shown file-by-file.
+    Large directories are summarised as a single line of aggregated unique symbol
+    names — keeps Java/C# modules with 100+ files from blowing up the output.
+
+    Sections are ranked by file count so the most populated (most important)
+    modules appear first. Caps at _ARCH_MAX_DIRS total sections.
     """
     global _ARCHITECTURE_MAP
     dir_files: dict[str, list[Path]] = {}
@@ -616,17 +635,50 @@ def _build_architecture_map() -> str:
         key = str(p.parent.relative_to(WORKSPACE_ROOT))
         dir_files.setdefault(key, []).append(p)
 
+    # Sort by descending file count so high-value modules come first
+    ranked = sorted(dir_files.items(), key=lambda kv: -len(kv[1]))
+    total_dirs = len(ranked)
+    shown = ranked[:_ARCH_MAX_DIRS]
+    omitted = total_dirs - len(shown)
+
     parts: list[str] = [f"# Workspace architecture: {WORKSPACE_ROOT.name}\n"]
-    for dir_key in sorted(dir_files):
-        files = sorted(dir_files[dir_key])
+    if omitted > 0:
+        parts.append(
+            f"(showing top {_ARCH_MAX_DIRS} of {total_dirs} directories by file count — "
+            f"add patterns to .mimirignore to exclude tests/build dirs)\n"
+        )
+
+    for dir_key, files in shown:
+        files = sorted(files)
         label = dir_key if dir_key != '.' else '(root)'
-        parts.append(f"## {label}/  ({len(files)} {'file' if len(files) == 1 else 'files'})")
-        for fp in files:
-            blueprint = _build_blueprint(fp)
-            names = _toplevel_names_from_blueprint(blueprint)
-            name_str = ', '.join(names[:8]) + ('…' if len(names) > 8 else '')
-            parts.append(f"  {fp.name:<40}  {name_str}")
+        n = len(files)
+        parts.append(f"## {label}/  ({n} {'file' if n == 1 else 'files'})")
+
+        if n > _ARCH_LARGE_DIR_THRESHOLD:
+            # Large directory: collect all unique top-level symbol names, show compactly
+            seen: set[str] = set()
+            all_names: list[str] = []
+            for fp in files:
+                for name in _toplevel_names_from_blueprint(_build_blueprint(fp)):
+                    if name not in seen:
+                        seen.add(name)
+                        all_names.append(name)
+            sym_str = ', '.join(all_names[:16]) + ('…' if len(all_names) > 16 else '')
+            parts.append(f"  {sym_str or '(no top-level symbols extracted)'}")
+        else:
+            # Small directory: show file-by-file
+            for fp in files:
+                names = _toplevel_names_from_blueprint(_build_blueprint(fp))
+                name_str = ', '.join(names[:5]) + ('…' if len(names) > 5 else '')
+                parts.append(f"  {fp.name:<40}  {name_str}")
+
         parts.append('')
+
+    if omitted > 0:
+        parts.append(
+            f"... {omitted} more {'directory' if omitted == 1 else 'directories'} omitted. "
+            f"Use get_directory_structure for a specific path."
+        )
 
     result = '\n'.join(parts).rstrip()
     _ARCHITECTURE_MAP = result
