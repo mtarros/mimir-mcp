@@ -511,3 +511,31 @@ This prints SQL vs linear-scan timing and speedup numbers.
 | Ruby | tree-sitter | — |
 | Java | tree-sitter | — |
 | C / C++ | tree-sitter | — |
+| XML | custom extractor | — |
+
+**XML blueprint format:** Layout files show the view hierarchy with `@id` attributes in visual order — exactly what you need to compare field ordering between platforms. Resource files show name→value pairs:
+
+```
+# res/layout/dialog_rectification_filter.xml  [xml · 184 lines]
+L1   ScrollView
+L4     LinearLayout
+L12      TextView @id/labelDateRange text="Date Range"
+L19      Spinner @id/filterStatus
+L26      Spinner @id/filterAllocatedUser
+L33      Spinner @id/filterAttributes
+L40      Spinner @id/filterSortBy
+L47      CheckBox @id/filterRememberFilters
+
+# res/values/strings.xml  [xml · 312 lines]
+L45    string "rectification_filter_section_date_range" = "Date Range"
+L46    string "rectification_filter_section_status" = "Status"
+L47    string "rectification_filter_section_sort_by" = "Sort By"
+```
+
+To exclude noisy XML files (Maven pom.xml, IDE metadata, generated resources), add patterns to `.mimirignore`:
+```
+**/pom.xml
+**/.idea/**
+**/build/**
+**/*.generated.xml
+```

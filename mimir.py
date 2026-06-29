@@ -303,6 +303,7 @@ EXT_LANG = {
     ".hpp":  ("cpp",        "cstyle"),
     ".m":    ("objc",       "cstyle"),
     ".vue":  ("vue",        "cstyle"),
+    ".xml":  (None,         "xml"),   # custom extractor; not tree-sitter
 }
 
 # A node is a "definition" if its type ends with one of these suffixes. This
@@ -598,6 +599,106 @@ def _is_def_node(node) -> bool:
     return False
 
 
+_XML_COMMENT_RE = re.compile(r'<!--.*?-->', re.DOTALL)
+_XML_PI_RE      = re.compile(r'<\?.*?\?>', re.DOTALL)
+_XML_TAG_RE     = re.compile(r'<(/?)(\w[\w:.-]*)([^>]*?)(/?)>', re.DOTALL)
+
+# Tags that add no semantic value to the blueprint
+_XML_SKIP_TAGS = frozenset({
+    'resources', 'merge', 'data', 'import', 'variable', 'layout',
+    'declare-styleable', 'eat-comment',
+})
+
+def _extract_xml_blueprint(path: Path, text: str) -> str:
+    """Extract a structural blueprint from XML files.
+
+    Handles Android layout XML (view hierarchy with @id attributes) and
+    Android resource XML (strings, colors, dimensions). Produces one line
+    per meaningful element with key attributes shown inline.
+    """
+    # Strip comments and processing instructions before scanning tags
+    clean = _XML_COMMENT_RE.sub('', text)
+    clean = _XML_PI_RE.sub('', clean)
+
+    # Build a map from character offset → line number for the ORIGINAL text
+    # (use original so reported line numbers match the actual file)
+    line_starts: list[int] = [0]
+    for ch in text:
+        if ch == '\n':
+            line_starts.append(line_starts[-1] + 1)
+        else:
+            line_starts[-1] += 1
+    # Rebuild as cumulative offsets
+    cumulative = [0]
+    for raw_line in text.splitlines():
+        cumulative.append(cumulative[-1] + len(raw_line) + 1)
+
+    def _lineno(pos: int) -> int:
+        lo, hi = 0, len(cumulative) - 1
+        while lo < hi:
+            mid = (lo + hi + 1) // 2
+            if cumulative[mid] <= pos:
+                lo = mid
+            else:
+                hi = mid - 1
+        return lo + 1
+
+    out_lines: list[str] = []
+    depth = 0
+
+    for m in _XML_TAG_RE.finditer(clean):
+        is_close    = m.group(1) == '/'
+        tag_raw     = m.group(2)
+        attrs       = m.group(3)
+        is_self_close = m.group(4) == '/'
+        tag = tag_raw.split(':')[-1]   # strip namespace prefix (e.g. android:, app:)
+
+        if is_close:
+            depth = max(0, depth - 1)
+            continue
+
+        if tag in _XML_SKIP_TAGS:
+            if not is_self_close:
+                depth += 1
+            continue
+
+        lineno = _lineno(m.start())
+        indent = '  ' * min(depth, 8)
+
+        # Pull out the attributes we care about (in priority order)
+        android_id  = re.search(r'android:id="@\+?id/(\w+)"',    attrs)
+        name_attr   = re.search(r'\bname="([^"]+)"',              attrs)
+        text_attr   = re.search(r'\btext="([^"@][^"]*)"',         attrs)
+        hint_attr   = re.search(r'android:hint="([^"@][^"]*)"',   attrs)
+        style_attr  = re.search(r'\bstyle="([^"]+)"',             attrs)
+
+        parts: list[str] = [tag]
+        if android_id:
+            parts.append(f'@id/{android_id.group(1)}')
+        elif name_attr:
+            parts.append(f'"{name_attr.group(1)}"')
+        if text_attr and len(text_attr.group(1)) <= 50:
+            parts.append(f'text="{text_attr.group(1)}"')
+        elif hint_attr and len(hint_attr.group(1)) <= 50:
+            parts.append(f'hint="{hint_attr.group(1)}"')
+
+        # String resource: grab the inline value between tags
+        if tag == 'string' and name_attr:
+            after = clean[m.end():m.end() + 120]
+            val_m = re.match(r'\s*>?\s*([^<]{1,80})\s*<', after)
+            if val_m:
+                val = val_m.group(1).strip()
+                if val:
+                    parts.append(f'= "{val[:60]}"')
+
+        out_lines.append(f"L{lineno}  {indent}{' '.join(parts)}")
+
+        if not is_self_close:
+            depth += 1
+
+    return '\n'.join(out_lines)
+
+
 def _extract_tree_sitter(path: Path, src: bytes, ts_lang: str) -> Optional[str]:
     """Deterministic AST extraction. Returns None to signal 'fall back to regex'."""
     if not TREE_SITTER_OK:
@@ -682,6 +783,16 @@ def _build_blueprint(path: Path) -> str:
             blueprint = f"# {rel}  [skipped: minified/bundled file]"
             _cache_put(path, blueprint)
             return blueprint
+
+    # XML files use a dedicated extractor (not tree-sitter/regex)
+    if suffix == '.xml':
+        text = raw.decode('utf-8', 'replace')
+        body = _extract_xml_blueprint(path, text)
+        line_count = raw.count(b'\n') + 1
+        header = f"# {rel}  [xml · {line_count} lines]"
+        blueprint = header + '\n' + (body if body.strip() else '  (no structured elements found)')
+        _cache_put(path, blueprint)
+        return blueprint
 
     # Vue SFCs store script content as opaque raw_text in the Vue AST.
     # Extract the <script> block and reparse it as TypeScript so the normal
