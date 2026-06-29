@@ -803,15 +803,17 @@ def _start_file_watcher() -> bool:
 
     class _Handler(_WatchdogHandler):  # type: ignore[misc]
         def dispatch(self, event) -> None:
+            global _FILE_LIST, _FILE_LIST_TS, _ARCHITECTURE_MAP
             if event.is_directory:
                 # Directory added/removed — force a file-list re-walk
-                global _FILE_LIST, _FILE_LIST_TS
                 _FILE_LIST = []
                 _FILE_LIST_TS = 0.0
+                _ARCHITECTURE_MAP = ""
                 return
             p = Path(getattr(event, 'dest_path', event.src_path))
             if p.suffix in EXT_LANG and not _is_blacklisted(p):
                 _cache_evict(p)
+                _ARCHITECTURE_MAP = ""
                 # Incrementally refresh reverse-import index in the background
                 import threading
                 threading.Thread(
@@ -2084,10 +2086,43 @@ def get_changed_files(base: str = "main") -> str:
         if not source_files:
             return f"No source file changes found vs '{base}'."
 
-        parts = [
-            f"# Changed files vs '{base}'  ({len(source_files)} source "
-            f"{'file' if len(source_files) == 1 else 'files'})\n"
-        ]
+        # Collect line diff counts: working-tree vs base covers committed + uncommitted
+        numstat: dict[str, tuple[int, int]] = {}
+        r_numstat = _git("diff", "--numstat", base)
+        if r_numstat.returncode == 0:
+            for line in r_numstat.stdout.splitlines():
+                parts_ns = line.split("\t", 2)
+                if len(parts_ns) == 3:
+                    added_s, removed_s, fname = parts_ns
+                    try:
+                        numstat[fname.strip()] = (int(added_s), int(removed_s))
+                    except ValueError:
+                        pass  # binary files show '-' — skip
+
+        def _diff_tag(rel: str, p: Path) -> str:
+            if rel in numstat:
+                added, removed = numstat[rel]
+                return f"+{added} -{removed}"
+            if not p.exists():
+                return "deleted"
+            # Untracked new file — count its lines
+            try:
+                lines = len(p.read_text(errors="replace").splitlines())
+                return f"+{lines} -0"
+            except OSError:
+                return "new"
+
+        label = 'file' if len(source_files) == 1 else 'files'
+        header = (
+            f"# Changed files vs '{base}'  ({len(source_files)} source {label})\n"
+        )
+        summary_rows = []
+        for rel in source_files:
+            tag = _diff_tag(rel, WORKSPACE_ROOT / rel)
+            summary_rows.append(f"  {rel:<55} {tag}")
+        summary = "\n".join(summary_rows)
+
+        parts = [header + summary + "\n"]
         for rel in source_files:
             p = WORKSPACE_ROOT / rel
             if not p.exists():

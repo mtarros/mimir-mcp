@@ -493,6 +493,16 @@ class TestGetChangedFilesWire:
         assert "models.py" in text
         assert "EXCEPTION" not in text
 
+    async def test_shows_diff_summary_table(self, git_workspace):
+        """Summary table with +/- line counts should appear before the blueprints."""
+        async with Client(_make_transport(git_workspace)) as client:
+            r = await client.call_tool("get_changed_files", {"base": "main"})
+        text = _text(r)
+        # models.py is a new untracked-then-committed file; summary line shows +N -0 or +N -M
+        assert "+" in text
+        assert "models.py" in text
+        assert "EXCEPTION" not in text
+
     async def test_non_git_workspace_handled(self, workspace):
         """Plain tmp_path (no git repo) should return a clear error, not crash."""
         async with Client(_make_transport(workspace)) as client:
@@ -536,6 +546,31 @@ class TestGetArchitectureWire:
         text = _text(r)
         assert len(text) > 50
         assert "EXCEPTION" not in text
+
+    async def test_rebuilds_when_cache_invalidated(self, workspace):
+        """After invalidation, get_architecture must discover files added since warmup."""
+        new_file = workspace / "src" / "brandnew.py"
+        try:
+            async with Client(_make_transport(workspace)) as client:
+                # Prime the architecture cache (warmup may or may not have run yet)
+                await client.call_tool("get_architecture", {})
+                # Write a new file AFTER the server started
+                new_file.write_text("class BrandNewService:\n    pass\n")
+                # add_ignore clears _ARCHITECTURE_MAP and _FILE_LIST as a side effect
+                await client.call_tool("add_ignore", {"pattern": "__test_marker__"})
+                # Next call must rebuild from scratch and discover brandnew.py
+                r = await client.call_tool("get_architecture", {})
+            text = _text(r)
+            assert "BrandNewService" in text
+            assert "EXCEPTION" not in text
+        finally:
+            new_file.unlink(missing_ok=True)
+            ignore_file = workspace / ".mimirignore"
+            if ignore_file.exists():
+                content = ignore_file.read_text()
+                ignore_file.write_text(
+                    "\n".join(l for l in content.splitlines() if "__test_marker__" not in l) + "\n"
+                )
 
 
 # ---------------------------------------------------------------------------
