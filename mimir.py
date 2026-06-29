@@ -62,6 +62,16 @@ try:
 except Exception:  # noqa: BLE001 - we genuinely want to swallow everything here
     _ts_get_parser = None  # type: ignore
 
+# Optional file watcher — graceful fallback if watchdog is not installed
+_WATCHER_OK = False
+try:
+    from watchdog.observers import Observer as _WatchdogObserver          # type: ignore
+    from watchdog.events import FileSystemEventHandler as _WatchdogHandler # type: ignore
+    _WATCHER_OK = True
+except Exception:
+    _WatchdogObserver = None   # type: ignore
+    _WatchdogHandler  = None   # type: ignore
+
 
 # --------------------------------------------------------------------------- #
 # Configuration
@@ -243,6 +253,8 @@ def _init_disk_cache() -> "Optional[object]":
 _DISK_CACHE = _init_disk_cache()
 _FTS_READY = False       # True once the symbols inverted index is built and queryable
 _WARMUP_COMPLETE = False  # True once _warm_cache() finishes its first full pass
+_REVERSE_IMPORTS: dict[str, list[str]] = {}  # rel_target → sorted list of rel files that import it
+_FILE_WATCHER_ACTIVE = False  # True if a watchdog observer started successfully
 
 
 def _load_disk_cache() -> int:
@@ -454,6 +466,28 @@ def _cache_put(path: Path, blueprint: str) -> None:
             pass
 
 
+def _cache_evict(path: Path) -> None:
+    """Remove a single file's blueprint from memory and disk caches.
+
+    Called by the file watcher on modification/deletion so the next access
+    rebuilds a fresh blueprint rather than returning stale structure.
+    """
+    global _FILE_LIST, _FILE_LIST_TS
+    _CACHE.pop(str(path), None)
+    if _DISK_CACHE is not None:
+        try:
+            rel = str(path.relative_to(WORKSPACE_ROOT))
+            _DISK_CACHE.execute("DELETE FROM blueprints WHERE path = ?", (str(path),))
+            _DISK_CACHE.execute("DELETE FROM symbols WHERE file = ?", (rel,))
+            _DISK_CACHE.execute("DELETE FROM lines WHERE file = ?", (rel,))
+            _DISK_CACHE.commit()
+        except Exception:
+            pass
+    # Force a file-list re-walk so new/deleted files are picked up immediately
+    _FILE_LIST = []
+    _FILE_LIST_TS = 0.0
+
+
 # --------------------------------------------------------------------------- #
 # Path helpers / safety
 # --------------------------------------------------------------------------- #
@@ -508,6 +542,73 @@ def _iter_source_files() -> list[Path]:
     return result
 
 
+def _build_reverse_imports() -> None:
+    """Build _REVERSE_IMPORTS: for each workspace file, which other files import it.
+
+    Only covers languages where _resolve_import can produce 'workspace' hits
+    (TypeScript/JS and Python). Called from _warm_cache and incrementally
+    when the file watcher detects a change.
+    """
+    global _REVERSE_IMPORTS
+    rev: dict[str, set[str]] = {}
+    for src_path in _iter_source_files():
+        try:
+            text = src_path.read_text(encoding='utf-8', errors='replace')
+        except OSError:
+            continue
+        entries = _parse_import_entries(src_path, text)
+        if not entries:
+            continue
+        rel_src = str(src_path.relative_to(WORKSPACE_ROOT))
+        for spec, _ in entries:
+            try:
+                kind, resolved = _resolve_import(spec, src_path)
+            except Exception:
+                continue
+            if kind == 'workspace':
+                rev.setdefault(resolved, set()).add(rel_src)
+    _REVERSE_IMPORTS = {k: sorted(v) for k, v in rev.items()}
+
+
+def _start_file_watcher() -> bool:
+    """Start a background watchdog observer to evict stale blueprints instantly.
+
+    Returns True if the watcher started, False if watchdog is not installed
+    or failed to start (falls back to the existing 30-second mtime re-walk).
+    """
+    global _FILE_WATCHER_ACTIVE
+    if not _WATCHER_OK:
+        return False
+
+    class _Handler(_WatchdogHandler):  # type: ignore[misc]
+        def dispatch(self, event) -> None:
+            if event.is_directory:
+                # Directory added/removed — force a file-list re-walk
+                global _FILE_LIST, _FILE_LIST_TS
+                _FILE_LIST = []
+                _FILE_LIST_TS = 0.0
+                return
+            p = Path(getattr(event, 'dest_path', event.src_path))
+            if p.suffix in EXT_LANG and not _is_blacklisted(p):
+                _cache_evict(p)
+                # Incrementally refresh reverse-import index in the background
+                import threading
+                threading.Thread(
+                    target=_build_reverse_imports, daemon=True,
+                    name="mimir-reimports"
+                ).start()
+
+    try:
+        obs = _WatchdogObserver()
+        obs.schedule(_Handler(), str(WORKSPACE_ROOT), recursive=True)
+        obs.daemon = True
+        obs.start()
+        _FILE_WATCHER_ACTIVE = True
+        return True
+    except Exception:
+        return False
+
+
 def _warm_cache() -> None:
     """Parse all source files in parallel so the first search is fast."""
     global _WARMUP_COMPLETE
@@ -518,6 +619,7 @@ def _warm_cache() -> None:
             pass
     _build_cs_ns_index()
     _build_symbol_index()
+    _build_reverse_imports()
     _WARMUP_COMPLETE = True
 
 
@@ -1301,6 +1403,14 @@ def _resolve_import(specifier: str, source_file: Path) -> tuple[str, str]:
                         except ValueError:
                             pass
             return ('unresolved', specifier)
+        # Absolute import: try to resolve against the workspace root
+        mod_path = WORKSPACE_ROOT / specifier.replace('.', '/')
+        for c in [mod_path.with_suffix('.py'), mod_path / '__init__.py']:
+            if c.is_file():
+                try:
+                    return ('workspace', str(c.relative_to(WORKSPACE_ROOT)))
+                except ValueError:
+                    pass
         return ('external', specifier)
 
     if suffix in ('.cs', '.kt', '.kts', '.swift'):
@@ -1510,6 +1620,20 @@ def scope_task(task: str, max_files: int = 5, include_blueprints: bool = False) 
         parts.append(f"  {i}. {rel}  ({n} {'match' if n == 1 else 'matches'})")
     parts.append("\nCall get_file_structure on the files above for full symbol maps.")
 
+    # Show files that import the top results — useful when the task involves changing
+    # a shared module and the AI needs to know what else may need updating.
+    if _REVERSE_IMPORTS and top_files:
+        dependent_set: set[str] = set()
+        for rel in top_files:
+            for dep in _REVERSE_IMPORTS.get(rel, []):
+                if dep not in top_set:
+                    dependent_set.add(dep)
+        if 0 < len(dependent_set) <= 8:
+            parts.append("\n## Files that import these results\n")
+            for dep in sorted(dependent_set):
+                parts.append(f"  {dep}")
+            parts.append("(May need updates if the above files change — call get_dependents for full details)")
+
     if include_blueprints:
         parts.append("\n## File blueprints\n")
         for rel in top_files:
@@ -1583,6 +1707,53 @@ def get_imports(path: str) -> str:
         parts.extend(external_lines)
     parts.append(f"\n{len(workspace_lines)} workspace, {len(external_lines)} external")
     return "\n".join(parts)
+
+
+@mcp.tool()
+def get_dependents(path: str) -> str:
+    """Find all workspace files that directly import the given file.
+
+    WHEN TO USE: after identifying a file you are about to change, call this
+    to see the blast radius — which other files in the workspace will be
+    directly affected. Returns only first-hop importers (files with a direct
+    import statement pointing at this file).
+
+    Works for languages where mimir resolves imports to workspace paths:
+    TypeScript, JavaScript, and Python. For other languages use find_callers
+    to trace symbol-level usage instead.
+
+    Args:
+        path: workspace-relative path to the file being changed.
+
+    Returns a list of files that import it, or a clear message if none do.
+    """
+    try:
+        resolved = _resolve_in_workspace(path)
+    except ValueError as e:
+        return f"Error: {e}."
+    rel = str(resolved.relative_to(WORKSPACE_ROOT))
+
+    if not _WARMUP_COMPLETE:
+        return "Reverse import index is still building — try again in a few seconds."
+
+    dependents = _REVERSE_IMPORTS.get(rel, [])
+    if not dependents:
+        return (
+            f"No workspace files directly import '{rel}'.\n"
+            "It may be an entry point, have only external consumers, "
+            "or use a language where import resolution is not supported "
+            "(Kotlin, Swift, Java, C#, Go, Rust — use find_callers for those)."
+        )
+
+    count = len(dependents)
+    lines = [f"# Dependents of '{rel}'  ({count} direct {'importer' if count == 1 else 'importers'})\n"]
+    for dep in dependents:
+        lines.append(f"  {dep}")
+    lines.append(
+        f"\nThese {count} {'file' if count == 1 else 'files'} import '{rel}' directly "
+        "and may need updates if its exports change."
+    )
+    return "\n".join(lines)
 
 
 @mcp.tool()
@@ -1871,6 +2042,18 @@ def get_status() -> str:
                 "    feature name maps to a different code name in the codebase"
             )
 
+        rev_count = len(_REVERSE_IMPORTS)
+        watcher_line = (
+            "file_watcher:       on (changes invalidate cache instantly)"
+            if _FILE_WATCHER_ACTIVE
+            else "file_watcher:       off  (pip install watchdog to enable)"
+        )
+        rev_line = (
+            f"reverse_imports:    {rev_count:,} files mapped"
+            if rev_count > 0
+            else "reverse_imports:    building..."
+        )
+
         lines = [
             f"workspace:          {WORKSPACE_ROOT}",
             f"source_files:       {total_files}",
@@ -1880,6 +2063,8 @@ def get_status() -> str:
             f"warmup:             {warmup_state}",
             f"tree_sitter:        {'on' if TREE_SITTER_OK else 'off (regex fallback)'}",
             f"sandbox:            {'on' if SANDBOX_ENABLED else 'off'}",
+            watcher_line,
+            rev_line,
             "",
             ignore_section,
             "",
@@ -2111,6 +2296,7 @@ MCP TOOLS (available to Claude Code and GitHub Copilot)
   get_file_structure       Compact symbol map of a single file (classes, methods, line nos)
   get_directory_structure  Symbol maps for every file under a directory
   get_imports              Resolve imports to workspace files or external packages
+  get_dependents           Find all files that directly import a given file (blast radius)
   verify_symbol_existence  Confirm a symbol is defined and find its location
   find_callers             Find every call site and usage of a symbol
   record_alias             Save a domain/feature name → code name mapping for future searches
@@ -2195,6 +2381,8 @@ def main() -> None:
     )
     import threading
     threading.Thread(target=_warm_cache, daemon=True, name="mimir-warmup").start()
+    watcher_state = "on" if _start_file_watcher() else "off (install watchdog for auto-invalidation)"
+    print(f"[mimir] file_watcher={watcher_state}", file=sys.stderr)
     mcp.run()
 
 

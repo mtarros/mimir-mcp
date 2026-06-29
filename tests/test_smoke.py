@@ -101,6 +101,7 @@ class TestToolRegistration:
             "verify_symbol_existence",
             "scope_task",
             "get_imports",
+            "get_dependents",
             "find_callers",
             "get_directory_structure",
             "get_status",
@@ -235,6 +236,32 @@ class TestFindCallersWire:
         text = _text(r)
         assert "EXCEPTION" not in text
         assert "No usages" in text or "not found" in text.lower()
+
+
+# ---------------------------------------------------------------------------
+# get_dependents
+# ---------------------------------------------------------------------------
+
+class TestGetDependentsWire:
+    async def test_returns_importer(self, workspace):
+        """auth.py imports src.service, so service.py should list auth.py as a dependent."""
+        async with Client(_make_transport(workspace)) as client:
+            r = await client.call_tool("get_dependents", {"path": "src/service.py"})
+        text = _text(r)
+        assert "auth.py" in text
+        assert "EXCEPTION" not in text
+
+    async def test_file_with_no_dependents(self, workspace):
+        async with Client(_make_transport(workspace)) as client:
+            r = await client.call_tool("get_dependents", {"path": "src/models.py"})
+        text = _text(r)
+        assert "EXCEPTION" not in text
+
+    async def test_unknown_path_handled(self, workspace):
+        async with Client(_make_transport(workspace)) as client:
+            r = await client.call_tool("get_dependents", {"path": "src/does_not_exist.py"})
+        text = _text(r)
+        assert "EXCEPTION" not in text
 
 
 # ---------------------------------------------------------------------------

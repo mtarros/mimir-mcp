@@ -336,7 +336,20 @@ WHEN TO USE: after `verify_symbol_existence` tells you where something is define
 
 ---
 
-### 7. `record_alias` — teach mimir your project's vocabulary
+### 7. `get_dependents` — blast-radius analysis (who imports this file?)
+
+Returns every workspace file that directly imports a given file. Built from the reverse import index that mimir constructs at startup — no extra configuration needed. Use it when you're about to change a shared module and need to know which files will be affected.
+
+**Example:**
+> `get_dependents("src/services/auth.py")`
+
+Returns a sorted list of files that import `auth.py`, e.g. `src/controllers/login.py`, `src/controllers/signup.py`. If no workspace files import it, mimir says so and suggests `find_callers` for languages (Swift, Kotlin, Java, Go, Rust) where import resolution is not supported.
+
+WHEN TO USE: before modifying a widely-used utility, service, or model — get the full blast radius in one call instead of grepping for the filename manually.
+
+---
+
+### 8. `record_alias` — teach mimir your project's vocabulary
 
 Records a mapping from a domain/feature name to the code name used in the codebase. Once saved, `scope_task` automatically expands matching phrases before searching — so plain-English task descriptions find the right files even when the code uses completely different terminology.
 
@@ -382,7 +395,7 @@ To remove an entry: delete the line or comment it out with `#`.
 
 ---
 
-### 8. `execute_local_sandbox` — run a quick snippet
+### 9. `execute_local_sandbox` — run a quick snippet
 
 Runs a Python or bash snippet locally with a timeout, captures output, and returns it.
 
