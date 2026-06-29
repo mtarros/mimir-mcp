@@ -118,7 +118,7 @@ class TestToolRegistration:
     async def test_tool_results_are_text_not_none(self, workspace):
         """Every tool must return a non-empty string — no None, no empty result."""
         async with Client(_make_transport(workspace)) as client:
-            r = await client.call_tool("get_file_structure", {"file_path": "src/service.py"})
+            r = await client.call_tool("get_file_structure", {"path":"src/service.py"})
         assert _text(r), "get_file_structure returned empty string"
         assert "EXCEPTION" not in _text(r), "Unhandled exception escaped tool handler"
 
@@ -130,21 +130,21 @@ class TestToolRegistration:
 class TestGetFileStructureWire:
     async def test_returns_blueprint_with_l_lines(self, workspace):
         async with Client(_make_transport(workspace)) as client:
-            r = await client.call_tool("get_file_structure", {"file_path": "src/service.py"})
+            r = await client.call_tool("get_file_structure", {"path":"src/service.py"})
         text = _text(r)
         assert "UserService" in text
         assert text.count("\nL") >= 2, "Blueprint should have multiple L-lines"
 
     async def test_file_not_found_returns_error_string(self, workspace):
         async with Client(_make_transport(workspace)) as client:
-            r = await client.call_tool("get_file_structure", {"file_path": "does/not/exist.py"})
+            r = await client.call_tool("get_file_structure", {"path":"does/not/exist.py"})
         text = _text(r)
         assert "not found" in text.lower() or "Error" in text
         assert "EXCEPTION" not in text
 
     async def test_path_traversal_rejected(self, workspace):
         async with Client(_make_transport(workspace)) as client:
-            r = await client.call_tool("get_file_structure", {"file_path": "../../etc/passwd"})
+            r = await client.call_tool("get_file_structure", {"path":"../../etc/passwd"})
         text = _text(r)
         assert "outside" in text.lower() or "escapes" in text.lower() or "error" in text.lower()
 
@@ -196,14 +196,14 @@ class TestVerifySymbolExistenceWire:
 class TestGetImportsWire:
     async def test_resolves_workspace_import(self, workspace):
         async with Client(_make_transport(workspace)) as client:
-            r = await client.call_tool("get_imports", {"file_path": "src/controllers/auth.py"})
+            r = await client.call_tool("get_imports", {"path":"src/controllers/auth.py"})
         text = _text(r)
         assert "workspace" in text.lower() or "service" in text.lower()
         assert "EXCEPTION" not in text
 
     async def test_file_with_no_imports_handled(self, workspace):
         async with Client(_make_transport(workspace)) as client:
-            r = await client.call_tool("get_imports", {"file_path": "src/models.py"})
+            r = await client.call_tool("get_imports", {"path":"src/models.py"})
         text = _text(r)
         assert "EXCEPTION" not in text
 

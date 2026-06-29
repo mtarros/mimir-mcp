@@ -1156,7 +1156,7 @@ mcp = FastMCP("mimir")
 
 
 @mcp.tool()
-def get_file_structure(file_path: str) -> str:
+def get_file_structure(path: str) -> str:
     """Return a compact structural blueprint of ONE source file: only classes,
     functions, methods, structs, and their signatures - all bodies, loops, and
     implementation text stripped out.
@@ -1167,7 +1167,7 @@ def get_file_structure(file_path: str) -> str:
     this, and only the specific ranges you actually need.
 
     Args:
-        file_path: path to the file, relative to the workspace root.
+        path: path to the file, relative to the workspace root.
 
     Returns a dense text map like:
         # src/auth/session.py  [py · tree-sitter]
@@ -1176,20 +1176,20 @@ def get_file_structure(file_path: str) -> str:
         L40  def revoke_all(user_id)
     """
     try:
-        path = _resolve_in_workspace(file_path)
+        resolved = _resolve_in_workspace(path)
     except ValueError as e:
         return f"Error: {e}. Pass a path inside the workspace root ({WORKSPACE_ROOT})."
-    if not path.exists():
-        return (f"Error: '{file_path}' not found under {WORKSPACE_ROOT}. "
+    if not resolved.exists():
+        return (f"Error: '{path}' not found under {WORKSPACE_ROOT}. "
                 f"Double-check the relative path.")
-    if path.is_dir():
-        return f"Error: '{file_path}' is a directory, not a file. Pass a single source file."
-    if _is_blacklisted(path):
-        return f"Error: '{file_path}' lives in a blacklisted directory and is not mapped."
+    if resolved.is_dir():
+        return f"Error: '{path}' is a directory, not a file. Pass a single source file."
+    if _is_blacklisted(resolved):
+        return f"Error: '{path}' lives in a blacklisted directory and is not mapped."
     try:
-        return _build_blueprint(path)
+        return _build_blueprint(resolved)
     except Exception as e:  # last-resort guard: never break the stdio stream
-        return f"Error mapping '{file_path}': {type(e).__name__}: {e}. Try a smaller file or a line range."
+        return f"Error mapping '{path}': {type(e).__name__}: {e}. Try a smaller file or a line range."
 
 
 @mcp.tool()
@@ -1226,24 +1226,29 @@ def verify_symbol_existence(symbol_name: str, max_results: int = 25) -> str:
 
 
 @mcp.tool()
-def scope_task(task: str, max_files: int = 5) -> str:
+def scope_task(task: str, max_files: int = 5, include_blueprints: bool = False) -> str:
     """Map a plain-English task description to the specific files and symbols it
     touches — before reading any raw file contents.
 
     WHEN TO USE: call this as the FIRST step on any task that involves existing
     code. It extracts candidate symbol names from your description, searches the
-    workspace for their definitions, and returns full structural blueprints for the
-    most-matched files. This replaces open-ended codebase exploration with a
-    single targeted call and tells you exactly which line ranges to read next.
+    workspace for their definitions, and returns the ranked file list with matched
+    symbols. Then call get_file_structure on the specific files you need.
+
+    TIP: use technical/class names when known ("RectificationFilter") rather than
+    domain language ("corrective actions filter") — the symbol index matches code
+    names, not feature names.
 
     Args:
         task: plain-English description of what you want to do, e.g.
               "add retry logic to the live tutor session handler".
-        max_files: how many files to include blueprints for (default 5).
+        max_files: how many files to rank and return (default 5).
+        include_blueprints: set True to include full structural blueprints inline
+                            (useful for small repos; may produce large output on
+                            large repos — prefer calling get_file_structure after).
 
-    Returns a scoped context block: keywords searched, every matching symbol
-    definition with file:line, and structural blueprints for the top files.
-    After calling this, read only the specific line ranges you need.
+    Returns a compact context block: keywords searched, matched symbols with
+    file:line locations, and ranked files by relevance score.
     """
     keywords = _extract_scope_keywords(task)
     if not keywords:
@@ -1318,22 +1323,29 @@ def scope_task(task: str, max_files: int = 5) -> str:
             parts.append(f"  {r}:{l}  {s}")
         parts.append("")
 
-    parts.append("## File blueprints\n")
-    for rel in top_files:
+    parts.append("## Ranked files\n")
+    for i, rel in enumerate(top_files, 1):
         n = file_hit_count[rel]
-        try:
-            path = _resolve_in_workspace(rel)
-            blueprint = _build_blueprint(path)
-        except Exception as e:
-            parts.append(f"### {rel}\n  (error reading: {e})\n")
-            continue
-        parts.append(f"### {rel}  ({n} {'match' if n == 1 else 'matches'})\n{blueprint}\n")
+        parts.append(f"  {i}. {rel}  ({n} {'match' if n == 1 else 'matches'})")
+    parts.append("\nCall get_file_structure on the files above for full symbol maps.")
+
+    if include_blueprints:
+        parts.append("\n## File blueprints\n")
+        for rel in top_files:
+            n = file_hit_count[rel]
+            try:
+                bp_path = _resolve_in_workspace(rel)
+                blueprint = _build_blueprint(bp_path)
+            except Exception as e:
+                parts.append(f"### {rel}\n  (error reading: {e})\n")
+                continue
+            parts.append(f"### {rel}  ({n} {'match' if n == 1 else 'matches'})\n{blueprint}\n")
 
     return "\n".join(parts)
 
 
 @mcp.tool()
-def get_imports(file_path: str) -> str:
+def get_imports(path: str) -> str:
     """List every import in a source file and resolve workspace-local ones to actual paths.
 
     WHEN TO USE: after get_file_structure reveals an unfamiliar symbol, call this
@@ -1343,43 +1355,43 @@ def get_imports(file_path: str) -> str:
     files next.
 
     Args:
-        file_path: path to the file, relative to the workspace root.
+        path: path to the file, relative to the workspace root.
 
     Returns each import as [workspace] resolved/path.ts or [external] package-name,
     with the names being imported shown inline.
     """
     try:
-        path = _resolve_in_workspace(file_path)
+        resolved = _resolve_in_workspace(path)
     except ValueError as e:
         return f"Error: {e}."
-    if not path.exists():
-        return f"Error: '{file_path}' not found under {WORKSPACE_ROOT}."
-    if path.suffix not in EXT_LANG:
-        return f"Error: '{file_path}' is not a recognised source file type."
+    if not resolved.exists():
+        return f"Error: '{path}' not found under {WORKSPACE_ROOT}."
+    if resolved.suffix not in EXT_LANG:
+        return f"Error: '{path}' is not a recognised source file type."
 
     try:
-        text = path.read_text(encoding='utf-8', errors='replace')
+        text = resolved.read_text(encoding='utf-8', errors='replace')
     except OSError as e:
         return f"Error reading file: {e}."
 
-    entries = _parse_import_entries(path, text)
+    entries = _parse_import_entries(resolved, text)
     if not entries:
-        return f"No imports found in '{file_path}'."
+        return f"No imports found in '{path}'."
 
     workspace_lines: list[str] = []
     external_lines: list[str] = []
 
     for spec, names in entries:
-        kind, resolved = _resolve_import(spec, path)
+        kind, imp_resolved = _resolve_import(spec, resolved)
         suffix = f"  ← {names}" if names else ""
         if kind == 'workspace':
-            workspace_lines.append(f"  [workspace]  {resolved}{suffix}")
+            workspace_lines.append(f"  [workspace]  {imp_resolved}{suffix}")
         elif kind == 'unresolved':
             workspace_lines.append(f"  [workspace?] {spec}  (not found on disk){suffix}")
         else:
-            external_lines.append(f"  [external]   {resolved}{suffix}")
+            external_lines.append(f"  [external]   {imp_resolved}{suffix}")
 
-    rel = str(path.relative_to(WORKSPACE_ROOT))
+    rel = str(resolved.relative_to(WORKSPACE_ROOT))
     parts: list[str] = [f"# Imports: {rel}\n"]
     if workspace_lines:
         parts.append("## Workspace")
@@ -1748,6 +1760,32 @@ def setup() -> None:
             f.write(snippet)
         action = "updated" if claude_md.exists() else "created"
         print(f"{action}  {claude_md}  (mimir section appended)")
+
+    github_dir = cwd / ".github"
+    github_dir.mkdir(exist_ok=True)
+    copilot_instructions = github_dir / "copilot-instructions.md"
+    copilot_marker = "## Code exploration — use mimir tools"
+    if copilot_instructions.exists() and copilot_marker in copilot_instructions.read_text(encoding="utf-8"):
+        print(f"skipped  {copilot_instructions}  (mimir section already present)")
+    else:
+        copilot_snippet = (
+            f"{copilot_marker}\n\n"
+            "This project has mimir MCP tools. Always use them before using built-in search or reading files.\n\n"
+            "Workflow for any task involving existing code:\n"
+            "1. Call `get_status` to confirm the index is ready\n"
+            "2. Call `scope_task` with a description of the task — use its ranked file list, "
+            "do NOT fall back to glob or grep even if the output is large\n"
+            "   - Tip: use technical/class names when known (e.g. 'RectificationFilter') "
+            "rather than feature names (e.g. 'corrective actions filter')\n"
+            "3. Call `get_file_structure` on the files scope_task returns before reading raw lines\n"
+            "4. Use `find_callers` or `verify_symbol_existence` to trace symbols\n\n"
+            "Do not use built-in file search, glob, or grep if mimir tools are available. "
+            "Read the full scope_task output even if it is saved to a temp file — it contains the answer.\n"
+        )
+        with open(copilot_instructions, "a", encoding="utf-8") as f:
+            f.write(copilot_snippet)
+        action = "updated" if copilot_instructions.exists() else "created"
+        print(f"{action}  {copilot_instructions}  (mimir section appended)")
 
     print("\nDone. Restart Claude Code or reload VS Code to pick up the config.")
 

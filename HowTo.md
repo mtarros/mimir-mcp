@@ -54,13 +54,14 @@ cd /path/to/your-project
 mimir-setup
 ```
 
-This creates three files:
+This creates four files:
 
 | File | Purpose |
 |---|---|
 | `.mcp.json` | Registers mimir with Claude Code |
 | `.vscode/mcp.json` | Registers mimir with GitHub Copilot in VS Code |
-| `CLAUDE.md` | Tells Claude when and how to use each tool consistently |
+| `CLAUDE.md` | Tells Claude Code when and how to use each tool consistently |
+| `.github/copilot-instructions.md` | Tells GitHub Copilot to use mimir tools and not fall back to built-in search |
 
 That's it. Restart Claude Code (or reload VS Code) and mimir is active.
 
@@ -152,17 +153,43 @@ Claude Code picks this up automatically when you open that folder. The `"."` res
 
 To use the tools in Copilot Chat, open the chat panel, switch to agent mode, and the mimir tools will be available alongside the built-in Copilot tools.
 
-> **Note:** Copilot only uses MCP tools in agent mode — not in regular chat or inline completions. You may need to prompt it explicitly ("use mimir to find where X is defined") since Copilot doesn't read `CLAUDE.md`. There is no equivalent persistent instruction file for Copilot today.
+> **Note:** Copilot only uses MCP tools in agent mode — not in regular chat or inline completions.
+
+### Giving Copilot persistent instructions (manual setup)
+
+`mimir-setup` also creates `.github/copilot-instructions.md`, which Copilot reads automatically to know how to use mimir. If you prefer to create it manually:
+
+```markdown
+## Code exploration — use mimir tools
+
+This project has mimir MCP tools. Always use them before using built-in search or reading files.
+
+Workflow for any task involving existing code:
+1. Call `get_status` to confirm the index is ready
+2. Call `scope_task` with a description of the task — use its ranked file list,
+   do NOT fall back to glob or grep even if the output is large
+   - Tip: use technical/class names when known rather than feature names
+3. Call `get_file_structure` on the files scope_task returns before reading raw lines
+4. Use `find_callers` or `verify_symbol_existence` to trace symbols
+
+Do not use built-in file search, glob, or grep if mimir tools are available.
+Read the full scope_task output even if it is saved to a temp file — it contains the answer.
+```
+
+Without this file, Copilot may fall back to its own glob/grep search when mimir output is large.
 
 ### Both on the same project
 
-If you use Claude Code on your Mac and Copilot at work, both config files can coexist in the same project:
+If you use Claude Code on your Mac and Copilot at work, all config files can coexist in the same project:
 
 ```
 your-project/
-  .mcp.json            ← picked up by Claude Code
+  .mcp.json                        ← picked up by Claude Code
   .vscode/
-    mcp.json           ← picked up by VS Code Copilot
+    mcp.json                       ← picked up by VS Code Copilot (MCP connection)
+  .github/
+    copilot-instructions.md        ← tells Copilot to trust mimir results
+  CLAUDE.md                        ← tells Claude Code when and how to use mimir
 ```
 
 Same mimir install, same tools, no conflicts.
@@ -219,12 +246,16 @@ If `symbol_index: building`, the other tools still work but `scope_task` and `ve
 
 ### 1. `scope_task` — start here
 
-Call this **first** on any task involving existing code. Give it a plain-English description of what you want to do. It extracts symbol names, searches the workspace, and returns blueprints for the most relevant files.
+Call this **first** on any task involving existing code. Give it a plain-English description of what you want to do. It extracts symbol names, searches the workspace, and returns a ranked list of the most relevant files with matched symbol locations.
 
 **Example:**
 > "change how the live tutor handles pronunciation errors"
 
-Returns: the files most likely involved, matched symbols, and their structural blueprints — all in one call.
+Returns: ranked files, matched symbols with file:line locations. Then call `get_file_structure` on the files you need.
+
+**Tip:** Use technical/class names when known rather than feature names — the symbol index matches code identifiers, not domain language. `"RectificationFilter section order"` finds the right file faster than `"corrective actions filter UI"`.
+
+Pass `include_blueprints=True` to get full symbol maps inline (useful for small repos, but can produce large output on large codebases).
 
 Use this before reading any files. It replaces open-ended exploration.
 
