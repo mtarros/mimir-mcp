@@ -255,6 +255,7 @@ _FTS_READY = False       # True once the symbols inverted index is built and que
 _WARMUP_COMPLETE = False  # True once _warm_cache() finishes its first full pass
 _REVERSE_IMPORTS: dict[str, list[str]] = {}  # rel_target → sorted list of rel files that import it
 _FILE_WATCHER_ACTIVE = False  # True if a watchdog observer started successfully
+_ARCHITECTURE_MAP: str = ""   # cached architecture overview; built once in _warm_cache
 
 
 def _load_disk_cache() -> int:
@@ -570,6 +571,167 @@ def _build_reverse_imports() -> None:
     _REVERSE_IMPORTS = {k: sorted(v) for k, v in rev.items()}
 
 
+# ---------------------------------------------------------------------------
+# Architecture map
+# ---------------------------------------------------------------------------
+
+_BLUEPRINT_TOPLEVEL_KWS = (
+    'export default ', 'export ', 'async ', 'public ', 'private ',
+    'protected ', 'static ', 'abstract ', 'override ', 'sealed ',
+    'class ', 'def ', 'function* ', 'function ', 'const ', 'let ',
+    'var ', 'type ', 'interface ', 'struct ', 'enum ', 'impl ',
+)
+
+
+def _toplevel_names_from_blueprint(blueprint: str) -> list[str]:
+    """Return top-level symbol names from a blueprint string (depth-0 only)."""
+    names: list[str] = []
+    for line in blueprint.splitlines():
+        # Blueprint lines: L{num:<5}{indent}{sig} — top-level has no indent after the
+        # 6-char prefix (L + 5-char left-aligned number field).
+        if not line.startswith('L') or len(line) <= 6:
+            continue
+        if line[6] == ' ':   # indent present → nested symbol, skip
+            continue
+        sig = line[6:].strip()
+        for kw in _BLUEPRINT_TOPLEVEL_KWS:
+            if sig.startswith(kw):
+                sig = sig[len(kw):]
+        m = re.match(r'([A-Za-z_]\w*)', sig)
+        if m:
+            names.append(m.group(1))
+    return names
+
+
+def _build_architecture_map() -> str:
+    """Build a compact directory → file → symbols overview of the workspace.
+
+    Groups source files by their parent directory, lists top-level symbol names
+    for each file. Built once at warmup from already-cached blueprints so there
+    is no extra I/O cost.
+    """
+    global _ARCHITECTURE_MAP
+    dir_files: dict[str, list[Path]] = {}
+    for p in _iter_source_files():
+        key = str(p.parent.relative_to(WORKSPACE_ROOT))
+        dir_files.setdefault(key, []).append(p)
+
+    parts: list[str] = [f"# Workspace architecture: {WORKSPACE_ROOT.name}\n"]
+    for dir_key in sorted(dir_files):
+        files = sorted(dir_files[dir_key])
+        label = dir_key if dir_key != '.' else '(root)'
+        parts.append(f"## {label}/  ({len(files)} {'file' if len(files) == 1 else 'files'})")
+        for fp in files:
+            blueprint = _build_blueprint(fp)
+            names = _toplevel_names_from_blueprint(blueprint)
+            name_str = ', '.join(names[:8]) + ('…' if len(names) > 8 else '')
+            parts.append(f"  {fp.name:<40}  {name_str}")
+        parts.append('')
+
+    result = '\n'.join(parts).rstrip()
+    _ARCHITECTURE_MAP = result
+    return result
+
+
+# ---------------------------------------------------------------------------
+# Symbol body extraction (used by get_symbol)
+# ---------------------------------------------------------------------------
+
+def _extract_symbol_body(path: Path, symbol_name: str) -> Optional[str]:
+    """Return the full source text of a named symbol (function/class/method).
+
+    Tries tree-sitter first; falls back to indentation/brace heuristics. Returns
+    None when the symbol is not found in the file.
+    """
+    try:
+        raw = path.read_bytes()
+        text = raw.decode('utf-8', 'replace')
+    except OSError:
+        return None
+
+    suffix = path.suffix
+    ts_lang, _ = EXT_LANG.get(suffix, (None, None))
+    pat = re.compile(r'\b' + re.escape(symbol_name) + r'\b')
+
+    # --- Tree-sitter path ---
+    if TREE_SITTER_OK and ts_lang:
+        try:
+            parser = _ts_get_parser(ts_lang)  # type: ignore[misc]
+            tree = parser.parse(text)
+
+            def _find(node) -> Optional[object]:
+                if _is_def_node(node):
+                    sig = _signature_from_node(node, raw)
+                    if sig and pat.search(sig):
+                        return node
+                for i in range(node.child_count()):
+                    result = _find(node.child(i))
+                    if result is not None:
+                        return result
+                return None
+
+            node = _find(tree.root_node())
+            if node is not None:
+                return raw[node.start_byte():node.end_byte()].decode('utf-8', 'replace')
+        except Exception:
+            pass
+
+    # --- Indentation/brace fallback (Python + simple languages) ---
+    lines = text.splitlines(keepends=True)
+    start_idx: Optional[int] = None
+    base_indent = 0
+    for i, line in enumerate(lines):
+        stripped = line.lstrip()
+        if pat.search(stripped):
+            # Confirm it looks like a definition, not a call or comment
+            if re.match(
+                r'(?:(?:async|public|private|protected|static|abstract|sealed)\s+)*'
+                r'(?:class|def|function\*?|const|let|var|interface|type|struct|enum|impl)\s',
+                stripped,
+            ) or re.match(r'\w[\w<>[\]]*\s*\(', stripped):
+                start_idx = i
+                base_indent = len(line) - len(stripped)
+                break
+
+    if start_idx is None:
+        return None
+
+    # Collect body by indentation (Python) or brace counting (C-style)
+    brace_count = lines[start_idx].count('{') - lines[start_idx].count('}')
+    use_braces = brace_count > 0 or suffix in ('.ts', '.tsx', '.js', '.jsx', '.java', '.kt', '.swift', '.cs', '.go', '.rs')
+
+    end_idx = len(lines) - 1
+    if use_braces:
+        for i in range(start_idx + 1, len(lines)):
+            brace_count += lines[i].count('{') - lines[i].count('}')
+            if brace_count <= 0:
+                end_idx = i
+                break
+    else:
+        for i in range(start_idx + 1, len(lines)):
+            line = lines[i]
+            if line.strip() == '':
+                continue
+            cur_indent = len(line) - len(line.lstrip())
+            if cur_indent <= base_indent:
+                end_idx = i - 1
+                while end_idx > start_idx and lines[end_idx].strip() == '':
+                    end_idx -= 1
+                break
+
+    return ''.join(lines[start_idx:end_idx + 1])
+
+
+def _symbol_name_from_sig(sig: str) -> Optional[str]:
+    """Extract bare symbol name from a blueprint signature line."""
+    sig = sig.strip()
+    for kw in _BLUEPRINT_TOPLEVEL_KWS:
+        if sig.startswith(kw):
+            sig = sig[len(kw):]
+    m = re.match(r'([A-Za-z_]\w*)', sig)
+    return m.group(1) if m else None
+
+
 def _start_file_watcher() -> bool:
     """Start a background watchdog observer to evict stale blueprints instantly.
 
@@ -620,6 +782,7 @@ def _warm_cache() -> None:
     _build_cs_ns_index()
     _build_symbol_index()
     _build_reverse_imports()
+    _build_architecture_map()
     _WARMUP_COMPLETE = True
 
 
@@ -1618,7 +1781,22 @@ def scope_task(task: str, max_files: int = 5, include_blueprints: bool = False) 
     for i, rel in enumerate(top_files, 1):
         n = file_hit_count[rel]
         parts.append(f"  {i}. {rel}  ({n} {'match' if n == 1 else 'matches'})")
-    parts.append("\nCall get_file_structure on the files above for full symbol maps.")
+
+    # Suggest targeted get_symbol calls for definition hits — faster than reading a whole file
+    sym_suggestions: list[tuple[str, str]] = []
+    seen_syms: set[tuple[str, str]] = set()
+    for r, l, s in unique:
+        if _def_line_pat.search(s):
+            name = _symbol_name_from_sig(s)
+            if name and (r, name) not in seen_syms:
+                seen_syms.add((r, name))
+                sym_suggestions.append((r, name))
+    if sym_suggestions:
+        parts.append("\n## Suggested next calls (read just the symbols you need)")
+        for file_rel, sym in sym_suggestions[:6]:
+            parts.append(f'  get_symbol("{file_rel}", "{sym}")')
+    else:
+        parts.append("\nCall get_file_structure on the files above for full symbol maps.")
 
     # Show files that import the top results — useful when the task involves changing
     # a shared module and the AI needs to know what else may need updating.
@@ -1754,6 +1932,131 @@ def get_dependents(path: str) -> str:
         "and may need updates if its exports change."
     )
     return "\n".join(lines)
+
+
+@mcp.tool()
+def get_symbol(path: str, symbol_name: str) -> str:
+    """Return the complete source code of ONE named symbol (function, class, or method)
+    — bodies included.
+
+    This is the efficient middle ground between get_file_structure (signatures only,
+    no bodies) and reading the raw file (everything). Use it when you know which
+    symbol you need and want just its implementation.
+
+    WHEN TO USE: after scope_task or get_file_structure identifies the symbol you
+    need, call get_symbol to read only that function or class instead of the entire
+    file. Typically 10-50× fewer tokens than reading the whole file.
+
+    Args:
+        path: workspace-relative path to the source file (e.g. "src/services/auth.py")
+        symbol_name: exact name of the function, class, or method (e.g. "authenticate")
+
+    Returns the full source of the symbol with its original indentation, including
+    docstrings, decorators on the definition line, and the complete body.
+    """
+    try:
+        resolved = _resolve_in_workspace(path)
+    except ValueError as e:
+        return f"Error: {e}"
+    if not resolved.exists():
+        return f"Error: '{path}' not found in workspace."
+    body = _extract_symbol_body(resolved, symbol_name)
+    if body is None:
+        # Offer a helpful fallback hint
+        blueprint = _build_blueprint(resolved)
+        return (
+            f"Symbol '{symbol_name}' not found in '{path}'.\n\n"
+            f"Available symbols in this file:\n{blueprint}"
+        )
+    line_count = body.count('\n') + 1
+    return f"# {path}  symbol={symbol_name}  ({line_count} lines)\n\n{body}"
+
+
+@mcp.tool()
+def get_changed_files(base: str = "main") -> str:
+    """Return structural blueprints of every source file changed vs a git base branch.
+
+    Combines committed branch changes, uncommitted edits, and untracked new files
+    into a single compact overview — the ideal first call at the start of a session
+    to orient yourself on what is currently in flight.
+
+    WHEN TO USE: at the start of a session when you need to know which files are
+    actively being worked on, before deciding where to focus.
+
+    Args:
+        base: the branch or commit to diff against (default "main"; try "master" or
+              "HEAD~1" if main does not exist).
+
+    Returns blueprints of each changed source file (bodies stripped, symbols + line
+    numbers only) so you get the full structural picture in one call.
+    """
+    try:
+        def _git(*args: str) -> "subprocess.CompletedProcess[str]":
+            return subprocess.run(
+                ["git", "-C", str(WORKSPACE_ROOT)] + list(args),
+                capture_output=True, text=True, timeout=10,
+            )
+
+        # Committed changes on this branch vs base
+        r_branch = _git("diff", "--name-only", f"{base}...HEAD")
+        # Uncommitted staged + unstaged changes
+        r_uncommitted = _git("diff", "--name-only", "HEAD")
+        # New untracked source files
+        r_untracked = _git("ls-files", "--others", "--exclude-standard")
+
+        if r_branch.returncode != 0 and r_uncommitted.returncode != 0:
+            stderr = (r_branch.stderr or r_uncommitted.stderr or "").strip()
+            if "not a git repository" in stderr:
+                return "Not a git repository — get_changed_files requires git."
+            return (
+                f"Error: could not diff against '{base}'. "
+                "Try base='master' or base='HEAD~1'.\n" + stderr
+            )
+
+        changed: set[str] = set()
+        for r in (r_branch, r_uncommitted, r_untracked):
+            if r.returncode == 0:
+                for line in r.stdout.splitlines():
+                    line = line.strip()
+                    if line:
+                        changed.add(line)
+
+        source_files = sorted(f for f in changed if Path(f).suffix in EXT_LANG)
+        if not source_files:
+            return f"No source file changes found vs '{base}'."
+
+        parts = [
+            f"# Changed files vs '{base}'  ({len(source_files)} source "
+            f"{'file' if len(source_files) == 1 else 'files'})\n"
+        ]
+        for rel in source_files:
+            p = WORKSPACE_ROOT / rel
+            if not p.exists():
+                parts.append(f"# {rel}  [deleted]\n")
+            else:
+                parts.append(_build_blueprint(p) + "\n")
+        return "\n".join(parts)
+    except Exception as e:
+        return f"Error: {e}"
+
+
+@mcp.tool()
+def get_architecture() -> str:
+    """Return a high-level map of the entire workspace: directories, files, and
+    their top-level symbols. One compact overview instead of dozens of
+    get_file_structure calls.
+
+    WHEN TO USE: at the very start of a session to understand the project layout
+    before diving into specific files. Much cheaper than exploring directory by
+    directory. For a specific directory use get_directory_structure instead.
+
+    The map is built from cached blueprints during startup warmup so this call
+    is nearly instant after the index is ready (check get_status).
+    """
+    global _ARCHITECTURE_MAP
+    if _ARCHITECTURE_MAP:
+        return _ARCHITECTURE_MAP
+    return _build_architecture_map()
 
 
 @mcp.tool()
@@ -2292,9 +2595,12 @@ EXAMPLES
 
 MCP TOOLS (available to Claude Code and GitHub Copilot)
   get_status               Index state, file count, ignore patterns, domain aliases — call first
+  get_architecture         High-level workspace map: directories, files, top-level symbols
   scope_task               Find relevant files from a task description
   get_file_structure       Compact symbol map of a single file (classes, methods, line nos)
+  get_symbol               Full source of ONE named symbol — efficient middle ground
   get_directory_structure  Symbol maps for every file under a directory
+  get_changed_files        Blueprints of files changed vs a git branch (session orientation)
   get_imports              Resolve imports to workspace files or external packages
   get_dependents           Find all files that directly import a given file (blast radius)
   verify_symbol_existence  Confirm a symbol is defined and find its location

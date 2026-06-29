@@ -92,7 +92,7 @@ def workspace(tmp_path):
 
 class TestToolRegistration:
     async def test_all_tools_listed(self, workspace):
-        """Eight tools must be registered — any missing tool fails silently in production."""
+        """All 13 tools must be registered — any missing tool fails silently in production."""
         async with Client(_make_transport(workspace)) as client:
             tools = await client.list_tools()
             names = {t.name for t in tools}
@@ -107,6 +107,9 @@ class TestToolRegistration:
             "get_status",
             "record_alias",
             "execute_local_sandbox",
+            "get_symbol",
+            "get_changed_files",
+            "get_architecture",
         }
         assert expected == names, f"Tool mismatch. Extra: {names - expected}, Missing: {expected - names}"
 
@@ -363,6 +366,134 @@ class TestRecordAliasWire:
             r = await client.call_tool("record_alias", {"domain_term": "", "code_name": "Foo"})
         text = _text(r)
         assert "Error" in text
+
+
+# ---------------------------------------------------------------------------
+# get_symbol
+# ---------------------------------------------------------------------------
+
+class TestGetSymbolWire:
+    async def test_returns_function_body(self, workspace):
+        """get_symbol should return the full authenticate method body."""
+        async with Client(_make_transport(workspace)) as client:
+            r = await client.call_tool("get_symbol", {"path": "src/service.py", "symbol_name": "authenticate"})
+        text = _text(r)
+        assert "authenticate" in text
+        assert "return True" in text   # body content, not just signature
+        assert "EXCEPTION" not in text
+
+    async def test_returns_class_body(self, workspace):
+        """get_symbol on a class name should return the whole class."""
+        async with Client(_make_transport(workspace)) as client:
+            r = await client.call_tool("get_symbol", {"path": "src/service.py", "symbol_name": "UserService"})
+        text = _text(r)
+        assert "UserService" in text
+        assert "authenticate" in text  # method inside the class
+        assert "EXCEPTION" not in text
+
+    async def test_unknown_symbol_returns_blueprint_hint(self, workspace):
+        """When the symbol is not found, the response should include available symbols."""
+        async with Client(_make_transport(workspace)) as client:
+            r = await client.call_tool("get_symbol", {"path": "src/service.py", "symbol_name": "GhostXYZ"})
+        text = _text(r)
+        assert "not found" in text.lower() or "GhostXYZ" in text
+        # Should suggest what IS in the file
+        assert "UserService" in text or "authenticate" in text
+        assert "EXCEPTION" not in text
+
+    async def test_unknown_file_returns_error(self, workspace):
+        async with Client(_make_transport(workspace)) as client:
+            r = await client.call_tool("get_symbol", {"path": "src/does_not_exist.py", "symbol_name": "foo"})
+        text = _text(r)
+        assert "Error" in text or "not found" in text.lower()
+        assert "EXCEPTION" not in text
+
+
+# ---------------------------------------------------------------------------
+# get_changed_files
+# ---------------------------------------------------------------------------
+
+@pytest.fixture
+def git_workspace(tmp_path):
+    """Workspace fixture that is a real git repo with one committed change."""
+    import subprocess
+    src = tmp_path / "src"
+    src.mkdir()
+
+    (src / "service.py").write_text(
+        "class UserService:\n"
+        "    def authenticate(self, username: str, password: str) -> bool:\n"
+        "        return True\n"
+    )
+
+    # Init git repo and make an initial commit on 'main'
+    subprocess.run(["git", "init", "-b", "main", str(tmp_path)], check=True, capture_output=True)
+    subprocess.run(["git", "-C", str(tmp_path), "config", "user.email", "test@test.com"], check=True, capture_output=True)
+    subprocess.run(["git", "-C", str(tmp_path), "config", "user.name", "Test"], check=True, capture_output=True)
+    subprocess.run(["git", "-C", str(tmp_path), "add", "."], check=True, capture_output=True)
+    subprocess.run(["git", "-C", str(tmp_path), "commit", "-m", "init"], check=True, capture_output=True)
+
+    # Add a new file on a feature branch
+    (src / "models.py").write_text("class User:\n    name: str\n")
+    subprocess.run(["git", "-C", str(tmp_path), "checkout", "-b", "feature"], check=True, capture_output=True)
+    subprocess.run(["git", "-C", str(tmp_path), "add", "."], check=True, capture_output=True)
+    subprocess.run(["git", "-C", str(tmp_path), "commit", "-m", "add models"], check=True, capture_output=True)
+
+    return tmp_path
+
+
+class TestGetChangedFilesWire:
+    async def test_returns_changed_file_blueprint(self, git_workspace):
+        """Should return blueprint for models.py which was added on the feature branch."""
+        async with Client(_make_transport(git_workspace)) as client:
+            r = await client.call_tool("get_changed_files", {"base": "main"})
+        text = _text(r)
+        assert "models.py" in text
+        assert "EXCEPTION" not in text
+
+    async def test_non_git_workspace_handled(self, workspace):
+        """Plain tmp_path (no git repo) should return a clear error, not crash."""
+        async with Client(_make_transport(workspace)) as client:
+            r = await client.call_tool("get_changed_files", {})
+        text = _text(r)
+        # Either no changes found, or a clear error — never an EXCEPTION
+        assert "EXCEPTION" not in text
+
+    async def test_bad_base_branch_handled(self, git_workspace):
+        async with Client(_make_transport(git_workspace)) as client:
+            r = await client.call_tool("get_changed_files", {"base": "nonexistent-branch-xyz"})
+        text = _text(r)
+        assert "EXCEPTION" not in text
+
+
+# ---------------------------------------------------------------------------
+# get_architecture
+# ---------------------------------------------------------------------------
+
+class TestGetArchitectureWire:
+    async def test_returns_directory_sections(self, workspace):
+        """Architecture map should include directory headers."""
+        async with Client(_make_transport(workspace)) as client:
+            r = await client.call_tool("get_architecture", {})
+        text = _text(r)
+        assert "src" in text
+        assert "EXCEPTION" not in text
+
+    async def test_includes_top_level_symbols(self, workspace):
+        """Architecture map should list top-level symbol names."""
+        async with Client(_make_transport(workspace)) as client:
+            r = await client.call_tool("get_architecture", {})
+        text = _text(r)
+        # service.py has UserService at top level
+        assert "UserService" in text
+        assert "EXCEPTION" not in text
+
+    async def test_returns_nonempty_string(self, workspace):
+        async with Client(_make_transport(workspace)) as client:
+            r = await client.call_tool("get_architecture", {})
+        text = _text(r)
+        assert len(text) > 50
+        assert "EXCEPTION" not in text
 
 
 # ---------------------------------------------------------------------------
