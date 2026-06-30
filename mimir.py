@@ -135,6 +135,41 @@ def _load_mimiraliases() -> dict[str, list[str]]:
 _MIMIRALIASES: dict[str, list[str]] = _load_mimiraliases()
 
 
+def _load_focus() -> dict[str, float]:
+    """Read project focus weights from .mimir-focus.
+
+    File format (one entry per line):
+        InControl.Carps.Mobile = 3.0
+        InControl.Carps.Keypad = 0.3
+        # comments ignored
+    Returns {prefix_lower: multiplier}.
+    """
+    p = WORKSPACE_ROOT / ".mimir-focus"
+    if not p.exists():
+        return {}
+    weights: dict[str, float] = {}
+    for line in p.read_text(encoding="utf-8").splitlines():
+        line = line.strip()
+        if not line or line.startswith("#"):
+            continue
+        if "=" in line:
+            prefix, _, raw = line.partition("=")
+            prefix = prefix.strip()
+            try:
+                weight = float(raw.strip())
+            except ValueError:
+                weight = 3.0
+        else:
+            prefix = line
+            weight = 3.0
+        if prefix:
+            weights[prefix.lower()] = weight
+    return weights
+
+
+_FOCUS_WEIGHTS: dict[str, float] = _load_focus()
+
+
 def _expand_task_with_aliases(task: str) -> str:
     """Append alias code names to a task string when domain phrases match.
 
@@ -190,7 +225,10 @@ _SYMBOL_STOPWORDS = frozenset({
 
 # Increment when the blueprint text format changes so cached blueprints are
 # automatically invalidated and re-parsed on the next server start.
-BLUEPRINT_VERSION = "3"
+BLUEPRINT_VERSION = "4"  # bump when index schema or tokenisation changes
+
+# Splits PascalCase / camelCase into components: 'StartAutoRefresh' → ['Start','Auto','Refresh']
+_CAMEL_SPLIT_RE = re.compile(r'[A-Z][a-z0-9]*|[a-z][a-z0-9]*')
 
 
 def _init_disk_cache() -> "Optional[object]":
@@ -256,6 +294,7 @@ _WARMUP_COMPLETE = False  # True once _warm_cache() finishes its first full pass
 _REVERSE_IMPORTS: dict[str, list[str]] = {}  # rel_target → sorted list of rel files that import it
 _FILE_WATCHER_ACTIVE = False  # True if a watchdog observer started successfully
 _ARCHITECTURE_MAP: str = ""   # cached architecture overview; built once in _warm_cache
+_GIT_RECENCY_CACHE: dict = {"ts": 0.0, "scores": {}}  # TTL cache: rel_path → recency rank
 
 
 def _load_disk_cache() -> int:
@@ -1166,31 +1205,39 @@ def _symbol_hits(name: str, max_results: int = 25) -> list[tuple[str, str, str]]
                 " WHERE s.token=? LIMIT ?",
                 (name, max_results * 4),
             ).fetchall()
-            hits = [(f, l, c) for f, l, c in rows if word_re.search(c)]
+            name_lc = name.lower()
+            hits = [
+                (f, l, c) for f, l, c in rows
+                if word_re.search(c) or name_lc in c.lower()
+            ]
             return hits[:max_results]
         except Exception:
             pass  # fall through to linear scan
 
     word_def = re.compile(rf"(?<![\w]){re.escape(name)}(?![\w])")
+    name_lc = name.lower()
     hits: list[tuple[str, str, str]] = []
     for path in _iter_source_files():
         if len(hits) >= max_results:
             break
         cached = _cache_get(path)
         if cached is not None:
-            if name not in cached:
+            if name not in cached and name_lc not in cached.lower():
                 continue
             blueprint = cached
         else:
             try:
-                if name.encode() not in path.read_bytes():
+                raw = path.read_bytes()
+                if name.encode() not in raw and name_lc.encode() not in raw.lower():
                     continue
             except OSError:
                 continue
             blueprint = _build_blueprint(path)
         rel = str(path.relative_to(WORKSPACE_ROOT))
         for bl in blueprint.splitlines():
-            if bl.startswith("#") or not word_def.search(bl):
+            if bl.startswith("#"):
+                continue
+            if not (word_def.search(bl) or name_lc in bl.lower()):
                 continue
             m = re.match(r"L(\d+)\s*(.*)", bl.strip())
             if m:
@@ -1220,8 +1267,9 @@ def _symbol_hits_multi(
                     " WHERE s.token=? LIMIT ?",
                     (name, max_per_kw * 4),
                 ).fetchall()
+                name_lc = name.lower()
                 for f, l, c in rows:
-                    if word_re.search(c):
+                    if word_re.search(c) or name_lc in c.lower():
                         hits[name].append((f, l, c))
                         if len(hits[name]) >= max_per_kw:
                             break
@@ -1230,6 +1278,7 @@ def _symbol_hits_multi(
             pass  # fall through to linear scan
 
     patterns = {n: re.compile(rf"(?<![\w]){re.escape(n)}(?![\w])") for n in names}
+    names_lc = {n: n.lower() for n in names}
     hits = {n: [] for n in names}
     saturated: set[str] = set()
 
@@ -1238,14 +1287,21 @@ def _symbol_hits_multi(
             break
         cached = _cache_get(path)
         blueprint = cached if cached is not None else _build_blueprint(path)
+        blueprint_lc = blueprint.lower()
         rel = str(path.relative_to(WORKSPACE_ROOT))
 
         for name in names:
-            if name in saturated or name not in blueprint:
+            if name in saturated:
+                continue
+            nlc = names_lc[name]
+            if name not in blueprint and nlc not in blueprint_lc:
                 continue
             pat = patterns[name]
             for bl in blueprint.splitlines():
-                if bl.startswith("#") or not pat.search(bl):
+                if bl.startswith("#"):
+                    continue
+                bl_lc = bl.lower()
+                if not (pat.search(bl) or nlc in bl_lc):
                     continue
                 m = re.match(r"L(\d+)\s*(.*)", bl.strip())
                 if m:
@@ -1255,6 +1311,52 @@ def _symbol_hits_multi(
                         break
 
     return hits
+
+
+def _byte_keyword_freq(path: Path, keywords: list[str]) -> int:
+    """Count total raw occurrences of all keywords in a file's bytes.
+
+    Used as a tiebreaker when files share the same scope_task score: a file
+    where search terms appear many times in implementation code ranks above one
+    where they only appear in a definition line. Byte scan only — no content
+    returned, no extra tokens.
+    """
+    try:
+        raw = path.read_bytes().lower()
+        return sum(raw.count(kw.lower().encode()) for kw in keywords)
+    except OSError:
+        return 0
+
+
+def _git_recency_scores() -> dict[str, int]:
+    """Return a recency score per workspace-relative file from recent git log.
+
+    Most recently touched file = 40, next = 39, etc. Cached for 60 s.
+    Returns {} silently on any failure (non-git dir, git not installed, etc.).
+    """
+    now = time.monotonic()
+    if now - _GIT_RECENCY_CACHE["ts"] < 60:
+        return _GIT_RECENCY_CACHE["scores"]
+    try:
+        out = subprocess.check_output(
+            ["git", "log", "--format=", "--name-only", "-n", "40"],
+            cwd=str(WORKSPACE_ROOT), text=True, timeout=3,
+            stderr=subprocess.DEVNULL,
+        )
+        seen: dict[str, int] = {}
+        rank = 40
+        for line in out.splitlines():
+            line = line.strip()
+            if line and line not in seen:
+                seen[line] = rank
+                rank -= 1
+                if rank <= 0:
+                    break
+        _GIT_RECENCY_CACHE.update({"ts": now, "scores": seen})
+        return seen
+    except Exception:
+        _GIT_RECENCY_CACHE["ts"] = now  # avoid hammering on repeated failure
+        return {}
 
 
 def _extract_scope_keywords(task: str) -> list[str]:
@@ -1302,7 +1404,7 @@ def _extract_path_keywords(task: str) -> list[str]:
     # Split CamelCase terms into sub-components (min 4 chars to avoid noise)
     for camel in re.findall(r'\b[A-Z][a-zA-Z]{3,}\b', task):
         for part in re.findall(r'[A-Z][a-z0-9]+', camel):
-            if len(part) >= 4:
+            if len(part) >= 6:  # 6-char floor keeps "filter"/"refresh" but drops "stop"/"auto"/"start"
                 words.append(part.lower())
     seen: set[str] = set()
     out: list[str] = []
@@ -1462,10 +1564,31 @@ def _extract_blueprint_lines(rel: str, blueprint: str) -> list[tuple[str, str, s
     return rows
 
 
+def _decompose_identifier(token: str) -> list[str]:
+    """Split a compound identifier into lowercase sub-tokens of ≥ 4 chars.
+
+    Handles PascalCase, camelCase, snake_case, and mixed forms.
+    Examples:
+        StartOrStopAutoRefresh  → ['start', 'stop', 'auto', 'refresh']
+        _refreshIntervalInSeconds → ['refresh', 'interval', 'seconds']
+        MyCurrentViewModel      → ['current', 'view', 'model']
+    """
+    parts = [p for p in token.strip('_').split('_') if p]
+    sub: list[str] = []
+    for part in parts:
+        for component in (_CAMEL_SPLIT_RE.findall(part) or [part]):
+            if len(component) >= 4:
+                sub.append(component.lower())
+    return sub
+
+
 def _index_blueprint_rows(rel: str, blueprint: str) -> list[tuple[str, str, str]]:
     """Extract (token, file, lineno) rows for the symbols table from a blueprint.
 
-    Stopwords and tokens shorter than 2 chars are excluded to keep the index small.
+    Indexes both whole identifiers and their sub-components (from CamelCase /
+    snake_case decomposition) so that a search for 'refresh' can find a file
+    containing 'StartOrStopAutoRefresh' or '_refreshIntervalInSeconds'.
+    Stopwords and tokens shorter than 2 chars are excluded.
     Context is stored separately in the lines table — no duplication here.
     """
     rows = []
@@ -1480,9 +1603,15 @@ def _index_blueprint_rows(rel: str, blueprint: str) -> list[tuple[str, str, str]
             continue
         seen: set[str] = set()
         for tok in re.findall(r'\w+', context):
+            # Whole token
             if len(tok) >= 2 and tok not in _SYMBOL_STOPWORDS and tok not in seen:
                 seen.add(tok)
                 rows.append((tok, rel, lineno))
+            # Sub-tokens from compound identifiers (≥ 4 chars each)
+            for sub in _decompose_identifier(tok):
+                if sub not in _SYMBOL_STOPWORDS and sub not in seen:
+                    seen.add(sub)
+                    rows.append((sub, rel, lineno))
     return rows
 
 
@@ -1731,6 +1860,109 @@ def verify_symbol_existence(symbol_name: str, max_results: int = 25) -> str:
 
 
 @mcp.tool()
+def scope_hint(terms: str) -> str:
+    """Cheap first-pass symbol lookup — returns what actually exists and suggests a
+    focused scope_task query.  Call this when you have rough keywords but are unsure
+    of the exact symbol names; the output tells you what the codebase calls things so
+    the follow-up scope_task query is precise instead of broad.
+
+    Returns only names, file paths, and a suggested query — no blueprints — so it
+    costs very few tokens.
+
+    Args:
+        terms: Space-or-comma-separated rough search terms, e.g. "timer refresh current jobs"
+    """
+    raw = [t.strip().strip(',') for t in re.split(r'[\s,]+', terms) if t.strip()]
+    if not raw:
+        return "Error: provide at least one search term."
+
+    # Expand with sub-tokens so compound identifiers (StartOrStopAutoRefresh → refresh)
+    # are also searched.
+    expanded: list[str] = []
+    seen_exp: set[str] = set()
+    for t in raw:
+        tl = t.lower()
+        if tl not in seen_exp:
+            seen_exp.add(tl)
+            expanded.append(t)
+        for sub in _decompose_identifier(t):
+            if sub not in seen_exp:
+                seen_exp.add(sub)
+                expanded.append(sub)
+    expanded = expanded[:24]
+
+    try:
+        hits = _symbol_hits_multi(expanded, max_per_kw=8)
+    except Exception as e:
+        return f"Error during symbol lookup: {e}"
+
+    # Group results by file
+    file_syms: dict[str, list[str]] = {}
+    term_files: dict[str, set[str]] = {t: set() for t in raw}
+    all_sym_names: list[str] = []
+
+    _name_re = re.compile(r'\b([A-Z][A-Za-z0-9]+|[a-z_][a-zA-Z0-9_]{3,})\s*[({<:\[]')
+
+    for kw, matches in hits.items():
+        for rel, _lineno, sig in matches:
+            if rel not in file_syms:
+                file_syms[rel] = []
+            m = _name_re.search(sig)
+            if m:
+                sym = m.group(1)
+                if sym not in file_syms[rel]:
+                    file_syms[rel].append(sym)
+                if sym not in all_sym_names:
+                    all_sym_names.append(sym)
+            # Map original term → file (for the per-term breakdown)
+            for orig in raw:
+                orig_lc = orig.lower()
+                if orig_lc == kw or orig_lc in kw or kw in orig_lc:
+                    term_files[orig].add(rel)
+
+    if not file_syms:
+        return (
+            f"No symbols found for: {terms}\n"
+            "Try different terms or check spelling. "
+            "Use verify_symbol_existence to confirm a specific name exists."
+        )
+
+    lines = [f"# Scope Hint: '{terms}'\n"]
+
+    # Per-term breakdown (shows which term hit which file)
+    lines.append("## Term matches")
+    for orig in raw:
+        files = sorted(term_files.get(orig, set()))[:4]
+        if files:
+            lines.append(f"  '{orig}' → {', '.join(files)}")
+        else:
+            lines.append(f"  '{orig}' → (no matches)")
+
+    # Top files with the symbols found inside them
+    lines.append("\n## Top files")
+    ranked = sorted(file_syms, key=lambda f: -len(file_syms[f]))[:8]
+    for rel in ranked:
+        syms = ", ".join(file_syms[rel][:6])
+        lines.append(f"  {rel}")
+        lines.append(f"    → {syms}")
+
+    # Suggested refined query: prefer longer/more-specific symbol names
+    specific = sorted(
+        {s for s in all_sym_names if len(s) >= 8},
+        key=lambda s: -len(s)
+    )[:4]
+    if specific:
+        suggestion = " ".join(specific)
+        lines.append(f"\n## Suggested scope_task query")
+        lines.append(f'  scope_task("{suggestion}")')
+    else:
+        lines.append(f"\n## Suggested scope_task query")
+        lines.append(f'  scope_task("{terms}")')
+
+    return "\n".join(lines)
+
+
+@mcp.tool()
 def scope_task(task: str, max_files: int = 5, include_blueprints: bool = False) -> str:
     """Map a plain-English task description to the specific files and symbols it
     touches — before reading any raw file contents.
@@ -1763,25 +1995,50 @@ def scope_task(task: str, max_files: int = 5, include_blueprints: bool = False) 
             "Try including class names (e.g. 'TutorSession') or function names."
         )
 
-    file_hit_count: dict[str, int] = {}
+    file_hit_count: dict[str, float] = {}
     all_hits: list[tuple[str, str, str, str]] = []  # (keyword, rel, line, sig)
 
-    # Regex to detect a definition line vs a usage (import/call)
+    # Regex to detect a definition line vs a usage (import/call).
+    # Covers Python/JS/TS keywords and C#/Java/Go/Rust patterns so definitions
+    # always score 3× vs usages scoring 1×.
     _def_line_pat = re.compile(
+        # Python / JS / TS / Go / Rust
         r'(?:^|\s)(?:export\s+)?(?:default\s+)?(?:async\s+)?'
-        r'(?:function|class|def|interface|type|enum|struct|impl)\s+\w|'
-        r'(?:export\s+)?(?:const|let|var)\s+\w+\s*[=(]'
+        r'(?:function|class|def|interface|type|enum|struct|impl|func)\s+\w|'
+        r'(?:export\s+)?(?:const|let|var)\s+\w+\s*[=(]|'
+        # C# / Java / Kotlin — access modifier + optional modifiers + return type + name(
+        r'(?:public|private|protected|internal)(?:\s+(?:static|sealed|abstract|override'
+        r'|virtual|partial|async|readonly|new|extern))*\s+'
+        r'(?:class|interface|enum|record|struct|void|Task|bool|int|string|object'
+        r'|IDisposable|IEnumerable|IReadOnly\w+|\w+\??)\s+\w+\s*[(<]'
     )
 
     valid_kws = [kw for kw in keywords if re.match(r"^\w[\w]*$", kw)]
+
+    # Expand with sub-tokens from compound identifiers (e.g. StartOrStopAutoRefresh
+    # → refresh) so files with compound method names surface for plain-word queries.
+    # Sub-token hits are scored at 0.3× so a direct whole-token definition match
+    # always outranks files that merely contain the generic pieces elsewhere.
+    # Path scoring below uses only `keywords` — "start" never boosts Startup* files.
+    _sub_kws: list[str] = []
+    _seen_sub: set[str] = {k.lower() for k in valid_kws}
+    for kw in valid_kws:
+        for sub in _decompose_identifier(kw):
+            if sub not in _seen_sub:
+                _seen_sub.add(sub)
+                _sub_kws.append(sub)
+    _sub_kws = _sub_kws[:16]
+    _sub_kw_set = set(_sub_kws)
+
     try:
-        multi_hits = _symbol_hits_multi(valid_kws, max_per_kw=10)
+        multi_hits = _symbol_hits_multi(valid_kws + _sub_kws, max_per_kw=10)
     except Exception:
         multi_hits = {}
-    for kw in valid_kws:
+    for kw in valid_kws + _sub_kws:
+        sub_weight_factor = 0.3 if kw in _sub_kw_set else 1.0
         for rel, line, sig in multi_hits.get(kw, []):
             all_hits.append((kw, rel, line, sig))
-            weight = 3 if _def_line_pat.search(sig) else 1
+            weight = (3 if _def_line_pat.search(sig) else 1) * sub_weight_factor
             file_hit_count[rel] = file_hit_count.get(rel, 0) + weight
 
     # Path-based supplement: finds files whose path contains task terms.
@@ -1802,17 +2059,65 @@ def scope_task(task: str, max_files: int = 5, include_blueprints: bool = False) 
     except Exception:
         pass
 
+    # Forward import expansion: for the top 3 keyword/path-matched files, parse
+    # their imports and add workspace-resolved targets at 40% of the parent's score.
+    # This surfaces files one hop deeper in the call graph — where bugs often live.
+    if file_hit_count:
+        top3_exp = sorted(file_hit_count, key=lambda f: -file_hit_count[f])[:3]
+        for rel in top3_exp:
+            exp_path = WORKSPACE_ROOT / rel
+            try:
+                exp_text = exp_path.read_text(encoding='utf-8', errors='replace')
+            except OSError:
+                continue
+            try:
+                for specifier, _ in _parse_import_entries(exp_path, exp_text):
+                    kind, display = _resolve_import(specifier, exp_path)
+                    if kind == 'workspace' and display not in file_hit_count:
+                        file_hit_count[display] = file_hit_count[rel] * 0.4
+            except Exception:
+                pass
+
+    # Project focus weights: multiply each file's score by the first matching prefix
+    # weight.  Boost (>1) surfaces sub-projects you're working in; reduce (<1)
+    # suppresses sibling projects you're not touching.  Entries checked longest-
+    # prefix-first so more-specific rules win over broader ones.
+    if _FOCUS_WEIGHTS:
+        _sorted_focus = sorted(_FOCUS_WEIGHTS.items(), key=lambda kv: -len(kv[0]))
+        for rel in list(file_hit_count):
+            rel_lc = rel.lower()
+            for prefix_lc, multiplier in _sorted_focus:
+                if prefix_lc in rel_lc:
+                    file_hit_count[rel] *= multiplier
+                    break
+
+    # Git recency boost: files modified recently in git rise in the ranking when
+    # they're already keyword-matched — high-signal for regression bug tickets.
+    try:
+        recency = _git_recency_scores()
+        for rel, rscore in recency.items():
+            if rel in file_hit_count:
+                file_hit_count[rel] += rscore * 0.5
+    except Exception:
+        pass
+
     if not file_hit_count:
         return (
             f"No matches found for: {', '.join(keywords or path_kws)}.\n"
             "Try more specific terms — class names, function names, or file path segments."
         )
 
-    # Rank purely by total score — symbol hits already carry higher per-hit weight (3)
-    # so they naturally outrank path-only matches without a hard binary split that
-    # buries cross-platform counterparts (e.g. Java files alongside Swift files).
+    # Rank by total score. When files tie (common with generic keywords), use raw
+    # keyword byte-frequency as a secondary key: a file where the terms appear
+    # many times in implementation code outranks one where they only appear in a
+    # definition line. Byte scan only — no content returned, no extra output tokens.
+    _byte_freq: dict[str, int] = {
+        f: _byte_keyword_freq(WORKSPACE_ROOT / f, keywords)
+        for f in file_hit_count
+    }
+
     def _file_rank(f: str) -> tuple:
-        return (-file_hit_count[f],)
+        return (-file_hit_count[f], -_byte_freq[f])
 
     top_files = sorted(file_hit_count, key=_file_rank)[:max_files]
     top_set = set(top_files)
@@ -1840,7 +2145,7 @@ def scope_task(task: str, max_files: int = 5, include_blueprints: bool = False) 
 
     parts.append("## Ranked files\n")
     for i, rel in enumerate(top_files, 1):
-        n = file_hit_count[rel]
+        n = int(round(file_hit_count[rel]))
         parts.append(f"  {i}. {rel}  ({n} {'match' if n == 1 else 'matches'})")
 
     # Suggest targeted get_symbol calls for definition hits — faster than reading a whole file
@@ -1876,7 +2181,7 @@ def scope_task(task: str, max_files: int = 5, include_blueprints: bool = False) 
     if include_blueprints:
         parts.append("\n## File blueprints\n")
         for rel in top_files:
-            n = file_hit_count[rel]
+            n = int(round(file_hit_count[rel]))
             try:
                 bp_path = _resolve_in_workspace(rel)
                 blueprint = _build_blueprint(bp_path)
@@ -2430,6 +2735,80 @@ def add_ignore(pattern: str, reason: str = "") -> str:
 
 
 @mcp.tool()
+def set_focus(entries: str) -> str:
+    """Set (or clear) per-project score weights so scope_task biases results toward
+    the projects you're actively working in and away from those you're not.
+
+    Each entry is a path-prefix substring optionally followed by :weight.
+    Default weight when omitted is 3.0 (3× boost).  Use a weight below 1.0 to
+    suppress a project (e.g. 0.3 reduces its scores to 30%).  Multiple entries are
+    comma-separated.  Pass an empty string to clear all weights and restore equal
+    scoring across every project.
+
+    The weights are saved to .mimir-focus in the workspace root and take effect
+    immediately — no restart needed.  Call set_focus("") to reset at any time.
+
+    Args:
+        entries: comma-separated list of prefix[:weight] pairs, e.g.:
+            "Carps.Mobile"                         → boost Mobile 3×, others unchanged
+            "Carps.Mobile, Carps.Keypad:0.3"       → boost Mobile, suppress Keypad
+            "Carps.Mobile:3, Carps.Keypad:0.3"     → explicit weights for both
+            ""                                      → clear all, equal scoring
+
+    Examples:
+        set_focus("InControl.Carps.Mobile")
+        set_focus("InControl.Carps.Mobile, InControl.Carps.Keypad:0.3")
+        set_focus("")
+    """
+    global _FOCUS_WEIGHTS
+    raw = entries.strip()
+    focus_file = WORKSPACE_ROOT / ".mimir-focus"
+    try:
+        if not raw:
+            if focus_file.exists():
+                focus_file.unlink()
+            _FOCUS_WEIGHTS = {}
+            return "Focus cleared. All projects now score equally."
+
+        parsed: dict[str, float] = {}
+        lines_out: list[str] = []
+        for part in raw.split(","):
+            part = part.strip()
+            if not part:
+                continue
+            if ":" in part:
+                prefix, _, wraw = part.rpartition(":")
+                try:
+                    weight = float(wraw.strip())
+                except ValueError:
+                    weight = 3.0
+            else:
+                prefix = part
+                weight = 3.0
+            prefix = prefix.strip()
+            if prefix:
+                parsed[prefix.lower()] = weight
+                lines_out.append(f"{prefix} = {weight}")
+
+        if not parsed:
+            return "Error: no valid entries found. Format: 'Prefix.Name' or 'Prefix.Name:0.3'"
+
+        focus_file.write_text(
+            "# mimir project focus weights  (prefix = multiplier)\n"
+            + "\n".join(lines_out) + "\n",
+            encoding="utf-8"
+        )
+        _FOCUS_WEIGHTS = parsed
+
+        summary = ", ".join(
+            f"'{k}' {'×' if v >= 1 else '×'}{v:.1f}" for k, v in parsed.items()
+        )
+        return f"Focus set: {summary}. Saved to .mimir-focus (call set_focus(\"\") to reset)."
+    except OSError as e:
+        return f"Error saving focus: {e}"
+
+
+@mcp.tool()
 def get_status() -> str:
     """Report the current state of the mimir index for this workspace.
 
@@ -2511,6 +2890,20 @@ def get_status() -> str:
             else "reverse_imports:    building..."
         )
 
+        if _FOCUS_WEIGHTS:
+            focus_entries = "  ".join(
+                f"'{k}' ×{v:.1f}" for k, v in _FOCUS_WEIGHTS.items()
+            )
+            focus_line = (
+                f"project_focus:      {focus_entries}\n"
+                f"  → call set_focus(\"\") to clear, or set_focus(\"prefix:weight, ...\") to change"
+            )
+        else:
+            focus_line = (
+                "project_focus:      none\n"
+                "  → call set_focus(\"Prefix:3, OtherPrefix:0.3\") to bias scoring by sub-project"
+            )
+
         lines = [
             f"workspace:          {WORKSPACE_ROOT}",
             f"source_files:       {total_files}",
@@ -2522,6 +2915,8 @@ def get_status() -> str:
             f"sandbox:            {'on' if SANDBOX_ENABLED else 'off'}",
             watcher_line,
             rev_line,
+            "",
+            focus_line,
             "",
             ignore_section,
             "",

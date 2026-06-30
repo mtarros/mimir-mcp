@@ -92,7 +92,7 @@ def workspace(tmp_path):
 
 class TestToolRegistration:
     async def test_all_tools_listed(self, workspace):
-        """All 14 tools must be registered — any missing tool fails silently in production."""
+        """All 16 tools must be registered — any missing tool fails silently in production."""
         async with Client(_make_transport(workspace)) as client:
             tools = await client.list_tools()
             names = {t.name for t in tools}
@@ -100,6 +100,8 @@ class TestToolRegistration:
             "get_file_structure",
             "verify_symbol_existence",
             "scope_task",
+            "scope_hint",
+            "set_focus",
             "get_imports",
             "get_dependents",
             "find_callers",
@@ -173,6 +175,34 @@ class TestScopeTaskWire:
         text = _text(r)
         assert len(text) > 50
         assert "EXCEPTION" not in text
+
+    async def test_tiebreaker_ranks_body_rich_file_first(self, tmp_path):
+        """Integration: body-rich file beats definition-only file when symbol scores tie."""
+        # Both files define the same class → same symbol score.
+        # deep.py has many more keyword occurrences in method names and fields.
+        (tmp_path / "shallow.py").write_text(
+            "class TimerJob:\n"
+            "    def run(self): pass\n"
+        )
+        (tmp_path / "deep.py").write_text(
+            "class TimerJob:\n"
+            "    _timer_interval = 30\n"
+            "    _timer_handle = None\n"
+            "    def start_timer(self): pass\n"
+            "    def stop_timer(self): pass\n"
+            "    def reset_timer(self): pass\n"
+            "    def on_timer_tick(self): pass\n"
+        )
+        async with Client(_make_transport(tmp_path)) as client:
+            r = await client.call_tool("scope_task", {"task": "TimerJob timer", "max_files": 2})
+        text = _text(r)
+        assert "EXCEPTION" not in text
+        lines = text.splitlines()
+        ranked = [l for l in lines if l.strip().startswith(("1.", "2."))]
+        assert len(ranked) >= 2, f"Expected 2 ranked files:\n{text}"
+        assert "deep.py" in ranked[0], (
+            f"deep.py should rank first (more 'timer' occurrences in body):\n{text}"
+        )
 
 
 # ---------------------------------------------------------------------------

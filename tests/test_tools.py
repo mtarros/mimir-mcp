@@ -209,3 +209,269 @@ class TestGeneratedFileExclusion:
 
         assert "MyClass.cs" in names
         assert "AssemblyInfo.cs" not in names
+
+
+# ---------------------------------------------------------------------------
+# _byte_keyword_freq — raw byte frequency tiebreaker
+# ---------------------------------------------------------------------------
+
+class TestByteKeywordFreq:
+    def test_counts_occurrences(self, tmp_path):
+        f = tmp_path / "a.py"
+        f.write_text("refresh refresh refresh\ndef refresh_data(): pass\n")
+        count = mimir._byte_keyword_freq(f, ["refresh"])
+        assert count == 4
+
+    def test_case_insensitive(self, tmp_path):
+        f = tmp_path / "a.py"
+        f.write_text("Refresh REFRESH refresh\n")
+        count = mimir._byte_keyword_freq(f, ["refresh"])
+        assert count == 3
+
+    def test_multiple_keywords_summed(self, tmp_path):
+        f = tmp_path / "a.py"
+        f.write_text("timer interval timer\ninterval\n")
+        count = mimir._byte_keyword_freq(f, ["timer", "interval"])
+        assert count == 4  # 2 "timer" + 2 "interval"
+
+    def test_missing_file_returns_zero(self, tmp_path):
+        result = mimir._byte_keyword_freq(tmp_path / "nonexistent.py", ["anything"])
+        assert result == 0
+
+    def test_empty_keywords_returns_zero(self, tmp_path):
+        f = tmp_path / "a.py"
+        f.write_text("lots of text here\n")
+        assert mimir._byte_keyword_freq(f, []) == 0
+
+    def test_keyword_not_present_returns_zero(self, tmp_path):
+        f = tmp_path / "a.py"
+        f.write_text("class Foo: pass\n")
+        assert mimir._byte_keyword_freq(f, ["timer", "interval"]) == 0
+
+
+# ---------------------------------------------------------------------------
+# scope_task tiebreaker — body-rich file surfaces above definition-only file
+# ---------------------------------------------------------------------------
+
+class TestScopeTaskTiebreaker:
+    """When two files tie on symbol-definition score, the file with more keyword
+    occurrences in its implementation body should rank first."""
+
+    @pytest.fixture(autouse=True)
+    def workspace(self, tmp_path, monkeypatch):
+        # Two files that both define RefreshService (score tie on symbol match).
+        # shallow.py: one class definition, no further body mentions.
+        # deep.py: same class definition PLUS lots of "refresh"/"timer" in body.
+        (tmp_path / "shallow.py").write_text(
+            "class RefreshService:\n"
+            "    def run(self): pass\n"
+        )
+        (tmp_path / "deep.py").write_text(
+            "class RefreshService:\n"
+            "    _refresh_timer = None\n"
+            "    _refresh_interval = 10\n"
+            "    def start_refresh_timer(self): pass\n"
+            "    def stop_refresh_timer(self): pass\n"
+            "    def _on_refresh_tick(self): pass\n"
+            "    def configure_refresh(self, interval): pass\n"
+        )
+        monkeypatch.setattr(mimir, "WORKSPACE_ROOT", tmp_path)
+        monkeypatch.setattr(mimir, "_FILE_LIST", [])
+        monkeypatch.setattr(mimir, "_FILE_LIST_TS", 0.0)
+        monkeypatch.setattr(mimir, "_FTS_READY", False)
+        monkeypatch.setattr(mimir, "_DISK_CACHE", None)
+        monkeypatch.setattr(mimir, "_MIMIRIGNORE_PATTERNS", [])
+        monkeypatch.setattr(mimir, "_MIMIRALIASES", {})
+        monkeypatch.setattr(mimir, "_REVERSE_IMPORTS", {})
+        monkeypatch.setattr(mimir, "_CACHE", mimir._CACHE.__class__())
+        monkeypatch.setattr(mimir, "_GIT_RECENCY_CACHE", {"ts": float("inf"), "scores": {}})
+
+    def test_body_rich_file_ranks_above_definition_only_on_tie(self):
+        result = mimir.scope_task("RefreshService timer refresh", max_files=2)
+        lines = result.splitlines()
+        ranked = [l for l in lines if l.strip().startswith(("1.", "2."))]
+        assert len(ranked) >= 2, f"Expected 2 ranked files, got:\n{result}"
+        assert "deep.py" in ranked[0], (
+            f"Expected deep.py first (more keyword occurrences), got: {ranked[0]!r}\n"
+            f"Full output:\n{result}"
+        )
+
+    def test_shallow_file_still_appears_in_results(self):
+        result = mimir.scope_task("RefreshService timer refresh", max_files=2)
+        assert "shallow.py" in result
+
+    def test_byte_freq_does_not_promote_unrelated_file(self, tmp_path):
+        # A file full of the keyword but with NO class definition should not
+        # outrank one that actually defines the matched symbol.
+        (tmp_path / "noise.py").write_text(
+            "# refresh refresh refresh refresh refresh refresh refresh\n"
+            "x = 1\n"
+        )
+        result = mimir.scope_task("RefreshService", max_files=3)
+        lines = result.splitlines()
+        ranked = [l.strip() for l in lines if l.strip().startswith(("1.", "2.", "3."))]
+        # noise.py has no RefreshService symbol — it may appear via path/body frequency
+        # but the definition files should rank above it on symbol score
+        if any("noise.py" in r for r in ranked):
+            def_rank = next((i for i, r in enumerate(ranked) if "noise.py" not in r), None)
+            noise_rank = next((i for i, r in enumerate(ranked) if "noise.py" in r), None)
+            assert def_rank is not None and noise_rank is not None
+            assert def_rank < noise_rank, "noise.py should not outrank symbol-definition files"
+
+
+# ---------------------------------------------------------------------------
+# _decompose_identifier — sub-token splitting for CamelCase / snake_case
+# ---------------------------------------------------------------------------
+
+class TestDecomposeIdentifier:
+    def test_pascal_case_splits(self):
+        result = mimir._decompose_identifier("StartOrStopAutoRefresh")
+        assert "start" in result
+        assert "stop" in result
+        assert "auto" in result
+        assert "refresh" in result
+
+    def test_snake_with_underscores(self):
+        result = mimir._decompose_identifier("_refreshIntervalInSeconds")
+        assert "refresh" in result
+        assert "interval" in result
+        assert "seconds" in result
+
+    def test_short_components_excluded(self):
+        # "in" is 2 chars, "or" is 2 chars — excluded by the 4-char minimum
+        result = mimir._decompose_identifier("StartOrStopAutoRefresh")
+        assert "or" not in result
+        assert "in" not in result
+
+    def test_plain_word_returns_itself_if_long_enough(self):
+        result = mimir._decompose_identifier("refresh")
+        assert "refresh" in result
+
+    def test_short_plain_word_returns_empty(self):
+        result = mimir._decompose_identifier("Get")
+        assert result == []
+
+    def test_camel_case_splits(self):
+        result = mimir._decompose_identifier("myCurrentViewModel")
+        assert "current" in result
+        assert "view" in result
+        assert "model" in result
+
+    def test_all_caps_acronym_no_crash(self):
+        result = mimir._decompose_identifier("HTTPSRequest")
+        # Should not raise; result may vary but must be a list
+        assert isinstance(result, list)
+
+    def test_leading_trailing_underscores_stripped(self):
+        result = mimir._decompose_identifier("__private_method__")
+        assert "private" in result
+        assert "method" in result
+
+
+# ---------------------------------------------------------------------------
+# _index_blueprint_rows — sub-tokens appear in the index
+# ---------------------------------------------------------------------------
+
+class TestSubTokenIndexing:
+    """Verify that _index_blueprint_rows emits sub-tokens for compound names."""
+
+    def test_camel_case_sub_tokens_indexed(self):
+        blueprint = "L1  def StartOrStopAutoRefresh(value: bool) -> None:"
+        rows = mimir._index_blueprint_rows("foo.py", blueprint)
+        tokens = {r[0] for r in rows}
+        assert "refresh" in tokens, f"'refresh' not in indexed tokens: {tokens}"
+        assert "stop" in tokens
+        assert "start" in tokens
+        assert "auto" in tokens
+
+    def test_snake_case_field_sub_tokens_indexed(self):
+        blueprint = "L5  _refreshIntervalInSeconds: int"
+        rows = mimir._index_blueprint_rows("foo.py", blueprint)
+        tokens = {r[0] for r in rows}
+        assert "refresh" in tokens
+        assert "interval" in tokens
+        assert "seconds" in tokens
+
+    def test_whole_token_also_indexed(self):
+        # The whole identifier should still be in the index alongside sub-tokens
+        blueprint = "L1  def StartOrStopAutoRefresh(value: bool) -> None:"
+        rows = mimir._index_blueprint_rows("foo.py", blueprint)
+        tokens = {r[0] for r in rows}
+        assert "StartOrStopAutoRefresh" in tokens
+
+    def test_short_sub_tokens_not_indexed(self):
+        # "or" (2 chars), "in" (2 chars) — must not appear
+        blueprint = "L1  def StartOrStopAutoRefresh(x: int) -> None:"
+        rows = mimir._index_blueprint_rows("foo.py", blueprint)
+        tokens = {r[0] for r in rows}
+        assert "or" not in tokens
+        assert "in" not in tokens
+
+    def test_no_duplicate_tokens_per_file_line(self):
+        blueprint = "L1  def refresh_timer_refresh(x): pass"
+        rows = mimir._index_blueprint_rows("foo.py", blueprint)
+        token_lineno_pairs = [(r[0], r[2]) for r in rows]
+        # Each (token, lineno) pair should appear at most once
+        assert len(token_lineno_pairs) == len(set(token_lineno_pairs))
+
+    def test_hash_comments_skipped(self):
+        blueprint = "# L1  def StartOrStopAutoRefresh(): pass"
+        rows = mimir._index_blueprint_rows("foo.py", blueprint)
+        assert rows == []
+
+
+# ---------------------------------------------------------------------------
+# Sub-token search — _symbol_hits and _symbol_hits_multi with compound names
+# ---------------------------------------------------------------------------
+
+class TestSubTokenSearch:
+    """End-to-end: searching for a sub-token finds files with compound identifiers."""
+
+    @pytest.fixture(autouse=True)
+    def workspace(self, tmp_path, monkeypatch):
+        (tmp_path / "viewmodel.py").write_text(
+            "class MyCurrentViewModel:\n"
+            "    _refreshIntervalInSeconds: int = 10\n"
+            "    def StartOrStopAutoRefresh(self, value: bool) -> None:\n"
+            "        pass\n"
+        )
+        (tmp_path / "unrelated.py").write_text(
+            "class Unrelated:\n"
+            "    def compute(self): pass\n"
+        )
+        monkeypatch.setattr(mimir, "WORKSPACE_ROOT", tmp_path)
+        monkeypatch.setattr(mimir, "_FILE_LIST", [])
+        monkeypatch.setattr(mimir, "_FILE_LIST_TS", 0.0)
+        monkeypatch.setattr(mimir, "_FTS_READY", False)
+        monkeypatch.setattr(mimir, "_DISK_CACHE", None)
+        monkeypatch.setattr(mimir, "_MIMIRIGNORE_PATTERNS", [])
+        monkeypatch.setattr(mimir, "_CACHE", mimir._CACHE.__class__())
+
+    def test_symbol_hits_finds_sub_token(self):
+        hits = mimir._symbol_hits("refresh", max_results=10)
+        files = {h[0] for h in hits}
+        assert "viewmodel.py" in files, (
+            f"Expected viewmodel.py in hits for 'refresh', got: {files}"
+        )
+
+    def test_symbol_hits_does_not_find_unrelated(self):
+        hits = mimir._symbol_hits("refresh", max_results=10)
+        files = {h[0] for h in hits}
+        assert "unrelated.py" not in files
+
+    def test_symbol_hits_multi_finds_sub_tokens(self):
+        # "refresh" and "current" both appear as sub-tokens of method/class names
+        result = mimir._symbol_hits_multi(["refresh", "current"], max_per_kw=10)
+        refresh_files = {h[0] for h in result["refresh"]}
+        current_files = {h[0] for h in result["current"]}
+        assert "viewmodel.py" in refresh_files
+        assert "viewmodel.py" in current_files
+
+    def test_scope_task_surfaces_compound_identifier_file(self, monkeypatch):
+        monkeypatch.setattr(mimir, "_MIMIRALIASES", {})
+        monkeypatch.setattr(mimir, "_REVERSE_IMPORTS", {})
+        monkeypatch.setattr(mimir, "_GIT_RECENCY_CACHE", {"ts": float("inf"), "scores": {}})
+        result = mimir.scope_task("current jobs timer polling refresh", max_files=5)
+        assert "viewmodel.py" in result, (
+            f"Expected viewmodel.py to rank for 'refresh' sub-token search.\nOutput:\n{result}"
+        )
