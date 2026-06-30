@@ -113,6 +113,9 @@ For any task involving existing code:
   so the follow-up `scope_task` query is precise. Costs very few tokens.
 - Use `scope_task` with specific class/method names once you know them — it finds
   the right files in one call.
+- Use `semantic_search("what the code does")` when `scope_task` returns poor results
+  because you know the concept but not the code name. It decomposes identifiers and
+  uses BM25 ranking to find files by meaning rather than exact token match.
 - Use `get_symbol(path, name)` to read ONE function or class body instead of the
   whole file.
 - Use `get_file_structure` to see a file's full symbol map before reading it line
@@ -249,6 +252,7 @@ source_files:       8605
 blueprints_cached:  8605 in memory, 8605 on disk
 symbol_index:       warm
   indexed_tokens:   267,034
+semantic_search:    warm (FTS5+RRF)
 warmup:             complete
 tree_sitter:        on
 file_watcher:       on (changes invalidate cache instantly)
@@ -403,7 +407,27 @@ Returns: keywords searched, matched symbols with file:line locations, ranked fil
 
 ---
 
-### 6. `get_symbol` — read just the code you need
+### 6. `semantic_search` — find code by what it does, not what it's called
+
+Use this when `scope_task` returns poor results because you know the **concept** but not the **code name**. Good cases:
+- "authentication token refresh" when the method is called `renewCredentials`
+- "connection pool exhaustion" when the class is `DBSessionLimiter`
+- Cross-cutting concerns spread across several differently-named files
+
+**How it works:** Decomposes identifiers into sub-tokens at index time (`handleAuthFailure` → `"handle auth fail"`) and runs FTS5 BM25 ranked retrieval against those tokens, fused with symbol-index keyword hits via Reciprocal Rank Fusion. The reverse-import graph then adds structurally adjacent files.
+
+**Key difference from `scope_task`:** `scope_task` does exact-token lookup (~1ms). `semantic_search` does ranked full-text search over decomposed tokens (~3ms). Use `scope_task` first — fall back to `semantic_search` when you know what the code *does* but the name is different from your mental model.
+
+`set_focus` weights apply to `semantic_search` the same way as `scope_task`.
+
+**Example:**
+> `semantic_search("database connection pool exhaustion")`
+
+Returns ranked files with matched symbol signatures showing why each file was ranked.
+
+---
+
+### 7. `get_symbol` — read just the code you need
 
 Returns the complete source of ONE named function, class, or method — bodies included. The efficient middle ground between `get_file_structure` (signatures only) and reading the whole raw file.
 
@@ -418,7 +442,7 @@ If the symbol is not found, the response includes the file's full blueprint so y
 
 ---
 
-### 7. `get_file_structure` — understand a file
+### 8. `get_file_structure` — understand a file
 
 Returns a compact map of a single file: every class, function, method, and their signatures — with line numbers, bodies stripped.
 
@@ -429,7 +453,7 @@ Use this when you want the full symbol map of a file before deciding which symbo
 
 ---
 
-### 8. `get_imports` — trace where symbols come from
+### 9. `get_imports` — trace where symbols come from
 
 Lists every import in a file. Resolves relative paths and the `@/` alias (Next.js) to actual workspace files. Distinguishes workspace files from external packages.
 
@@ -451,7 +475,7 @@ Works for: TypeScript, JavaScript, Python, Kotlin, Swift, C#, Go, Rust.
 
 ---
 
-### 9. `get_directory_structure` — browse a module
+### 10. `get_directory_structure` — browse a module
 
 Returns structural blueprints for every source file under a directory. Use this when you know *where* to look but not *which* file.
 
@@ -462,7 +486,7 @@ Use `scope_task` when you don't know where to look. Use `get_directory_structure
 
 ---
 
-### 10. `verify_symbol_existence` — confirm a symbol is real
+### 11. `verify_symbol_existence` — confirm a symbol is real
 
 Searches the entire workspace for a symbol definition and returns its exact location and signature.
 
@@ -473,7 +497,7 @@ Use this before assuming a function or type exists, before importing it, or when
 
 ---
 
-### 11. `find_callers` — trace who calls a symbol
+### 12. `find_callers` — trace who calls a symbol
 
 Searches raw source text across the entire workspace for every call site and usage of a symbol. Unlike `verify_symbol_existence` (which only finds definitions), this finds where a symbol is called, passed, or referenced in implementation code.
 
@@ -484,7 +508,7 @@ WHEN TO USE: after `verify_symbol_existence` tells you where something is define
 
 ---
 
-### 12. `get_dependents` — blast-radius analysis
+### 13. `get_dependents` — blast-radius analysis
 
 Returns every workspace file that directly imports a given file. Built from the reverse import index constructed at startup — no extra configuration needed.
 
@@ -497,7 +521,7 @@ WHEN TO USE: before modifying a widely-used utility, service, or model — get t
 
 ---
 
-### 13. `record_alias` — teach mimir your project's vocabulary
+### 14. `record_alias` — teach mimir your project's vocabulary
 
 Records a mapping from a domain/feature name to the code name used in the codebase. Once saved, `scope_task` automatically expands matching phrases before searching.
 
@@ -526,7 +550,7 @@ push notifications = PushNotificationService, PushManager
 
 ---
 
-### 14. `add_ignore` — exclude noisy files on the fly
+### 15. `add_ignore` — exclude noisy files on the fly
 
 Adds a gitignore-style pattern to `.mimirignore` and takes effect immediately — no restart needed. The AI uses this when it encounters vendor libraries, generated code, test fixtures, or build artefacts that pollute blueprints and `get_architecture` output.
 
@@ -567,7 +591,7 @@ Run `mimir status` to confirm which patterns are active.
 
 ---
 
-### 15. `execute_local_sandbox` — run a quick snippet
+### 16. `execute_local_sandbox` — run a quick snippet
 
 Runs a Python or bash snippet locally with a timeout, captures output, and returns it.
 
@@ -595,6 +619,8 @@ Session start
 Finding and reading code
   5. scope_hint("rough description")        ← cheap first pass: discover the right symbol names
   6. scope_task("ClassName MethodName")     ← precise search using names from scope_hint
+     — or —
+     semantic_search("what the code does")  ← when you know the concept but not the name
   7. get_symbol("file.cs", "SymbolName")   ← read just the function/class you need
      — or —
      get_file_structure("file.cs")          ← full symbol map if you need the overview
@@ -688,7 +714,7 @@ Requires the mimir development install (Option C) and pytest:
 ~/.local/pipx/venvs/mimir-mcp/bin/python -m pytest tests/ -q
 ```
 
-Expected: **157 passed** (~28s — smoke tests spawn real subprocesses).
+Expected: **215 passed** (~30s — smoke tests spawn real subprocesses).
 
 ### Run unit tests only (fast)
 

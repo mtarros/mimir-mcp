@@ -113,6 +113,7 @@ class TestToolRegistration:
             "get_symbol",
             "get_changed_files",
             "get_architecture",
+            "semantic_search",
         }
         assert expected == names, f"Tool mismatch. Extra: {names - expected}, Missing: {expected - names}"
 

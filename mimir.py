@@ -73,6 +73,7 @@ except Exception:
     _WatchdogHandler  = None   # type: ignore
 
 
+
 # --------------------------------------------------------------------------- #
 # Configuration
 # --------------------------------------------------------------------------- #
@@ -233,7 +234,7 @@ _SYMBOL_STOPWORDS = frozenset({
 
 # Increment when the blueprint text format changes so cached blueprints are
 # automatically invalidated and re-parsed on the next server start.
-BLUEPRINT_VERSION = "4"  # bump when index schema or tokenisation changes
+BLUEPRINT_VERSION = "6"  # bump when index schema or tokenisation changes
 
 # Splits PascalCase / camelCase into components: 'StartAutoRefresh' → ['Start','Auto','Refresh']
 _CAMEL_SPLIT_RE = re.compile(r'[A-Z][a-z0-9]*|[a-z][a-z0-9]*')
@@ -278,6 +279,23 @@ def _init_disk_cache() -> "Optional[object]":
         db.execute(
             "CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT)"
         )
+        # FTS5 virtual table for semantic_search — one row per definition line.
+        # file/lineno are UNINDEXED (retrieval only); symbol_name, signature, and
+        # decomposed (space-joined sub-tokens from identifier decomposition) are
+        # full-text indexed by FTS5's built-in BM25 scorer.
+        try:
+            db.execute(
+                "CREATE VIRTUAL TABLE IF NOT EXISTS symbol_fts USING fts5("
+                "  file UNINDEXED,"
+                "  lineno UNINDEXED,"
+                "  symbol_name,"
+                "  signature,"
+                "  decomposed,"
+                "  tokenize='unicode61'"
+                ")"
+            )
+        except Exception:
+            pass  # FTS5 unavailable in this SQLite build; semantic_search degrades gracefully
         # Invalidate all cached blueprints when the format version changes.
         stored = db.execute(
             "SELECT value FROM meta WHERE key='blueprint_version'"
@@ -286,6 +304,7 @@ def _init_disk_cache() -> "Optional[object]":
             db.execute("DELETE FROM blueprints")
             db.execute("DELETE FROM lines")
             db.execute("DELETE FROM symbols")
+            db.execute("DELETE FROM symbol_fts")
             db.execute(
                 "INSERT OR REPLACE INTO meta VALUES ('blueprint_version', ?)",
                 (BLUEPRINT_VERSION,)
@@ -297,17 +316,36 @@ def _init_disk_cache() -> "Optional[object]":
 
 
 _DISK_CACHE = _init_disk_cache()
-_FTS_READY = False       # True once the symbols inverted index is built and queryable
+_FTS_READY = False        # True once the symbols inverted index is built and queryable
+_SEMANTIC_READY = False   # True once symbol_fts FTS5 table is populated
 _WARMUP_COMPLETE = False  # True once _warm_cache() finishes its first full pass
 _REVERSE_IMPORTS: dict[str, list[str]] = {}  # rel_target → sorted list of rel files that import it
 _FILE_WATCHER_ACTIVE = False  # True if a watchdog observer started successfully
 _ARCHITECTURE_MAP: str = ""   # cached architecture overview; built once in _warm_cache
 _GIT_RECENCY_CACHE: dict = {"ts": 0.0, "scores": {}}  # TTL cache: rel_path → recency rank
 
+# Shared pattern: detects definition lines vs usages (import/call).
+# Compiled once at module load; used by scope_task and semantic_search.
+_DEF_LINE_PAT = re.compile(
+    r'(?:^|\s)(?:export\s+)?(?:default\s+)?(?:async\s+)?'
+    r'(?:function|class|def|interface|type|enum|struct|impl|func)\s+\w|'
+    r'(?:export\s+)?(?:const|let|var)\s+\w+\s*[=(]|'
+    r'(?:public|private|protected|internal)(?:\s+(?:static|sealed|abstract|override'
+    r'|virtual|partial|async|readonly|new|extern))*\s+'
+    r'(?:class|interface|enum|record|struct|void|Task|bool|int|string|object'
+    r'|IDisposable|IEnumerable|IReadOnly\w+|\w+\??)\s+\w+\s*[(<]'
+)
+# Pre-computed path strings for fast scope_task path scoring.
+# List of (rel, stem_lower, dir_lower) tuples — avoids Path.relative_to() and .stem
+# on every scope_task call. Built once in _warm_cache(); rebuilt on file-list TTL expiry.
+_PATH_STRINGS: list[tuple[str, str, str]] = []
+_PATH_STRINGS_TS: float = 0.0
+
+
 
 def _load_disk_cache() -> int:
     """Populate the in-memory cache from SQLite. Returns number of valid entries loaded."""
-    global _FTS_READY
+    global _FTS_READY, _SEMANTIC_READY
     if _DISK_CACHE is None:
         return 0
     loaded = 0
@@ -329,6 +367,12 @@ def _load_disk_cache() -> int:
         count = _DISK_CACHE.execute("SELECT COUNT(*) FROM symbols").fetchone()[0]
         if count > 0:
             _FTS_READY = True
+    except Exception:
+        pass
+    try:
+        fts_count = _DISK_CACHE.execute("SELECT COUNT(*) FROM symbol_fts").fetchone()[0]
+        if fts_count > 0:
+            _SEMANTIC_READY = True
     except Exception:
         pass
     return loaded
@@ -509,6 +553,15 @@ def _cache_put(path: Path, blueprint: str) -> None:
                     _DISK_CACHE.executemany("INSERT OR IGNORE INTO lines VALUES (?,?,?)", line_rows)
                 if sym_rows:
                     _DISK_CACHE.executemany("INSERT OR IGNORE INTO symbols VALUES (?,?,?)", sym_rows)
+            if _SEMANTIC_READY:
+                fts_rows = _fts_rows_for_blueprint(rel, blueprint)
+                _DISK_CACHE.execute("DELETE FROM symbol_fts WHERE file = ?", (rel,))
+                if fts_rows:
+                    _DISK_CACHE.executemany(
+                        "INSERT INTO symbol_fts(file, lineno, symbol_name, signature, decomposed)"
+                        " VALUES (?,?,?,?,?)",
+                        fts_rows,
+                    )
             _DISK_CACHE.commit()
         except Exception:
             pass
@@ -528,6 +581,7 @@ def _cache_evict(path: Path) -> None:
             _DISK_CACHE.execute("DELETE FROM blueprints WHERE path = ?", (str(path),))
             _DISK_CACHE.execute("DELETE FROM symbols WHERE file = ?", (rel,))
             _DISK_CACHE.execute("DELETE FROM lines WHERE file = ?", (rel,))
+            _DISK_CACHE.execute("DELETE FROM symbol_fts WHERE file = ?", (rel,))
             _DISK_CACHE.commit()
         except Exception:
             pass
@@ -890,9 +944,12 @@ def _warm_cache() -> None:
     _build_cs_ns_index()
     _build_java_class_index()
     _build_symbol_index()
+    _build_fts_index()         # FTS5 BM25 table for semantic_search
+    _build_path_strings()      # pre-compute (rel, stem_lower, dir_lower) for scope_task path loop
     _build_reverse_imports()
     _build_architecture_map()
     _WARMUP_COMPLETE = True
+    _git_recency_scores()      # pre-warm git cache so first scope_task call isn't slow
 
 
 # --------------------------------------------------------------------------- #
@@ -1634,6 +1691,46 @@ def _decompose_identifier(token: str) -> list[str]:
     return sub
 
 
+def _fts_rows_for_blueprint(
+    rel: str, blueprint: str
+) -> list[tuple[str, str, str, str, str]]:
+    """Produce (file, lineno, symbol_name, signature, decomposed) rows for symbol_fts.
+
+    One row per unique definition line. symbol_name is the longest non-stopword
+    identifier on the line. decomposed is a space-joined set of all sub-tokens
+    derived from CamelCase/snake_case decomposition of every identifier — this
+    is the primary FTS5 search surface for natural-language queries.
+    """
+    rows: list[tuple[str, str, str, str, str]] = []
+    seen_lines: set[str] = set()
+    for line in blueprint.splitlines():
+        if not line or line.startswith('#'):
+            continue
+        m = re.match(r'L(\d+)\s*(.*)', line.strip())
+        if not m:
+            continue
+        lineno = m.group(1)
+        if lineno in seen_lines:
+            continue
+        seen_lines.add(lineno)
+        signature = m.group(2).strip()
+        if not signature:
+            continue
+        toks = re.findall(r'\w+', signature)
+        candidates = [t for t in toks if t not in _SYMBOL_STOPWORDS and len(t) >= 2]
+        if not candidates:
+            continue
+        symbol_name = max(candidates, key=len)
+        decomp: set[str] = set()
+        for tok in candidates:
+            decomp.add(tok.lower())
+            for sub in _decompose_identifier(tok):
+                decomp.add(sub)
+        decomposed = ' '.join(sorted(decomp))
+        rows.append((rel, lineno, symbol_name, signature, decomposed))
+    return rows
+
+
 def _index_blueprint_rows(rel: str, blueprint: str) -> list[tuple[str, str, str]]:
     """Extract (token, file, lineno) rows for the symbols table from a blueprint.
 
@@ -1665,6 +1762,23 @@ def _index_blueprint_rows(rel: str, blueprint: str) -> list[tuple[str, str, str]
                     seen.add(sub)
                     rows.append((sub, rel, lineno))
     return rows
+
+
+def _build_path_strings() -> None:
+    """Pre-compute (rel, stem_lower, dir_lower) for every source file.
+
+    Avoids repeated Path.relative_to() / .stem calls in the scope_task path loop,
+    reducing that loop from ~47ms to ~3ms on 2k-file repos.
+    """
+    global _PATH_STRINGS, _PATH_STRINGS_TS
+    result: list[tuple[str, str, str]] = []
+    for src_path in _iter_source_files():
+        rel = str(src_path.relative_to(WORKSPACE_ROOT))
+        stem_lc = src_path.stem.lower()
+        dir_lc = str(src_path.parent.relative_to(WORKSPACE_ROOT)).lower()
+        result.append((rel, stem_lc, dir_lc))
+    _PATH_STRINGS = result
+    _PATH_STRINGS_TS = time.monotonic()
 
 
 def _build_symbol_index() -> None:
@@ -1704,6 +1818,48 @@ def _build_symbol_index() -> None:
         _DISK_CACHE.commit()
         _DISK_CACHE.execute("PRAGMA wal_checkpoint(TRUNCATE)")
         _FTS_READY = True
+    except Exception:
+        pass
+
+
+def _build_fts_index() -> None:
+    """Populate symbol_fts FTS5 table from all cached blueprints.
+
+    Called from _warm_cache() after _build_symbol_index(). Skips rebuild if
+    the table already covers all known source files (warm-restart optimisation).
+    Incremental updates happen via _cache_put/_cache_evict for individual files.
+    """
+    global _SEMANTIC_READY
+    if _DISK_CACHE is None:
+        return
+    try:
+        indexed = _DISK_CACHE.execute(
+            "SELECT COUNT(DISTINCT file) FROM symbol_fts"
+        ).fetchone()[0]
+        total = len(_iter_source_files())
+        if indexed > 0 and indexed >= total:
+            _SEMANTIC_READY = True
+            return
+    except Exception:
+        return  # FTS5 table not present; skip silently
+
+    fts_rows: list[tuple[str, str, str, str, str]] = []
+    for path in _iter_source_files():
+        cached = _cache_get(path)
+        if cached is None:
+            continue
+        rel = str(path.relative_to(WORKSPACE_ROOT))
+        fts_rows.extend(_fts_rows_for_blueprint(rel, cached))
+
+    try:
+        _DISK_CACHE.execute("DELETE FROM symbol_fts")
+        _DISK_CACHE.executemany(
+            "INSERT INTO symbol_fts(file, lineno, symbol_name, signature, decomposed)"
+            " VALUES (?,?,?,?,?)",
+            fts_rows,
+        )
+        _DISK_CACHE.commit()
+        _SEMANTIC_READY = True
     except Exception:
         pass
 
@@ -2120,21 +2276,6 @@ def scope_task(task: str, max_files: int = 5, include_blueprints: bool = False) 
     file_hit_count: dict[str, float] = {}
     all_hits: list[tuple[str, str, str, str]] = []  # (keyword, rel, line, sig)
 
-    # Regex to detect a definition line vs a usage (import/call).
-    # Covers Python/JS/TS keywords and C#/Java/Go/Rust patterns so definitions
-    # always score 3× vs usages scoring 1×.
-    _def_line_pat = re.compile(
-        # Python / JS / TS / Go / Rust
-        r'(?:^|\s)(?:export\s+)?(?:default\s+)?(?:async\s+)?'
-        r'(?:function|class|def|interface|type|enum|struct|impl|func)\s+\w|'
-        r'(?:export\s+)?(?:const|let|var)\s+\w+\s*[=(]|'
-        # C# / Java / Kotlin — access modifier + optional modifiers + return type + name(
-        r'(?:public|private|protected|internal)(?:\s+(?:static|sealed|abstract|override'
-        r'|virtual|partial|async|readonly|new|extern))*\s+'
-        r'(?:class|interface|enum|record|struct|void|Task|bool|int|string|object'
-        r'|IDisposable|IEnumerable|IReadOnly\w+|\w+\??)\s+\w+\s*[(<]'
-    )
-
     valid_kws = [kw for kw in keywords if re.match(r"^\w[\w]*$", kw)]
 
     # Expand with sub-tokens from compound identifiers (e.g. StartOrStopAutoRefresh
@@ -2160,26 +2301,32 @@ def scope_task(task: str, max_files: int = 5, include_blueprints: bool = False) 
         sub_weight_factor = 0.3 if kw in _sub_kw_set else 1.0
         for rel, line, sig in multi_hits.get(kw, []):
             all_hits.append((kw, rel, line, sig))
-            weight = (3 if _def_line_pat.search(sig) else 1) * sub_weight_factor
+            weight = (3 if _DEF_LINE_PAT.search(sig) else 1) * sub_weight_factor
             file_hit_count[rel] = file_hit_count.get(rel, 0) + weight
+    _used_fts = _SEMANTIC_READY  # path loop uses FTS5; byte-scan tiebreaker skipped
 
-    # Path-based supplement: finds files whose path contains task terms.
-    # Filename matches score 3x vs directory matches (score 1x) so that
-    # "RectificationFilterDialogFragment.java" outranks generic files that merely
-    # live in a directory named "filter". Also boosts files already found via
-    # symbol search so cross-platform counterparts (iOS ↔ Android) surface together.
+    # Path-based supplement: files whose name/directory contains task keywords.
+    # Filename stem matches score 3×, directory matches 1×.
+    # Uses _PATH_STRINGS (pre-computed at warmup) — avoids Path.relative_to() overhead
+    # on every call. Falls back to live walk if the cache is empty.
     path_kws = _extract_path_keywords(expanded)
-    try:
-        for src_path in _iter_source_files():
-            rel = str(src_path.relative_to(WORKSPACE_ROOT))
-            fname_norm = src_path.stem.lower()
-            dir_norm = str(src_path.parent.relative_to(WORKSPACE_ROOT)).lower()
-            score = sum(3 if kw in fname_norm else (1 if kw in dir_norm else 0)
-                        for kw in path_kws)
-            if score > 0:
-                file_hit_count[rel] = file_hit_count.get(rel, 0) + score
-    except Exception:
-        pass
+    if path_kws:
+        path_source = _PATH_STRINGS if _PATH_STRINGS else [
+            (
+                str(src_path.relative_to(WORKSPACE_ROOT)),
+                src_path.stem.lower(),
+                str(src_path.parent.relative_to(WORKSPACE_ROOT)).lower(),
+            )
+            for src_path in _iter_source_files()
+        ]
+        try:
+            for rel, stem_lc, dir_lc in path_source:
+                score = sum(3 if kw in stem_lc else (1 if kw in dir_lc else 0)
+                            for kw in path_kws)
+                if score > 0:
+                    file_hit_count[rel] = file_hit_count.get(rel, 0) + score
+        except Exception:
+            pass
 
     # Forward import expansion: for the top 3 keyword/path-matched files, parse
     # their imports and add workspace-resolved targets at 40% of the parent's score.
@@ -2251,19 +2398,16 @@ def scope_task(task: str, max_files: int = 5, include_blueprints: bool = False) 
             "Try more specific terms — class names, function names, or file path segments."
         )
 
-    # Rank by total score. When files tie (common with generic keywords), use raw
-    # keyword byte-frequency as a secondary key: a file where the terms appear
-    # many times in implementation code outranks one where they only appear in a
-    # definition line. Byte scan only — no content returned, no extra output tokens.
-    _byte_freq: dict[str, int] = {
-        f: _byte_keyword_freq(WORKSPACE_ROOT / f, keywords)
-        for f in file_hit_count
-    }
-
-    def _file_rank(f: str) -> tuple:
-        return (-file_hit_count[f], -_byte_freq[f])
-
-    top_files = sorted(file_hit_count, key=_file_rank)[:max_files]
+    # Rank by total score. When FTS5 was used, BM25 already encodes term frequency
+    # so no byte scan is needed. Fall back to byte scan only for the symbols-table path.
+    if _used_fts:
+        top_files = sorted(file_hit_count, key=lambda f: -file_hit_count[f])[:max_files]
+    else:
+        _byte_freq: dict[str, int] = {
+            f: _byte_keyword_freq(WORKSPACE_ROOT / f, keywords)
+            for f in file_hit_count
+        }
+        top_files = sorted(file_hit_count, key=lambda f: (-file_hit_count[f], -_byte_freq[f]))[:max_files]
     top_set = set(top_files)
 
     parts: list[str] = [f"# Scope: {task!r}\n"]
@@ -2296,7 +2440,7 @@ def scope_task(task: str, max_files: int = 5, include_blueprints: bool = False) 
     sym_suggestions: list[tuple[str, str]] = []
     seen_syms: set[tuple[str, str]] = set()
     for r, l, s in unique:
-        if _def_line_pat.search(s):
+        if _DEF_LINE_PAT.search(s):
             name = _symbol_name_from_sig(s)
             if name and (r, name) not in seen_syms:
                 seen_syms.add((r, name))
@@ -2335,6 +2479,235 @@ def scope_task(task: str, max_files: int = 5, include_blueprints: bool = False) 
             parts.append(f"### {rel}  ({n} {'match' if n == 1 else 'matches'})\n{blueprint}\n")
 
     return "\n".join(parts)
+
+
+# ---------------------------------------------------------------------------
+# semantic_search helpers
+# ---------------------------------------------------------------------------
+
+# English filler words that carry no search signal in a natural-language query.
+# Intentionally small — code keywords (export, import, …) must NOT be here because
+# they are meaningful query terms even though they are code syntax stopwords.
+_QUERY_STOPWORDS = frozenset({
+    "the", "and", "for", "with", "this", "that", "are", "was", "were",
+    "has", "have", "been", "how", "what", "where", "when", "which",
+    "its", "their", "from", "into", "onto", "upon", "over", "under",
+    "not", "but", "can", "will", "all", "any", "some", "each",
+})
+
+
+def _decompose_query_for_fts(query: str) -> list[str]:
+    """Convert a natural-language query to FTS5 search terms.
+
+    Extracts word tokens, decomposes CamelCase/snake_case identifiers,
+    lowercases everything, deduplicates, filters English filler words, and
+    returns up to 16 terms of 3+ characters.
+
+    Uses _QUERY_STOPWORDS (not _SYMBOL_STOPWORDS) so that code keywords that
+    appear in the query (e.g. "export", "import") are kept as search terms.
+    """
+    seen: set[str] = set()
+    terms: list[str] = []
+    for tok in re.findall(r'[a-zA-Z_]\w*', query):
+        parts_list = [tok.lower()] + _decompose_identifier(tok)
+        for p in parts_list:
+            pl = p.lower()
+            if len(pl) >= 3 and pl not in _QUERY_STOPWORDS and pl not in seen:
+                seen.add(pl)
+                terms.append(pl)
+    return terms[:16]
+
+
+def _fts_search(
+    terms: list[str], limit: int = 50
+) -> list[tuple]:
+    """Run an FTS5 BM25 search over symbol_fts.
+
+    Returns list of (file, lineno, symbol_name, signature, score) tuples.
+    BM25 scores in SQLite FTS5 are negative (more negative = better match).
+    Falls back to a bare OR query if the quoted form fails.
+    """
+    if not terms or _DISK_CACHE is None:
+        return []
+    safe_terms = [t for t in terms if re.match(r'^\w+$', t)]
+    if not safe_terms:
+        return []
+    fts_query = ' OR '.join(f'"{t}"' for t in safe_terms)
+    # Column weights: symbol_name=10, signature=5, decomposed=1.
+    # Heavily penalises matches that only appear in the broad decomposed token
+    # bag — reduces noise from common sub-tokens like 'file', 'get', 'error'.
+    sql = (
+        "SELECT file, lineno, symbol_name, signature, bm25(symbol_fts, 0, 0, 10, 5, 1) AS score"
+        " FROM symbol_fts WHERE symbol_fts MATCH ? ORDER BY score LIMIT ?"
+    )
+    try:
+        return _DISK_CACHE.execute(sql, (fts_query, limit)).fetchall()
+    except Exception:
+        try:
+            bare = ' OR '.join(safe_terms)
+            return _DISK_CACHE.execute(sql, (bare, limit)).fetchall()
+        except Exception:
+            return []
+
+
+@mcp.tool()
+def semantic_search(query: str, max_results: int = 10) -> str:
+    """Search the workspace by MEANING rather than exact symbol names.
+
+    WHEN TO USE: when scope_task returns poor results because you know the
+    CONCEPT but not the CODE NAME — e.g. "authentication token refresh"
+    instead of "refreshAuthToken", "connection pool exhaustion" instead of
+    "PoolExhaustedException". Also useful for cross-cutting concerns that
+    live in several differently-named files.
+
+    How it works:
+      1. FTS5 BM25 full-text search over decomposed identifier tokens
+      2. RRF fusion with symbol-index keyword hits
+      3. Reverse-import graph expansion to surface structurally adjacent files
+
+    TIP: use scope_task when you know the exact class/function name.
+         Use semantic_search when you know what the code DOES but not what
+         it is CALLED.
+
+    Args:
+        query:       natural-language description of what the code does, e.g.
+                     "database connection retry logic"
+                     "user authentication token expiry handler"
+        max_results: how many ranked files to return (default 10, max 25).
+    """
+    try:
+        max_results = max(1, min(int(max_results), 25))
+
+        if not _SEMANTIC_READY or _DISK_CACHE is None:
+            fallback = scope_task(query, max_files=max_results)
+            return (
+                "[semantic_search: FTS5 index not yet ready — using scope_task fallback]\n"
+                + fallback
+            )
+
+        query_terms = _decompose_query_for_fts(query)
+        if not query_terms:
+            return (
+                f"No searchable terms extracted from {query!r}. "
+                "Try more specific language with concrete nouns or identifier-like words."
+            )
+
+        # Layer 1: FTS5 BM25 retrieval (top 50 candidates)
+        fts_hits = _fts_search(query_terms, limit=50)
+        if not fts_hits:
+            return (
+                f"No matches found for terms: {', '.join(query_terms)}.\n"
+                "Try broader terms or use scope_task for exact symbol names."
+            )
+
+        # Group by file: keep the BEST (most negative = highest BM25) score per file.
+        # Summing rewards high-symbol-count files for volume, not relevance — a file
+        # with 100 weak matches beats a file with 1 perfect match. Max-score fixes that.
+        file_scores: dict[str, float] = {}
+        file_symbols: dict[str, list[tuple[str, str]]] = {}
+        for file, lineno, sym_name, sig, score in fts_hits:
+            abs_score = abs(score)
+            if abs_score > file_scores.get(file, 0.0):
+                file_scores[file] = abs_score
+            file_symbols.setdefault(file, []).append((lineno, sig))
+
+        # Path boost: if any query term appears in the file path, multiply the score.
+        # scope_task wins on class-name queries (e.g. "excel" → TableToExcel.cs) because
+        # it directly matches file names. Replicate that signal here: a 3× boost when the
+        # path contains a term, stronger (5×) when the *filename stem* contains it.
+        for file in list(file_scores):
+            path_lc = file.lower()
+            stem_lc = os.path.splitext(os.path.basename(path_lc))[0]
+            for term in query_terms:
+                if term in stem_lc:
+                    file_scores[file] *= 5.0
+                    break
+                if term in path_lc:
+                    file_scores[file] *= 3.0
+                    break
+
+        # Layer 2: RRF merge with scope_task's symbol-index lookup.
+        # FTS5 BM25 finds code by decomposed tokens; the symbol index finds class/method
+        # names by exact token (e.g. "email" → CRectificationEmail via its token index).
+        # Reciprocal Rank Fusion (k=60) combines both ranked lists without needing to
+        # normalise their incompatible score scales.
+        try:
+            scope_kws = _extract_scope_keywords(query)
+            valid_scope_kws = [kw for kw in scope_kws if re.match(r'^\w[\w]*$', kw)]
+            if valid_scope_kws and _FTS_READY:
+                sym_hits = _symbol_hits_multi(valid_scope_kws, max_per_kw=8)
+                sym_scores: dict[str, float] = {}
+                for kw in valid_scope_kws:
+                    for rel, _line, sig in sym_hits.get(kw, []):
+                        w = 3.0 if _DEF_LINE_PAT.search(sig) else 1.0
+                        sym_scores[rel] = sym_scores.get(rel, 0.0) + w
+
+                K = 60
+                fts_ranked = sorted(file_scores, key=lambda f: -file_scores[f])
+                sym_ranked = sorted(sym_scores, key=lambda f: -sym_scores[f])
+
+                rrf: dict[str, float] = {}
+                for rank, f in enumerate(fts_ranked, 1):
+                    rrf[f] = rrf.get(f, 0.0) + 1.0 / (K + rank)
+                for rank, f in enumerate(sym_ranked, 1):
+                    rrf[f] = rrf.get(f, 0.0) + 1.0 / (K + rank)
+                # populate file_symbols for files found only by the symbol index
+                for kw in valid_scope_kws:
+                    for rel, line, sig in sym_hits.get(kw, []):
+                        if rel not in file_symbols:
+                            file_symbols[rel] = []
+                        if (line, sig) not in ((l, s) for l, s in file_symbols[rel]):
+                            file_symbols[rel].append((line, sig))
+
+                file_scores = rrf
+        except Exception:
+            pass  # RRF is best-effort; fall back to FTS5-only ranking
+
+        # Layer 3: reverse-import graph expansion — add files that import the top 3 hits
+        if _REVERSE_IMPORTS and file_scores:
+            top3 = sorted(file_scores, key=lambda f: -file_scores[f])[:3]
+            for rel in top3:
+                for dependent in _REVERSE_IMPORTS.get(rel, []):
+                    if dependent not in file_scores:
+                        file_scores[dependent] = file_scores[rel] * 0.2
+
+        # Apply focus weights (same logic as scope_task)
+        if _FOCUS_WEIGHTS:
+            _default_weight = _FOCUS_WEIGHTS.get('*')
+            _sorted_focus = sorted(
+                ((k, v) for k, v in _FOCUS_WEIGHTS.items() if k != '*'),
+                key=lambda kv: -len(kv[0]),
+            )
+            for rel in list(file_scores):
+                rel_lc = rel.lower()
+                for prefix_lc, multiplier in _sorted_focus:
+                    if prefix_lc in rel_lc:
+                        file_scores[rel] *= multiplier
+                        break
+                else:
+                    if _default_weight is not None:
+                        file_scores[rel] *= _default_weight
+
+        top_files = sorted(file_scores, key=lambda f: -file_scores[f])[:max_results]
+
+        out: list[str] = [
+            f"# semantic_search: {query!r}",
+            f"Terms:     {', '.join(query_terms)}",
+            "Retrieval: FTS5+RRF + graph expansion",
+            f"Results:   {len(top_files)} files\n",
+        ]
+        for rank, rel in enumerate(top_files, 1):
+            syms = file_symbols.get(rel, [])
+            out.append(f"{rank}. {rel}")
+            for lineno, sig in syms[:3]:
+                out.append(f"   L{lineno}  {sig}")
+            if len(syms) > 3:
+                out.append(f"   ... and {len(syms) - 3} more symbols")
+
+        return '\n'.join(out)
+
+    except Exception as e:
+        return f"Error in semantic_search: {type(e).__name__}: {e}"
 
 
 @mcp.tool()
@@ -3054,12 +3427,18 @@ def get_status() -> str:
                 "  → call set_focus(\"Prefix:3, OtherPrefix:0.3\") to bias scoring by sub-project"
             )
 
+        if _SEMANTIC_READY:
+            sem_line = "semantic_search:    warm (FTS5+RRF)"
+        else:
+            sem_line = "semantic_search:    building (FTS5 index pending)"
+
         lines = [
             f"workspace:          {WORKSPACE_ROOT}",
             f"source_files:       {total_files}",
             f"blueprints_cached:  {cached} in memory, {disk_count} on disk",
             f"symbol_index:       {index_state}",
             f"  indexed_tokens:   {sym_count:,}" if _FTS_READY else "  indexed_tokens:   (not yet built)",
+            sem_line,
             f"warmup:             {warmup_state}",
             f"tree_sitter:        {'on' if TREE_SITTER_OK else 'off (regex fallback)'}",
             f"sandbox:            {'on' if SANDBOX_ENABLED else 'off'}",

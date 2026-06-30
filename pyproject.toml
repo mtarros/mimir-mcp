@@ -39,6 +39,7 @@ dependencies = [
     "watchdog>=3.0",
 ]
 
+
 [project.scripts]
 mimir = "mimir:main"
 mimir-setup = "mimir:setup"
