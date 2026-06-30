@@ -880,6 +880,7 @@ def _warm_cache() -> None:
         for _ in as_completed(ex.submit(_build_blueprint, p) for p in files):
             pass
     _build_cs_ns_index()
+    _build_java_class_index()
     _build_symbol_index()
     _build_reverse_imports()
     _build_architecture_map()
@@ -1460,9 +1461,31 @@ def _parse_import_entries(path: Path, text: str) -> list[tuple[str, str]]:
         for m in re.finditer(r'^(?:global\s+)?using\s+(?:static\s+)?([\w.]+)\s*;', text, re.MULTILINE):
             entries.append((m.group(1), ''))
 
+    elif suffix == '.java':
+        for m in re.finditer(r'^import\s+(?:static\s+)?([\w.]+)\s*;', text, re.MULTILINE):
+            spec = m.group(1)
+            # Strip static member suffix: com.foo.Bar.METHOD → com.foo.Bar
+            # Keep only if the last component starts with uppercase (class name)
+            parts = spec.split('.')
+            # Walk back to find the class boundary (first uppercase component)
+            for i, part in enumerate(parts):
+                if part and part[0].isupper():
+                    entries.append(('.'.join(parts[:i + 1]), ''))
+                    break
+            else:
+                entries.append((spec, ''))
+
     elif suffix in ('.kt', '.kts'):
         for m in re.finditer(r'^import\s+([\w.*]+)', text, re.MULTILINE):
-            entries.append((m.group(1), ''))
+            spec = m.group(1)
+            # Same class-boundary trimming for Kotlin
+            parts = spec.split('.')
+            for i, part in enumerate(parts):
+                if part and part[0].isupper():
+                    entries.append(('.'.join(parts[:i + 1]), ''))
+                    break
+            else:
+                entries.append((spec, ''))
 
     elif suffix == '.swift':
         for m in re.finditer(r'^(?:@\w+\s+)?import\s+(\w+)', text, re.MULTILINE):
@@ -1513,6 +1536,9 @@ def _find_ts_aliases(source_file: Path) -> "dict[str, Path]":
 _CS_NS_INDEX: "dict[str, list[str]]" = {}   # namespace → [rel_path, ...]
 _CS_NS_INDEX_READY = False
 
+_JAVA_CLASS_INDEX: "dict[str, list[str]]" = {}  # ClassName → [rel_path, ...]  (multiple files may share a name)
+_JAVA_CLASS_INDEX_READY = False
+
 
 def _build_cs_ns_index() -> None:
     """Build a namespace→files index from already-cached C# blueprints.
@@ -1538,6 +1564,24 @@ def _build_cs_ns_index() -> None:
                 break  # one namespace declaration per file
     _CS_NS_INDEX = index
     _CS_NS_INDEX_READY = True
+
+
+def _build_java_class_index() -> None:
+    """Build ClassName → [rel_path] index for all .java and .kt/.kts files.
+
+    Called at the end of _warm_cache(). The file stem is the primary class name
+    in Java/Kotlin convention, so DialogBuilder.java → {'DialogBuilder': [rel]}.
+    Multiple files may share a name (rare but possible), so we store a list.
+    """
+    global _JAVA_CLASS_INDEX, _JAVA_CLASS_INDEX_READY
+    index: dict[str, list[str]] = {}
+    for path in _iter_source_files():
+        if path.suffix not in ('.java', '.kt', '.kts'):
+            continue
+        rel = str(path.relative_to(WORKSPACE_ROOT))
+        index.setdefault(path.stem, []).append(rel)
+    _JAVA_CLASS_INDEX = index
+    _JAVA_CLASS_INDEX_READY = True
 
 
 def _extract_blueprint_lines(rel: str, blueprint: str) -> list[tuple[str, str, str]]:
@@ -1766,7 +1810,32 @@ def _resolve_import(specifier: str, source_file: Path) -> tuple[str, str]:
                     pass
         return ('external', specifier)
 
-    if suffix in ('.cs', '.kt', '.kts', '.swift'):
+    if suffix in ('.java', '.kt', '.kts'):
+        # specifier is like "com.foo.bar.ClassName" (class boundary already trimmed by parser)
+        # Strategy 1: convert to path suffix com/foo/bar/ClassName.java and match any workspace file
+        class_name = specifier.rsplit('.', 1)[-1]
+        ext = '.java' if suffix == '.java' else '.kt'
+        path_suffix = specifier.replace('.', '/') + ext
+        # Walk workspace files looking for any path that ends with the package suffix
+        if _JAVA_CLASS_INDEX_READY:
+            candidates = _JAVA_CLASS_INDEX.get(class_name, [])
+            if candidates:
+                # Prefer the file whose path most closely matches the full package path
+                best = min(candidates, key=lambda r: (
+                    0 if r.replace('\\', '/').endswith(path_suffix) else 1,
+                    len(r)
+                ))
+                return ('workspace', best)
+        # Strategy 2: direct filesystem lookup (pre-index fallback)
+        for p in WORKSPACE_ROOT.rglob(f'{class_name}{ext}'):
+            if p.is_file():
+                try:
+                    return ('workspace', str(p.relative_to(WORKSPACE_ROOT)))
+                except ValueError:
+                    pass
+        return ('external', specifier)
+
+    if suffix in ('.cs', '.swift'):
         if suffix == '.cs' and _CS_NS_INDEX_READY:
             best: list[str] = []
             for ns, ns_files in _CS_NS_INDEX.items():

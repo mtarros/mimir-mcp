@@ -553,3 +553,131 @@ class TestReverseDependentExpansion:
         result = mimir.scope_task("DialogBuilder exit_app", max_files=5)
         assert "dialog.py" in result
         assert not result.startswith("EXCEPTION")
+
+
+# ---------------------------------------------------------------------------
+# Java import parsing and resolution
+# ---------------------------------------------------------------------------
+
+class TestJavaImportParsing:
+    """_parse_import_entries should extract Java import specifiers trimmed to class boundary."""
+
+    def _parse(self, text: str) -> list[tuple[str, str]]:
+        return mimir._parse_import_entries(Path("Foo.java"), text)
+
+    def test_simple_class_import(self):
+        entries = self._parse("import com.example.app.dialog.DialogBuilder;\n")
+        assert any(spec == "com.example.app.dialog.DialogBuilder" for spec, _ in entries)
+
+    def test_static_import_trimmed_to_class(self):
+        entries = self._parse("import static com.example.app.dialog.DialogBuilder.show;\n")
+        assert any(spec == "com.example.app.dialog.DialogBuilder" for spec, _ in entries)
+
+    def test_wildcard_import_not_crash(self):
+        entries = self._parse("import com.example.utils.*;\n")
+        assert isinstance(entries, list)
+
+    def test_multiple_imports(self):
+        text = (
+            "import com.example.BaseActivity;\n"
+            "import com.example.dialog.DialogBuilder;\n"
+            "import android.os.Bundle;\n"
+        )
+        specs = [s for s, _ in self._parse(text)]
+        assert "com.example.BaseActivity" in specs
+        assert "com.example.dialog.DialogBuilder" in specs
+        assert "android.os.Bundle" in specs
+
+    def test_deduplication(self):
+        text = (
+            "import com.example.BaseActivity;\n"
+            "import com.example.BaseActivity;\n"
+        )
+        entries = self._parse(text)
+        specs = [s for s, _ in entries]
+        assert specs.count("com.example.BaseActivity") == 1
+
+
+class TestJavaImportResolution:
+    """_resolve_import should map Java imports to workspace-relative paths using _JAVA_CLASS_INDEX."""
+
+    @pytest.fixture(autouse=True)
+    def setup(self, tmp_path, monkeypatch):
+        java_root = tmp_path / "app" / "src" / "main" / "java" / "com" / "example" / "topcat"
+        dialog_dir = java_root / "dialog"
+        dialog_dir.mkdir(parents=True)
+        (dialog_dir / "DialogBuilder.java").write_text("public class DialogBuilder {}")
+        (java_root / "BaseActivity.java").write_text("public class BaseActivity {}")
+
+        monkeypatch.setattr(mimir, "WORKSPACE_ROOT", tmp_path)
+        monkeypatch.setattr(mimir, "_MIMIRIGNORE_PATTERNS", [])
+        monkeypatch.setattr(mimir, "_FILE_LIST", [])
+        monkeypatch.setattr(mimir, "_FILE_LIST_TS", 0.0)
+
+        mimir._build_java_class_index()
+
+        self.src_file = dialog_dir / "SomeOtherClass.java"
+
+    def test_resolves_to_workspace_by_class_name(self):
+        kind, display = mimir._resolve_import("com.example.topcat.BaseActivity", self.src_file)
+        assert kind == "workspace"
+        assert "BaseActivity.java" in display
+
+    def test_prefers_package_path_match(self):
+        kind, display = mimir._resolve_import(
+            "com.example.topcat.dialog.DialogBuilder", self.src_file
+        )
+        assert kind == "workspace"
+        assert "DialogBuilder.java" in display
+        assert "dialog" in display.replace("\\", "/")
+
+    def test_unknown_class_returns_external(self):
+        kind, display = mimir._resolve_import("com.example.topcat.UnknownClass", self.src_file)
+        assert kind == "external"
+
+    def test_android_sdk_class_returns_external(self):
+        kind, display = mimir._resolve_import("android.os.Bundle", self.src_file)
+        assert kind == "external"
+
+
+class TestJavaReverseImports:
+    """_build_reverse_imports should populate _REVERSE_IMPORTS for Java projects."""
+
+    @pytest.fixture(autouse=True)
+    def setup(self, tmp_path, monkeypatch):
+        java_root = tmp_path / "app" / "src" / "main" / "java" / "com" / "example"
+        dialog_dir = java_root / "dialog"
+        dialog_dir.mkdir(parents=True)
+        (dialog_dir / "DialogBuilder.java").write_text("public class DialogBuilder {}")
+        (java_root / "BaseActivity.java").write_text(
+            "import com.example.dialog.DialogBuilder;\n"
+            "public class BaseActivity {}\n"
+        )
+        monkeypatch.setattr(mimir, "WORKSPACE_ROOT", tmp_path)
+        monkeypatch.setattr(mimir, "_MIMIRIGNORE_PATTERNS", [])
+        monkeypatch.setattr(mimir, "_FILE_LIST", [])
+        monkeypatch.setattr(mimir, "_FILE_LIST_TS", 0.0)
+        monkeypatch.setattr(mimir, "_CACHE", mimir._CACHE.__class__())
+
+        mimir._build_java_class_index()
+        mimir._build_reverse_imports()
+
+    def test_base_activity_depends_on_dialog_builder(self):
+        rel_dialog = next(
+            (r for r in mimir._REVERSE_IMPORTS if "DialogBuilder.java" in r),
+            None
+        )
+        assert rel_dialog is not None, (
+            f"DialogBuilder.java not found as a key in _REVERSE_IMPORTS.\n"
+            f"Keys: {list(mimir._REVERSE_IMPORTS.keys())}"
+        )
+        dependents = mimir._REVERSE_IMPORTS[rel_dialog]
+        assert any("BaseActivity.java" in d for d in dependents), (
+            f"BaseActivity.java not found in dependents of DialogBuilder.java.\n"
+            f"Dependents: {dependents}"
+        )
+
+    def test_reverse_imports_not_empty_for_java_project(self):
+        assert len(mimir._REVERSE_IMPORTS) > 0, (
+            "_REVERSE_IMPORTS is empty — Java import resolution is not working."
+        )
