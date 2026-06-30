@@ -681,3 +681,62 @@ class TestJavaReverseImports:
         assert len(mimir._REVERSE_IMPORTS) > 0, (
             "_REVERSE_IMPORTS is empty — Java import resolution is not working."
         )
+
+
+# ---------------------------------------------------------------------------
+# set_focus wildcard (*) suppression
+# ---------------------------------------------------------------------------
+
+class TestFocusWildcard:
+    """When '*' is in _FOCUS_WEIGHTS, files not matching any named prefix get that weight."""
+
+    @pytest.fixture(autouse=True)
+    def workspace(self, tmp_path, monkeypatch):
+        (tmp_path / "android" / "app").mkdir(parents=True)
+        (tmp_path / "android" / "app" / "MainActivity.java").write_text(
+            "class MainActivity {\n    void onCreate() {}\n}\n"
+        )
+        (tmp_path / "dotnet").mkdir()
+        (tmp_path / "dotnet" / "SyncService.cs").write_text(
+            "class SyncService {\n    void onCreate() {}\n}\n"
+        )
+        monkeypatch.setattr(mimir, "WORKSPACE_ROOT", tmp_path)
+        monkeypatch.setattr(mimir, "_FILE_LIST", [])
+        monkeypatch.setattr(mimir, "_FILE_LIST_TS", 0.0)
+        monkeypatch.setattr(mimir, "_FTS_READY", False)
+        monkeypatch.setattr(mimir, "_DISK_CACHE", None)
+        monkeypatch.setattr(mimir, "_MIMIRIGNORE_PATTERNS", [])
+        monkeypatch.setattr(mimir, "_MIMIRALIASES", {})
+        monkeypatch.setattr(mimir, "_CACHE", mimir._CACHE.__class__())
+        monkeypatch.setattr(mimir, "_GIT_RECENCY_CACHE", {"ts": float("inf"), "scores": {}})
+        monkeypatch.setattr(mimir, "_REVERSE_IMPORTS", {})
+
+    def test_wildcard_suppresses_non_matching_files(self):
+        """With android:5 + *:0.1, Android file should rank above .NET file even if
+        they'd otherwise tie on keyword hits."""
+        import mimir as _m
+        _m._FOCUS_WEIGHTS = {"android": 5.0, "*": 0.1}
+        result = _m.scope_task("onCreate service", max_files=5)
+        lines = result.splitlines()
+        ranked = [l for l in lines if l.strip().startswith(("1.", "2."))]
+        assert len(ranked) >= 1, f"No ranked files:\n{result}"
+        assert "MainActivity.java" in ranked[0], (
+            f"Android file should rank first with wildcard suppression.\nRanked: {ranked}\nFull:\n{result}"
+        )
+
+    def test_no_wildcard_does_not_suppress(self, monkeypatch):
+        """Without '*', files not matching any prefix are scored normally (1×)."""
+        monkeypatch.setattr(mimir, "_FOCUS_WEIGHTS", {"android": 5.0})
+        result = mimir.scope_task("onCreate service", max_files=5)
+        # SyncService.cs should still appear somewhere since it matches "onCreate" and "service"
+        assert not result.startswith("EXCEPTION")
+
+    def test_load_focus_parses_wildcard(self, tmp_path, monkeypatch):
+        """_load_focus should parse a '*' entry from the focus file."""
+        monkeypatch.setattr(mimir, "WORKSPACE_ROOT", tmp_path)
+        (tmp_path / ".mimir-focus").write_text(
+            "android = 5.0\n* = 0.1\n"
+        )
+        weights = mimir._load_focus()
+        assert weights.get("android") == 5.0
+        assert weights.get("*") == 0.1

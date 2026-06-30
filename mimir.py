@@ -141,7 +141,10 @@ def _load_focus() -> dict[str, float]:
     File format (one entry per line):
         InControl.Carps.Mobile = 3.0
         InControl.Carps.Keypad = 0.3
+        * = 0.2       # suppress everything else
         # comments ignored
+    The special key '*' is the default weight applied to files that match
+    no named prefix — use it to suppress noisy sibling directories.
     Returns {prefix_lower: multiplier}.
     """
     p = WORKSPACE_ROOT / ".mimir-focus"
@@ -2209,14 +2212,23 @@ def scope_task(task: str, max_files: int = 5, include_blueprints: bool = False) 
     # weight.  Boost (>1) surfaces sub-projects you're working in; reduce (<1)
     # suppresses sibling projects you're not touching.  Entries checked longest-
     # prefix-first so more-specific rules win over broader ones.
+    # Special key '*' applies to any file that matched no named prefix — use it
+    # to suppress everything outside your focus area, e.g. "*:0.2".
     if _FOCUS_WEIGHTS:
-        _sorted_focus = sorted(_FOCUS_WEIGHTS.items(), key=lambda kv: -len(kv[0]))
+        _default_weight = _FOCUS_WEIGHTS.get('*')
+        _sorted_focus = sorted(
+            ((k, v) for k, v in _FOCUS_WEIGHTS.items() if k != '*'),
+            key=lambda kv: -len(kv[0])
+        )
         for rel in list(file_hit_count):
             rel_lc = rel.lower()
             for prefix_lc, multiplier in _sorted_focus:
                 if prefix_lc in rel_lc:
                     file_hit_count[rel] *= multiplier
                     break
+            else:
+                if _default_weight is not None:
+                    file_hit_count[rel] *= _default_weight
 
     # Git recency boost: files modified recently in git rise in the ranking when
     # they're already keyword-matched — high-signal for regression bug tickets.
@@ -2875,16 +2887,22 @@ def set_focus(entries: str) -> str:
     The weights are saved to .mimir-focus in the workspace root and take effect
     immediately — no restart needed.  Call set_focus("") to reset at any time.
 
+    The special prefix '*' acts as a default weight for every file that does NOT
+    match any named prefix — useful in mixed mono-repos to suppress noisy sibling
+    directories without listing each one explicitly.
+
     Args:
         entries: comma-separated list of prefix[:weight] pairs, e.g.:
-            "Carps.Mobile"                         → boost Mobile 3×, others unchanged
-            "Carps.Mobile, Carps.Keypad:0.3"       → boost Mobile, suppress Keypad
-            "Carps.Mobile:3, Carps.Keypad:0.3"     → explicit weights for both
-            ""                                      → clear all, equal scoring
+            "Carps.Mobile"                            → boost Mobile 3×, others unchanged
+            "Carps.Mobile, Carps.Keypad:0.3"          → boost Mobile, suppress Keypad
+            "Carps.Mobile:3, Carps.Keypad:0.3"        → explicit weights for both
+            "app/src/main/java:5, *:0.2"              → boost Java 5×, suppress everything else 0.2×
+            ""                                         → clear all, equal scoring
 
     Examples:
         set_focus("InControl.Carps.Mobile")
         set_focus("InControl.Carps.Mobile, InControl.Carps.Keypad:0.3")
+        set_focus("app/src/main/java:5, *:0.2")
         set_focus("")
     """
     global _FOCUS_WEIGHTS
