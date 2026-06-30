@@ -2123,6 +2123,19 @@ def scope_task(task: str, max_files: int = 5, include_blueprints: bool = False) 
             except Exception:
                 pass
 
+    # Reverse dependent expansion: for the top 3 files, add their dependents
+    # (files that import them) at 20% of the parent's score.  The bug is often
+    # in the caller of the matched utility/builder, not the utility itself —
+    # e.g. scope_task finds DialogBuilder but the bug is in BaseActivity which
+    # calls it.  Lower weight than forward expansion (0.2 vs 0.4) because callers
+    # are more numerous and less specifically related than direct dependencies.
+    if file_hit_count and _REVERSE_IMPORTS:
+        top3_rev = sorted(file_hit_count, key=lambda f: -file_hit_count[f])[:3]
+        for rel in top3_rev:
+            for dependent in _REVERSE_IMPORTS.get(rel, []):
+                if dependent not in file_hit_count:
+                    file_hit_count[dependent] = file_hit_count[rel] * 0.2
+
     # Project focus weights: multiply each file's score by the first matching prefix
     # weight.  Boost (>1) surfaces sub-projects you're working in; reduce (<1)
     # suppresses sibling projects you're not touching.  Entries checked longest-

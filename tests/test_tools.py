@@ -475,3 +475,81 @@ class TestSubTokenSearch:
         assert "viewmodel.py" in result, (
             f"Expected viewmodel.py to rank for 'refresh' sub-token search.\nOutput:\n{result}"
         )
+
+
+# ---------------------------------------------------------------------------
+# Reverse dependent expansion — caller surfaces alongside matched utility
+# ---------------------------------------------------------------------------
+
+class TestReverseDependentExpansion:
+    """scope_task should surface files that IMPORT a matched file (callers/users)
+    alongside the matched file itself, so the bug in BaseActivity is found when
+    scope_task finds DialogBuilder."""
+
+    @pytest.fixture(autouse=True)
+    def workspace(self, tmp_path, monkeypatch):
+        # dialog.py: defines the matched utility (DialogBuilder equivalent)
+        (tmp_path / "dialog.py").write_text(
+            "class DialogBuilder:\n"
+            "    def exit_app(self): pass\n"
+            "    def show_confirmation(self): pass\n"
+        )
+        # activity.py: imports dialog.py — this is where the bug lives
+        (tmp_path / "activity.py").write_text(
+            "from dialog import DialogBuilder\n"
+            "class BaseActivity:\n"
+            "    def on_back_pressed(self):\n"
+            "        DialogBuilder().exit_app()\n"
+        )
+        # unrelated.py: no connection to the dialog
+        (tmp_path / "unrelated.py").write_text(
+            "class SomethingElse:\n"
+            "    def compute(self): pass\n"
+        )
+        monkeypatch.setattr(mimir, "WORKSPACE_ROOT", tmp_path)
+        monkeypatch.setattr(mimir, "_FILE_LIST", [])
+        monkeypatch.setattr(mimir, "_FILE_LIST_TS", 0.0)
+        monkeypatch.setattr(mimir, "_FTS_READY", False)
+        monkeypatch.setattr(mimir, "_DISK_CACHE", None)
+        monkeypatch.setattr(mimir, "_MIMIRIGNORE_PATTERNS", [])
+        monkeypatch.setattr(mimir, "_MIMIRALIASES", {})
+        monkeypatch.setattr(mimir, "_CACHE", mimir._CACHE.__class__())
+        monkeypatch.setattr(mimir, "_GIT_RECENCY_CACHE", {"ts": float("inf"), "scores": {}})
+        monkeypatch.setattr(mimir, "_FOCUS_WEIGHTS", {})
+        # Wire up the reverse import index: dialog.py is imported by activity.py
+        monkeypatch.setattr(mimir, "_REVERSE_IMPORTS", {
+            "dialog.py": ["activity.py"],
+        })
+
+    def test_caller_surfaces_in_scope_task(self):
+        """activity.py imports dialog.py — it should appear in results even though
+        no keywords match activity.py directly."""
+        result = mimir.scope_task("DialogBuilder exit_app confirmation", max_files=5)
+        assert "dialog.py" in result, "Matched file must appear"
+        assert "activity.py" in result, (
+            "Caller (activity.py) should surface via reverse dependent expansion.\n"
+            f"Output:\n{result}"
+        )
+
+    def test_caller_ranks_below_directly_matched_file(self):
+        """The matched utility should outrank its caller — caller gets 0.2× weight."""
+        result = mimir.scope_task("DialogBuilder exit_app", max_files=5)
+        lines = result.splitlines()
+        ranked = [l.strip() for l in lines if l.strip().startswith(("1.", "2."))]
+        assert len(ranked) >= 2, f"Expected at least 2 ranked files:\n{result}"
+        assert "dialog.py" in ranked[0], (
+            f"dialog.py should rank above activity.py (direct match vs 0.2× caller).\n"
+            f"Got: {ranked}"
+        )
+
+    def test_unrelated_file_not_pulled_in(self):
+        """Only dependents of matched files appear — unrelated files must not."""
+        result = mimir.scope_task("DialogBuilder exit_app", max_files=5)
+        assert "unrelated.py" not in result
+
+    def test_no_reverse_imports_does_not_crash(self, monkeypatch):
+        """Empty _REVERSE_IMPORTS must not raise or change behaviour."""
+        monkeypatch.setattr(mimir, "_REVERSE_IMPORTS", {})
+        result = mimir.scope_task("DialogBuilder exit_app", max_files=5)
+        assert "dialog.py" in result
+        assert not result.startswith("EXCEPTION")
