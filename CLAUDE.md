@@ -53,11 +53,11 @@ Everything lives in `mimir.py`. There is no package structure. Key sections in o
    - `get_architecture` — high-level directory/symbol map of the whole workspace
    - `get_changed_files` — blueprints of files changed vs a git base branch
    - `scope_hint` — cheap symbol lookup that returns what the codebase calls things + suggested query
-   - `scope_task` — ranked files + suggested `get_symbol` calls for a plain-English task description
+   - `scope_task` — ranked files + suggested `get_symbol` calls for a plain-English task description; accepts optional `focus="prefix:weight"` for a per-call weight override that does not modify `.mimir-focus`
    - `get_symbol` — full body of one named function/class/method
    - `get_file_structure` — blueprint (signatures + line numbers, bodies stripped) for one file
    - `get_directory_structure` — blueprints for all source files under a directory
-   - `get_imports` — resolved import map for one file
+   - `get_imports` — resolved import map for one file; when it returns `[workspace?] Namespace.TypeName` for C#/Kotlin/Swift, call `verify_symbol_existence("TypeName")` to locate the definition file; use `find_callers` for usage sites
    - `verify_symbol_existence` — search the symbol index for a definition
    - `find_callers` — text search for every call/usage site of a symbol
    - `get_dependents` — reverse import index: which files import a given file

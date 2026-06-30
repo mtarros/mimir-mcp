@@ -174,6 +174,28 @@ def _load_focus() -> dict[str, float]:
 _FOCUS_WEIGHTS: dict[str, float] = _load_focus()
 
 
+def _parse_focus_str(raw: str) -> dict[str, float]:
+    """Parse a comma-separated "prefix:weight" string into {prefix_lower: float}.
+
+    Accepts the same format as set_focus entries so callers can pass ad-hoc
+    focus weights for a single call without touching the persistent file.
+    """
+    result: dict[str, float] = {}
+    for part in raw.split(","):
+        part = part.strip()
+        if not part:
+            continue
+        if ":" in part:
+            prefix, _, wraw = part.rpartition(":")
+            try:
+                result[prefix.strip().lower()] = float(wraw.strip())
+            except ValueError:
+                result[prefix.strip().lower()] = 3.0
+        else:
+            result[part.lower()] = 3.0
+    return result
+
+
 def _expand_task_with_aliases(task: str) -> str:
     """Append alias code names to a task string when domain phrases match.
 
@@ -1726,6 +1748,34 @@ def _fts_rows_for_blueprint(
             decomp.add(tok.lower())
             for sub in _decompose_identifier(tok):
                 decomp.add(sub)
+
+        # Explicit enrichment: return type, parameter type hints, decorator names.
+        # The generic re.findall above already captures these tokens, but explicit
+        # extraction ensures compound type names are always decomposed and that
+        # future changes to the candidate filter don't accidentally drop them.
+        ret_match = re.search(r'->\s*([\w\[\], |]+)', signature)
+        if ret_match:
+            for tok in re.findall(r'\w+', ret_match.group(1)):
+                if len(tok) >= 4 and tok not in _SYMBOL_STOPWORDS:
+                    decomp.add(tok.lower())
+                    for sub in _decompose_identifier(tok):
+                        decomp.add(sub)
+
+        for tok in re.findall(r':\s*([A-Za-z_]\w+)', signature):
+            if len(tok) >= 4 and tok not in _SYMBOL_STOPWORDS:
+                decomp.add(tok.lower())
+                for sub in _decompose_identifier(tok):
+                    decomp.add(sub)
+
+        if signature.lstrip().startswith('@'):
+            deco_m = re.match(r'@([\w.]+)', signature.lstrip())
+            if deco_m:
+                for tok in deco_m.group(1).split('.'):
+                    if len(tok) >= 4 and tok not in _SYMBOL_STOPWORDS:
+                        decomp.add(tok.lower())
+                        for sub in _decompose_identifier(tok):
+                            decomp.add(sub)
+
         decomposed = ' '.join(sorted(decomp))
         rows.append((rel, lineno, symbol_name, signature, decomposed))
     return rows
@@ -2241,7 +2291,7 @@ def scope_hint(terms: str) -> str:
 
 
 @mcp.tool()
-def scope_task(task: str, max_files: int = 5, include_blueprints: bool = False) -> str:
+def scope_task(task: str, max_files: int = 5, include_blueprints: bool = False, focus: str = "") -> str:
     """Map a plain-English task description to the specific files and symbols it
     touches — before reading any raw file contents.
 
@@ -2261,6 +2311,10 @@ def scope_task(task: str, max_files: int = 5, include_blueprints: bool = False) 
         include_blueprints: set True to include full structural blueprints inline
                             (useful for small repos; may produce large output on
                             large repos — prefer calling get_file_structure after).
+        focus: optional comma-separated "prefix:weight" pairs applied only for
+               this call — e.g. "src/auth:3.0,src/payments:2.0".  Does not
+               modify .mimir-focus or the session-wide weights.  Overrides any
+               persistent focus weights when non-empty.
 
     Returns a compact context block: keywords searched, matched symbols with
     file:line locations, and ranked files by relevance score.
@@ -2366,10 +2420,12 @@ def scope_task(task: str, max_files: int = 5, include_blueprints: bool = False) 
     # prefix-first so more-specific rules win over broader ones.
     # Special key '*' applies to any file that matched no named prefix — use it
     # to suppress everything outside your focus area, e.g. "*:0.2".
-    if _FOCUS_WEIGHTS:
-        _default_weight = _FOCUS_WEIGHTS.get('*')
+    # Per-call `focus` overrides the session-wide _FOCUS_WEIGHTS without mutating it.
+    _eff_weights = _parse_focus_str(focus) if focus.strip() else _FOCUS_WEIGHTS
+    if _eff_weights:
+        _default_weight = _eff_weights.get('*')
         _sorted_focus = sorted(
-            ((k, v) for k, v in _FOCUS_WEIGHTS.items() if k != '*'),
+            ((k, v) for k, v in _eff_weights.items() if k != '*'),
             key=lambda kv: -len(kv[0])
         )
         for rel in list(file_hit_count):
@@ -2551,7 +2607,7 @@ def _fts_search(
 
 
 @mcp.tool()
-def semantic_search(query: str, max_results: int = 10) -> str:
+def semantic_search(query: str, max_results: int = 10, focus: str = "") -> str:
     """Search the workspace by MEANING rather than exact symbol names.
 
     WHEN TO USE: when scope_task returns poor results because you know the
@@ -2574,6 +2630,9 @@ def semantic_search(query: str, max_results: int = 10) -> str:
                      "database connection retry logic"
                      "user authentication token expiry handler"
         max_results: how many ranked files to return (default 10, max 25).
+        focus:       optional comma-separated "prefix:weight" pairs applied only
+                     for this call — does not modify .mimir-focus or the
+                     session-wide weights.  Overrides persistent focus when set.
     """
     try:
         max_results = max(1, min(int(max_results), 25))
@@ -2671,11 +2730,13 @@ def semantic_search(query: str, max_results: int = 10) -> str:
                     if dependent not in file_scores:
                         file_scores[dependent] = file_scores[rel] * 0.2
 
-        # Apply focus weights (same logic as scope_task)
-        if _FOCUS_WEIGHTS:
-            _default_weight = _FOCUS_WEIGHTS.get('*')
+        # Apply focus weights (same logic as scope_task).
+        # Per-call `focus` overrides session-wide _FOCUS_WEIGHTS without mutating it.
+        _eff_weights = _parse_focus_str(focus) if focus.strip() else _FOCUS_WEIGHTS
+        if _eff_weights:
+            _default_weight = _eff_weights.get('*')
             _sorted_focus = sorted(
-                ((k, v) for k, v in _FOCUS_WEIGHTS.items() if k != '*'),
+                ((k, v) for k, v in _eff_weights.items() if k != '*'),
                 key=lambda kv: -len(kv[0]),
             )
             for rel in list(file_scores):
@@ -2996,31 +3057,50 @@ def find_callers(symbol_name: str, max_results: int = 20) -> str:
 
     needle = symbol_name.encode('utf-8')
     word_re = re.compile(rf'(?<!\w){re.escape(symbol_name)}(?!\w)')
-    files = _iter_source_files()
-    results: list[tuple[str, int, str]] = []
     cutoff = max_results * 4
+    results: list[tuple[str, int, str]] = []
 
-    def _search_file(path: Path) -> list[tuple[str, int, str]]:
+    # Use the FTS5 blueprint index as a prefilter: files where the symbol appears
+    # in any signature (parameter type, return type, class name, decorator) are
+    # already indexed and can be identified in ~1ms without reading disk.
+    # Search those files first; they account for most real callers.  The remaining
+    # files are searched sequentially only if the result cap is not yet reached.
+    priority_rels: set[str] = set()
+    if _FTS_READY and _DISK_CACHE is not None:
+        try:
+            fts_rows = _DISK_CACHE.execute(
+                "SELECT DISTINCT file FROM symbol_fts"
+                " WHERE symbol_fts MATCH ? LIMIT 1000",
+                (f'"{symbol_name}"',),
+            ).fetchall()
+            priority_rels = {row[0] for row in fts_rows}
+        except Exception:
+            pass
+
+    all_files = list(_iter_source_files())
+    priority = [p for p in all_files if str(p.relative_to(WORKSPACE_ROOT)) in priority_rels]
+    remainder = [p for p in all_files if str(p.relative_to(WORKSPACE_ROOT)) not in priority_rels]
+
+    def _scan(path: Path) -> None:
+        if len(results) >= cutoff:
+            return
         try:
             raw = path.read_bytes()
         except OSError:
-            return []
+            return
         if needle not in raw:
-            return []
+            return
         rel = str(path.relative_to(WORKSPACE_ROOT))
-        hits = []
         for i, line in enumerate(raw.decode('utf-8', 'replace').splitlines(), 1):
             if word_re.search(line):
-                hits.append((rel, i, line.strip()[:120]))
-        return hits
+                results.append((rel, i, line.strip()[:120]))
 
-    workers = min(8, os.cpu_count() or 4)
-    with ThreadPoolExecutor(max_workers=workers) as ex:
-        futs = {ex.submit(_search_file, p): p for p in files}
-        for fut in as_completed(futs):
-            results.extend(fut.result())
-            if len(results) >= cutoff:
-                break
+    for path in priority:
+        _scan(path)
+    for path in remainder:
+        if len(results) >= cutoff:
+            break
+        _scan(path)
 
     if not results:
         return f"No usages of '{symbol_name}' found in the workspace."
@@ -3252,7 +3332,7 @@ def add_ignore(pattern: str, reason: str = "") -> str:
 
 
 @mcp.tool()
-def set_focus(entries: str) -> str:
+def set_focus(entries: str, persist: bool = True) -> str:
     """Set (or clear) per-project score weights so scope_task biases results toward
     the projects you're actively working in and away from those you're not.
 
@@ -3262,12 +3342,18 @@ def set_focus(entries: str) -> str:
     comma-separated.  Pass an empty string to clear all weights and restore equal
     scoring across every project.
 
-    The weights are saved to .mimir-focus in the workspace root and take effect
-    immediately — no restart needed.  Call set_focus("") to reset at any time.
+    By default the weights are saved to .mimir-focus in the workspace root and take
+    effect immediately — no restart needed.  Pass persist=False to apply weights for
+    this session only without touching the file (useful when two AI assistants share
+    the same workspace and you don't want them overwriting each other's focus state).
+    Call set_focus("") to reset at any time.
 
     The special prefix '*' acts as a default weight for every file that does NOT
     match any named prefix — useful in mixed mono-repos to suppress noisy sibling
     directories without listing each one explicitly.
+
+    For a single-call override without any persistent state change, pass the focus
+    string directly to scope_task or semantic_search via their focus= parameter.
 
     Args:
         entries: comma-separated list of prefix[:weight] pairs, e.g.:
@@ -3276,11 +3362,15 @@ def set_focus(entries: str) -> str:
             "Carps.Mobile:3, Carps.Keypad:0.3"        → explicit weights for both
             "app/src/main/java:5, *:0.2"              → boost Java 5×, suppress everything else 0.2×
             ""                                         → clear all, equal scoring
+        persist: if True (default), save weights to .mimir-focus so they survive
+                 server restart and are visible to other sessions.  If False, apply
+                 weights in memory for this session only.
 
     Examples:
         set_focus("InControl.Carps.Mobile")
         set_focus("InControl.Carps.Mobile, InControl.Carps.Keypad:0.3")
         set_focus("app/src/main/java:5, *:0.2")
+        set_focus("src/auth:3.0", persist=False)   # session-local, no file write
         set_focus("")
     """
     global _FOCUS_WEIGHTS
@@ -3288,7 +3378,7 @@ def set_focus(entries: str) -> str:
     focus_file = WORKSPACE_ROOT / ".mimir-focus"
     try:
         if not raw:
-            if focus_file.exists():
+            if persist and focus_file.exists():
                 focus_file.unlink()
             _FOCUS_WEIGHTS = {}
             return "Focus cleared. All projects now score equally."
@@ -3316,17 +3406,19 @@ def set_focus(entries: str) -> str:
         if not parsed:
             return "Error: no valid entries found. Format: 'Prefix.Name' or 'Prefix.Name:0.3'"
 
-        focus_file.write_text(
-            "# mimir project focus weights  (prefix = multiplier)\n"
-            + "\n".join(lines_out) + "\n",
-            encoding="utf-8"
-        )
+        if persist:
+            focus_file.write_text(
+                "# mimir project focus weights  (prefix = multiplier)\n"
+                + "\n".join(lines_out) + "\n",
+                encoding="utf-8"
+            )
         _FOCUS_WEIGHTS = parsed
 
         summary = ", ".join(
             f"'{k}' {'×' if v >= 1 else '×'}{v:.1f}" for k, v in parsed.items()
         )
-        return f"Focus set: {summary}. Saved to .mimir-focus (call set_focus(\"\") to reset)."
+        suffix = " Saved to .mimir-focus (call set_focus(\"\") to reset)." if persist else " (session only — not persisted to .mimir-focus)."
+        return f"Focus set: {summary}.{suffix}"
     except OSError as e:
         return f"Error saving focus: {e}"
 

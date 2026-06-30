@@ -640,3 +640,96 @@ class TestSandboxWire:
         text = _text(r)
         assert "EXCEPTION" not in text
         assert "ValueError" in text or "boom" in text or "error" in text.lower()
+
+
+# ---------------------------------------------------------------------------
+# Per-call focus parameter and set_focus persist flag
+# ---------------------------------------------------------------------------
+
+@pytest.fixture
+def dual_workspace(tmp_path):
+    """Two directories that both match 'authenticate user', allowing focus ranking tests."""
+    (tmp_path / "frontend" / "auth").mkdir(parents=True)
+    (tmp_path / "backend" / "auth").mkdir(parents=True)
+    (tmp_path / "frontend" / "auth" / "service.py").write_text(
+        "class FrontendAuthService:\n"
+        "    def authenticate_user(self, token: str) -> bool:\n"
+        "        return True\n"
+    )
+    (tmp_path / "backend" / "auth" / "service.py").write_text(
+        "class BackendAuthService:\n"
+        "    def authenticate_user(self, credentials: dict) -> bool:\n"
+        "        return True\n"
+    )
+    return tmp_path
+
+
+class TestPerCallFocus:
+    async def test_scope_task_focus_boosts_matching_path(self, dual_workspace):
+        async with Client(_make_transport(dual_workspace)) as client:
+            r = await client.call_tool("scope_task", {
+                "task": "authenticate user",
+                "focus": "backend:5.0",
+            })
+        text = _text(r)
+        assert "EXCEPTION" not in text
+        # scope_task output has a "Ranked files" section: "  1. backend/auth/..." etc.
+        # Find the first ranked entry and confirm it's backend.
+        ranked_lines = [
+            ln.strip() for ln in text.splitlines()
+            if ln.strip().startswith("1.")
+        ]
+        assert ranked_lines, f"No ranked files found in output:\n{text}"
+        assert "backend" in ranked_lines[0], (
+            f"Expected backend as #1 with focus=backend:5.0, got: {ranked_lines[0]}\n{text}"
+        )
+
+    async def test_scope_task_focus_does_not_mutate_global(self, dual_workspace):
+        """A second call without focus should give unbiased results independent of the first."""
+        async with Client(_make_transport(dual_workspace)) as client:
+            r1 = await client.call_tool("scope_task", {
+                "task": "authenticate user",
+                "focus": "backend:100.0",
+            })
+            r2 = await client.call_tool("scope_task", {
+                "task": "authenticate user",
+            })
+        text1 = _text(r1)
+        text2 = _text(r2)
+        assert "EXCEPTION" not in text1
+        assert "EXCEPTION" not in text2
+        # Focused call: backend must rank #1
+        ranked1 = [ln.strip() for ln in text1.splitlines() if ln.strip().startswith("1.")]
+        assert ranked1 and "backend" in ranked1[0], (
+            f"Expected backend #1 with focus=backend:100, got: {ranked1}"
+        )
+        # After the focused call, global weights are unchanged — r2 should contain
+        # both files (the server did not permanently bias toward backend).
+        assert "frontend" in text2 and "backend" in text2
+
+
+class TestSetFocusPersist:
+    async def test_persist_false_no_file_written(self, workspace):
+        async with Client(_make_transport(workspace)) as client:
+            r = await client.call_tool("set_focus", {
+                "entries": "src:2.0",
+                "persist": False,
+            })
+        text = _text(r)
+        assert "EXCEPTION" not in text
+        assert "session" in text.lower(), f"Expected 'session' in response: {text!r}"
+        assert not (workspace / ".mimir-focus").exists(), (
+            ".mimir-focus must not be written when persist=False"
+        )
+
+    async def test_persist_true_file_written(self, workspace):
+        async with Client(_make_transport(workspace)) as client:
+            r = await client.call_tool("set_focus", {
+                "entries": "src:2.0",
+                "persist": True,
+            })
+        text = _text(r)
+        assert "EXCEPTION" not in text
+        assert (workspace / ".mimir-focus").exists(), (
+            ".mimir-focus must be written when persist=True"
+        )

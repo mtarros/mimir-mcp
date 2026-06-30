@@ -581,3 +581,136 @@ class TestSemanticSearchWire:
             assert "fallback" in result.lower() or isinstance(result, str)
         finally:
             mimir._SEMANTIC_READY = orig
+
+
+# ---------------------------------------------------------------------------
+# FTS enrichment: return types, parameter types, decorator names
+# ---------------------------------------------------------------------------
+
+# A blueprint with compound type annotations, a return type, and a decorator,
+# using names distinct enough to be unambiguous in search queries.
+SAMPLE_TYPED = """\
+# api/payment_controller.py  [python · tree-sitter]
+L10  @Authenticated
+L11  class PaymentController:
+L15      def charge_card(self, card: PaymentMethod, amount: Decimal) -> Receipt:
+L20      def refund(self, transaction_id: str) -> RefundResult:
+"""
+
+TYPED_REL = "api/payment_controller.py"
+
+ALL_BLUEPRINTS_WITH_TYPED = {**ALL_BLUEPRINTS, TYPED_REL: SAMPLE_TYPED}
+
+
+def _search_fts(conn, query: str, limit: int = 10) -> list[str]:
+    """BM25 FTS5 search on a test db; returns files ordered by score."""
+    import re as _re
+    terms = mimir._decompose_query_for_fts(query)
+    safe = [t for t in terms if _re.match(r'^\w+$', t)]
+    if not safe:
+        return []
+    fts_query = ' OR '.join(f'"{t}"' for t in safe)
+    rows = conn.execute(
+        "SELECT file, bm25(symbol_fts) AS score FROM symbol_fts"
+        " WHERE symbol_fts MATCH ? ORDER BY score LIMIT ?",
+        (fts_query, limit),
+    ).fetchall()
+    seen: dict[str, float] = {}
+    for file, score in rows:
+        seen[file] = min(seen.get(file, 0.0), score)
+    return sorted(seen, key=lambda f: seen[f])
+
+
+@pytest.fixture
+def fts_db_typed():
+    """In-memory SQLite FTS5 table with all samples including the typed one."""
+    conn = sqlite3.connect(":memory:")
+    conn.execute(
+        "CREATE VIRTUAL TABLE symbol_fts USING fts5("
+        "  file UNINDEXED,"
+        "  lineno UNINDEXED,"
+        "  symbol_name,"
+        "  signature,"
+        "  decomposed,"
+        "  tokenize='unicode61'"
+        ")"
+    )
+    for rel, bp in ALL_BLUEPRINTS_WITH_TYPED.items():
+        rows = mimir._fts_rows_for_blueprint(rel, bp)
+        conn.executemany(
+            "INSERT INTO symbol_fts(file, lineno, symbol_name, signature, decomposed)"
+            " VALUES (?,?,?,?,?)",
+            rows,
+        )
+    conn.commit()
+    return conn
+
+
+class TestFtsEnrichment:
+    """Verify that return types, parameter type hints, and decorators are indexed."""
+
+    def _decomposed_for_sig(self, signature: str) -> str:
+        rows = mimir._fts_rows_for_blueprint("test.py", f"L1  {signature}")
+        assert rows, f"No FTS rows generated for: {signature!r}"
+        return rows[0][4]
+
+    # Return type
+    def test_return_type_simple_in_decomposed(self):
+        decomposed = self._decomposed_for_sig("def get_receipt(self) -> Receipt:")
+        assert "receipt" in decomposed, f"'receipt' missing from: {decomposed!r}"
+
+    def test_return_type_compound_decomposed(self):
+        decomposed = self._decomposed_for_sig("def find_user(self) -> UserProfile:")
+        assert "user" in decomposed
+        assert "profile" in decomposed
+
+    def test_return_type_generic_decomposed(self):
+        decomposed = self._decomposed_for_sig("async def list_orders(self) -> List[OrderRecord]:")
+        assert "order" in decomposed
+        assert "record" in decomposed
+
+    # Parameter type hints
+    def test_param_type_compound_in_decomposed(self):
+        decomposed = self._decomposed_for_sig("def charge(self, card: PaymentMethod):")
+        assert "payment" in decomposed
+        assert "method" in decomposed
+
+    def test_param_type_optional_in_decomposed(self):
+        decomposed = self._decomposed_for_sig("def fetch(self, opts: FetchOptions):")
+        assert "fetch" in decomposed
+
+    # Decorators
+    def test_decorator_simple_in_decomposed(self):
+        decomposed = self._decomposed_for_sig("@Authenticated")
+        assert "authenticated" in decomposed, f"'authenticated' missing from: {decomposed!r}"
+
+    def test_decorator_compound_in_decomposed(self):
+        decomposed = self._decomposed_for_sig("@RestController")
+        assert "rest" in decomposed
+        assert "controller" in decomposed
+
+    def test_decorator_dotted_in_decomposed(self):
+        decomposed = self._decomposed_for_sig("@pytest.fixture")
+        assert "pytest" in decomposed or "fixture" in decomposed
+
+    # FTS5 search quality: search by type/decorator finds the right file
+    def test_search_by_return_type_finds_file(self, fts_db_typed):
+        hits = _search_fts(fts_db_typed, "Receipt")
+        assert TYPED_REL in hits, f"Expected typed file for 'Receipt', got: {hits}"
+
+    def test_search_by_param_type_finds_file(self, fts_db_typed):
+        hits = _search_fts(fts_db_typed, "PaymentMethod")
+        assert TYPED_REL in hits, f"Expected typed file for 'PaymentMethod', got: {hits}"
+
+    def test_search_by_decorator_finds_file(self, fts_db_typed):
+        hits = _search_fts(fts_db_typed, "Authenticated")
+        assert TYPED_REL in hits, f"Expected typed file for 'Authenticated', got: {hits}"
+
+    # Regression: existing queries must still return the right files
+    def test_regression_auth_query(self, fts_db_typed):
+        hits = _search_fts(fts_db_typed, "authentication token refresh")
+        assert AUTH_REL in hits, f"Regression: auth file missing. Got: {hits}"
+
+    def test_regression_queue_query(self, fts_db_typed):
+        hits = _search_fts(fts_db_typed, "retry failed job exponential backoff")
+        assert QUEUE_REL in hits, f"Regression: queue file missing. Got: {hits}"

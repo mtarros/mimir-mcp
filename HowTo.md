@@ -274,6 +274,8 @@ domain_aliases (2 active):
 
 If `symbol_index: building`, the other tools still work but `scope_task` and `verify_symbol_existence` use a slower fallback until indexing completes (typically under 60s for large repos).
 
+**Large monorepo note:** During the initial warm-up, mimir builds blueprints in parallel (up to 8 threads) and loads tree-sitter grammars for each language it encounters. On repos with 10k+ source files or many languages, memory can spike briefly before the LRU cache caps it. If startup is unusually slow, set `MCP_MAX_FILE_BYTES` lower to skip very large generated files, or add patterns to `.mimirignore` to exclude build output and vendor directories.
+
 ---
 
 ### 1. `set_focus` — bias searches toward the project you're working in
@@ -298,9 +300,19 @@ set_focus("Carps.Mobile:3, Carps.Keypad:0.2, Carps.Shared:1.5")
 
 # Clear all weights — equal scoring across all projects
 set_focus("")
+
+# Session-only weights — do not write .mimir-focus
+set_focus("src/auth:3.0", persist=False)
 ```
 
-The focus is saved to `.mimir-focus` in the workspace root and persists across sessions. It takes effect immediately — no restart needed.
+By default the focus is saved to `.mimir-focus` in the workspace root and persists across sessions. Pass `persist=False` to apply weights in memory only for the current session, without touching the file. This is useful when multiple AI assistants (e.g. Claude Code and GitHub Copilot) are running against the same workspace simultaneously and you don't want them overwriting each other's focus state.
+
+**Per-call focus:** If you only need focus for a single query, pass the `focus=` parameter directly to `scope_task` or `semantic_search` instead — it applies weights for that call only and does not modify any state:
+
+```
+scope_task("add retry logic", focus="src/payments:3.0")
+semantic_search("authentication flow", focus="src/auth:2.0")
+```
 
 **Effect on scoring:** A file in the focused area with a score of 5 becomes 15 (5 × 3). A suppressed project file with a score of 15 becomes 4.5 (15 × 0.3). Files with no keyword hits are not affected — focus only amplifies existing matches, it does not invent them.
 
@@ -416,9 +428,11 @@ Use this when `scope_task` returns poor results because you know the **concept**
 
 **How it works:** Decomposes identifiers into sub-tokens at index time (`handleAuthFailure` → `"handle auth fail"`) and runs FTS5 BM25 ranked retrieval against those tokens, fused with symbol-index keyword hits via Reciprocal Rank Fusion. The reverse-import graph then adds structurally adjacent files.
 
+The index also explicitly extracts and decomposes **parameter type names**, **return type names**, and **decorator/annotation names** from each signature — so searching for `"UserProfile"` finds functions that *return* a `UserProfile` even if the function name doesn't mention it, and searching for `"Authenticated"` finds classes decorated with `@Authenticated`.
+
 **Key difference from `scope_task`:** `scope_task` does exact-token lookup (~1ms). `semantic_search` does ranked full-text search over decomposed tokens (~3ms). Use `scope_task` first — fall back to `semantic_search` when you know what the code *does* but the name is different from your mental model.
 
-`set_focus` weights apply to `semantic_search` the same way as `scope_task`.
+`set_focus` weights apply to `semantic_search` the same way as `scope_task`. You can also pass `focus=` inline for a single call (see `set_focus` docs).
 
 **Example:**
 > `semantic_search("database connection pool exhaustion")`
@@ -472,6 +486,8 @@ Use this after `get_file_structure` reveals an unfamiliar symbol — find which 
 Works for: TypeScript, JavaScript, Python, Kotlin, Swift, C#, Go, Rust.
 
 > **Note:** Kotlin, C#, and Swift use module/namespace imports rather than file paths. Mimir identifies whether they belong to the project or an external SDK, but cannot resolve them to a specific file.
+
+> **Tip for namespace imports (C#, Kotlin, Swift):** When `get_imports` returns `[workspace?] SomeNamespace.TypeName`, pluck the type name and call `verify_symbol_existence("TypeName")` to jump to the file that defines it. Use `find_callers("TypeName")` to find its usage sites instead.
 
 ---
 
