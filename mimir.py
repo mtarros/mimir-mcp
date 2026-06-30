@@ -1872,9 +1872,25 @@ def scope_hint(terms: str) -> str:
     Args:
         terms: Space-or-comma-separated rough search terms, e.g. "timer refresh current jobs"
     """
-    raw = [t.strip().strip(',') for t in re.split(r'[\s,]+', terms) if t.strip()]
+    # Extract meaningful keywords — applies the same stopword + length filtering
+    # that scope_task uses, so passing a full sentence like "are you sure you want
+    # to exit" doesn't flood results with matches on "are", "you", "to".
+    meaningful = _extract_scope_keywords(terms)
+    # Also keep any raw words ≥ 4 chars not caught by the CamelCase/snake extractor
+    # (e.g. plain lowercase words from a sentence like "exit").
+    extra = [
+        w for w in re.findall(r'[a-zA-Z]{4,}', terms)
+        if w.lower() not in _SYMBOL_STOPWORDS
+        and w.lower() not in {m.lower() for m in meaningful}
+    ]
+    raw = list(dict.fromkeys(meaningful + extra))  # deduplicated, order preserved
+
     if not raw:
-        return "Error: provide at least one search term."
+        return (
+            f"No searchable terms found in: '{terms}'\n"
+            "All words were too short or too common. Try using class/method names or "
+            "feature-specific terms (e.g. 'exit dialog confirmation')."
+        )
 
     # Expand with sub-tokens so compound identifiers (StartOrStopAutoRefresh → refresh)
     # are also searched.
@@ -1896,38 +1912,47 @@ def scope_hint(terms: str) -> str:
     except Exception as e:
         return f"Error during symbol lookup: {e}"
 
-    # Group results by file
+    # Group results by file; track how many distinct search terms hit each file
+    # so the ranking favours files matched by multiple terms over single-term hits.
     file_syms: dict[str, list[str]] = {}
+    file_term_hits: dict[str, set[str]] = {}   # file → set of terms that hit it
     term_files: dict[str, set[str]] = {t: set() for t in raw}
-    all_sym_names: list[str] = []
+    # sym → set of original terms that produced it (used for suggestion ranking)
+    sym_terms: dict[str, set[str]] = {}
 
     _name_re = re.compile(r'\b([A-Z][A-Za-z0-9]+|[a-z_][a-zA-Z0-9_]{3,})\s*[({<:\[]')
 
     for kw, matches in hits.items():
+        # Which original terms does this keyword relate to?
+        related_orig = {
+            orig for orig in raw
+            if orig.lower() == kw or orig.lower() in kw or kw in orig.lower()
+        }
         for rel, _lineno, sig in matches:
             if rel not in file_syms:
                 file_syms[rel] = []
+                file_term_hits[rel] = set()
+            file_term_hits[rel].update(related_orig)
             m = _name_re.search(sig)
             if m:
                 sym = m.group(1)
                 if sym not in file_syms[rel]:
                     file_syms[rel].append(sym)
-                if sym not in all_sym_names:
-                    all_sym_names.append(sym)
-            # Map original term → file (for the per-term breakdown)
-            for orig in raw:
-                orig_lc = orig.lower()
-                if orig_lc == kw or orig_lc in kw or kw in orig_lc:
-                    term_files[orig].add(rel)
+                if sym not in sym_terms:
+                    sym_terms[sym] = set()
+                sym_terms[sym].update(related_orig)
+            for orig in related_orig:
+                term_files[orig].add(rel)
 
     if not file_syms:
         return (
-            f"No symbols found for: {terms}\n"
+            f"No symbols found for: {', '.join(raw)}\n"
             "Try different terms or check spelling. "
             "Use verify_symbol_existence to confirm a specific name exists."
         )
 
     lines = [f"# Scope Hint: '{terms}'\n"]
+    lines.append(f"Keywords searched: {', '.join(raw)}\n")
 
     # Per-term breakdown (shows which term hit which file)
     lines.append("## Term matches")
@@ -1938,26 +1963,46 @@ def scope_hint(terms: str) -> str:
         else:
             lines.append(f"  '{orig}' → (no matches)")
 
-    # Top files with the symbols found inside them
+    # Top files ranked by number of distinct terms that hit them, then symbol count.
     lines.append("\n## Top files")
-    ranked = sorted(file_syms, key=lambda f: -len(file_syms[f]))[:8]
+    ranked = sorted(
+        file_syms,
+        key=lambda f: (-len(file_term_hits.get(f, set())), -len(file_syms[f]))
+    )[:8]
     for rel in ranked:
         syms = ", ".join(file_syms[rel][:6])
-        lines.append(f"  {rel}")
+        n_terms = len(file_term_hits.get(rel, set()))
+        lines.append(f"  {rel}  ({n_terms} term{'s' if n_terms != 1 else ''} matched)")
         lines.append(f"    → {syms}")
 
-    # Suggested refined query: prefer longer/more-specific symbol names
-    specific = sorted(
-        {s for s in all_sym_names if len(s) >= 8},
-        key=lambda s: -len(s)
-    )[:4]
-    if specific:
-        suggestion = " ".join(specific)
-        lines.append(f"\n## Suggested scope_task query")
-        lines.append(f'  scope_task("{suggestion}")')
+    # Suggested query: prefer symbols whose name contains a search term as a CamelCase
+    # component ("showExitDialog" → ["show","exit","dialog"] → "exit" matches).
+    # Using components rather than raw substring prevents "UserWantsToContinue..."
+    # from matching "want" just because "Wants" contains it as a substring.
+    # Among component-matched symbols, prefer shorter names (more specific).
+    # Fall back to any symbol from a multi-term file if no component match found.
+    raw_lc = {t.lower() for t in raw}
+
+    def _component_hits(s: str) -> int:
+        components = set(_decompose_identifier(s)) | {s.lower()}
+        return sum(1 for t in raw_lc if t in components)
+
+    def _sym_score(s: str) -> tuple:
+        comp_hits = _component_hits(s)
+        n_terms = len(sym_terms.get(s, set()))
+        return (0 if comp_hits > 0 else 1, -comp_hits, -n_terms, len(s))
+
+    candidates = [
+        s for s in sym_terms
+        if len(s) >= 6 and s not in _SYMBOL_STOPWORDS
+    ]
+    best = sorted(candidates, key=_sym_score)[:4]
+
+    lines.append(f"\n## Suggested scope_task query")
+    if best:
+        lines.append(f'  scope_task("{" ".join(best)}")')
     else:
-        lines.append(f"\n## Suggested scope_task query")
-        lines.append(f'  scope_task("{terms}")')
+        lines.append(f'  scope_task("{" ".join(raw)}")')
 
     return "\n".join(lines)
 
