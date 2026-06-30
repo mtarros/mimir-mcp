@@ -177,15 +177,20 @@ def _expand_task_with_aliases(task: str) -> str:
     """Append alias code names to a task string when domain phrases match.
 
     Checks every alias domain phrase (longest first to prefer specific matches)
-    against the lowercased task. Appends matched code names so that
-    scope_task keyword extraction picks them up alongside the original terms.
+    against the lowercased task. A phrase matches if ALL its words appear
+    anywhere in the task (order-independent) — so "orange badge verify count"
+    still matches a query like "orange badge category verify count bug".
+    Appends matched code names so that scope_task keyword extraction picks them
+    up alongside the original terms.
     """
     if not _MIMIRALIASES:
         return task
     task_lower = task.lower()
+    task_words = set(re.findall(r'[a-z]+', task_lower))
     additions: list[str] = []
     for domain in sorted(_MIMIRALIASES, key=len, reverse=True):
-        if domain in task_lower:
+        domain_words = re.findall(r'[a-z]+', domain)
+        if all(w in task_words for w in domain_words):
             additions.extend(_MIMIRALIASES[domain])
     if additions:
         return task + " " + " ".join(additions)
