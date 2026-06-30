@@ -47,10 +47,12 @@ Everything lives in `mimir.py`. There is no package structure. Key sections in o
 3. **Structure extraction** — `_extract_tree_sitter()` (preferred) and `_extract_regex()` (fallback). Both return the same dense line format `L{lineno}  {indent}{signature}`. `_build_blueprint()` orchestrates cache → tree-sitter → regex.
 4. **Warm-up** — `_warm_cache()` runs at startup: walks all source files, builds blueprints, populates `_SYMBOL_INDEX`, builds `_REVERSE_IMPORTS` map, builds `_ARCHITECTURE_MAP`, then starts the file watcher (`watchdog`).
 5. **File watcher** — `_start_file_watcher()` invalidates `_CACHE` and `_REVERSE_IMPORTS` entries on file change/create/delete events within the workspace.
-6. **MCP tools** (14 total):
-   - `get_status` — index health, file count, exclusion patterns, domain aliases
+6. **MCP tools** (16 total):
+   - `get_status` — index health, file count, exclusion patterns, domain aliases, active focus weights
+   - `set_focus` — save per-prefix score multipliers to `.mimir-focus`; takes effect immediately
    - `get_architecture` — high-level directory/symbol map of the whole workspace
    - `get_changed_files` — blueprints of files changed vs a git base branch
+   - `scope_hint` — cheap symbol lookup that returns what the codebase calls things + suggested query
    - `scope_task` — ranked files + suggested `get_symbol` calls for a plain-English task description
    - `get_symbol` — full body of one named function/class/method
    - `get_file_structure` — blueprint (signatures + line numbers, bodies stripped) for one file

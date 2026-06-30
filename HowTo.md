@@ -97,23 +97,35 @@ The section looks like this (you can edit it to suit your project):
 This project has mimir MCP tools available. Use them before reading raw files.
 
 At the start of any coding session:
-1. Call `get_status` to check the index is ready and see active exclusions
-2. Call `get_architecture()` for a high-level map of the whole codebase (cheap)
-3. Call `get_changed_files()` to see what is currently in flight vs main
-4. Call `scope_task("describe what you want to do")` to find relevant files
+1. Call `get_status` to check the index is ready, see active exclusions, and note
+   any project_focus already set.
+2. If the user mentions a specific sub-project or area (e.g. "I'm working on the
+   mobile app"), call `set_focus("matching-prefix")` immediately — this boosts files
+   in that area for all subsequent searches. If no focus is set and the user has not
+   indicated one, leave it unset.
+3. Call `get_architecture()` for a high-level map of the whole codebase (cheap).
+4. Call `get_changed_files()` to see what is currently in flight vs main.
+5. Call `scope_task("describe what you want to do")` to find relevant files.
 
 For any task involving existing code:
-- Use `scope_task` before opening files — it finds the right files in one call
-- Use `get_symbol(path, name)` to read ONE function or class body instead of the whole file
-- Use `get_file_structure` to see a file's full symbol map before reading it line by line
-- Use `verify_symbol_existence` before assuming a function or type exists
-- Use `find_callers` after `verify_symbol_existence` to trace impact
-- Use `get_dependents(path)` to find what else imports a file before changing it
-- Use `get_imports` when an unfamiliar symbol appears and you need to trace its origin
+- Use `scope_hint("rough terms")` BEFORE `scope_task` when you have vague keywords
+  and are unsure of the exact symbol names. It returns what the codebase calls things
+  so the follow-up `scope_task` query is precise. Costs very few tokens.
+- Use `scope_task` with specific class/method names once you know them — it finds
+  the right files in one call.
+- Use `get_symbol(path, name)` to read ONE function or class body instead of the
+  whole file.
+- Use `get_file_structure` to see a file's full symbol map before reading it line
+  by line.
+- Use `verify_symbol_existence` before assuming a function or type exists.
+- Use `find_callers` after `verify_symbol_existence` to trace impact.
+- Use `get_dependents(path)` to find what else imports a file before changing it.
+- Use `get_imports` when an unfamiliar symbol appears and you need to trace its
+  origin.
 - Call `record_alias(domain_term, code_name)` when you discover a feature name maps
-  to a different code name — future scope_task searches will expand it automatically
+  to a different code name — future scope_task searches will expand it automatically.
 - Call `add_ignore(pattern, reason)` when you encounter vendor/generated/test files
-  that add noise — always tell the user what you are adding and why first
+  that add noise — always tell the user what you are adding and why first.
 ```
 
 ---
@@ -173,16 +185,18 @@ To use the tools in Copilot Chat, open the chat panel, switch to agent mode, and
 This project has mimir MCP tools. Always use them before using built-in search or reading files.
 
 Workflow for any coding session:
-1. Call `get_status` to confirm the index is ready
-2. Call `get_architecture()` for a high-level map of the whole codebase (one cheap call)
-3. Call `get_changed_files()` to see what is currently in flight vs main
-4. Call `scope_task` with a description of the task — use its ranked file list and
-   suggested get_symbol calls, do NOT fall back to glob or grep
-5. Call `get_symbol(path, name)` to read ONE function or class body
-6. Use `get_dependents(path)` before changing a shared file to see blast radius
-7. When you discover a domain/feature term maps to a code name, call `record_alias`
-8. When you encounter vendor/generated/noisy files, tell the user what you found,
-   ask for confirmation, then call `add_ignore(pattern, reason)` to exclude them
+1. Call `get_status` to confirm the index is ready and note any project_focus set.
+2. If the user mentions a specific sub-project, call `set_focus("prefix")` to bias
+   searches toward that area. Call `set_focus("")` when switching to another area.
+3. Call `get_architecture()` for a high-level map of the whole codebase (one cheap call).
+4. Call `get_changed_files()` to see what is currently in flight vs main.
+5. For vague queries, call `scope_hint("rough terms")` first to find the right symbol
+   names, then call `scope_task` with those names.
+6. Call `get_symbol(path, name)` to read ONE function or class body.
+7. Use `get_dependents(path)` before changing a shared file to see blast radius.
+8. When you discover a domain/feature term maps to a code name, call `record_alias`.
+9. When you encounter vendor/generated/noisy files, tell the user what you found,
+   ask for confirmation, then call `add_ignore(pattern, reason)` to exclude them.
 
 Do not use built-in file search, glob, or grep if mimir tools are available.
 ```
@@ -197,6 +211,7 @@ If you use Claude Code on your Mac and Copilot at work, all config files can coe
 your-project/
   .mcp.json                        ← picked up by Claude Code
   .mimirignore                     ← exclusion patterns (commit this to share with the team)
+  .mimir-focus                     ← active project focus weights (commit if team works in same sub-project)
   .vscode/
     mcp.json                       ← picked up by VS Code Copilot (MCP connection)
   .github/
@@ -225,7 +240,7 @@ All tools work on Windows. The one exception: `execute_local_sandbox` with `lang
 
 ### 0. `get_status` — check the index before you start
 
-Call this at the start of a session to see how much of the workspace is indexed and whether the symbol index is ready.
+Call this at the start of a session to see how much of the workspace is indexed, whether the symbol index is ready, and what focus and exclusion settings are active.
 
 **Example output:**
 ```
@@ -240,24 +255,56 @@ file_watcher:       on (changes invalidate cache instantly)
 reverse_imports:    1,204 files mapped
 sandbox:            on
 
-ignored_patterns: 8 active (.mimirignore)
+project_focus:      'incontrol.carps.mobile' ×3.0  'incontrol.carps.keypad' ×0.3
+  → call set_focus("") to clear, or set_focus("prefix:weight, ...") to change
+
+ignored_patterns (8 active):
   **/obj/**
   **/bin/**
   ...
-```
 
-If `symbol_index: building`, the other tools still work but `scope_task` and `verify_symbol_existence` use a slower fallback until indexing completes (typically under 60s for large repos).
-
-**Domain aliases:** When `.mimiraliases` exists, `get_status` lists the active mappings:
-```
 domain_aliases (2 active):
   corrective actions → RectificationFilter
   live tutor → LiveTutor, GeminiLive
 ```
 
+If `symbol_index: building`, the other tools still work but `scope_task` and `verify_symbol_existence` use a slower fallback until indexing completes (typically under 60s for large repos).
+
 ---
 
-### 1. `get_architecture` — orient yourself in one call
+### 1. `set_focus` — bias searches toward the project you're working in
+
+In a repo with multiple sibling projects (common in mobile mono-repos, microservices, etc.), generic keyword searches can surface files from projects you're not touching. `set_focus` tells mimir to multiply scores for files matching a path prefix, so the right project rises to the top.
+
+**This tool can be called by both you and the AI.** When you tell Claude "I'm working on the mobile app", it should call `set_focus` immediately so every subsequent `scope_task` call is already biased correctly. You can also call it yourself via the CLI.
+
+Each entry is a path-prefix substring with an optional `:weight`. Default weight is `3.0` (3× boost). Use a weight below `1.0` to suppress a project rather than boost it.
+
+**Examples:**
+
+```
+# Boost one project
+set_focus("InControl.Carps.Mobile")
+
+# Boost Mobile AND suppress Keypad
+set_focus("InControl.Carps.Mobile, InControl.Carps.Keypad:0.3")
+
+# Explicit weights for both
+set_focus("Carps.Mobile:3, Carps.Keypad:0.2, Carps.Shared:1.5")
+
+# Clear all weights — equal scoring across all projects
+set_focus("")
+```
+
+The focus is saved to `.mimir-focus` in the workspace root and persists across sessions. It takes effect immediately — no restart needed.
+
+**Effect on scoring:** A file in the focused area with a score of 5 becomes 15 (5 × 3). A suppressed project file with a score of 15 becomes 4.5 (15 × 0.3). Files with no keyword hits are not affected — focus only amplifies existing matches, it does not invent them.
+
+**When to reset:** Call `set_focus("")` when switching to a different part of the codebase, or if results look wrong (too many files from one area). `get_status` always shows the active weights.
+
+---
+
+### 2. `get_architecture` — orient yourself in one call
 
 Returns a high-level map of the entire workspace: directories grouped by file count, with top-level symbol names per file. Much cheaper than calling `get_file_structure` on every file to understand the project layout.
 
@@ -281,40 +328,82 @@ Large repos (60+ directories) show the most file-dense modules first with a note
 
 ---
 
-### 2. `get_changed_files` — see what's in flight
+### 3. `get_changed_files` — see what's in flight
 
 Returns structural blueprints of every source file changed vs a git base branch — covering committed branch changes, uncommitted edits, and untracked new files.
 
 **Example:**
 > `get_changed_files()` or `get_changed_files(base="develop")`
 
-Returns blueprints (symbols + line numbers, bodies stripped) for each changed file so you get the full structural picture in one call.
+Returns blueprints (symbols + line numbers, bodies stripped) for each changed file plus a diff summary table so you get the full structural picture in one call.
 
 WHEN TO USE: at the start of a session to orient yourself on what is actively being worked on before deciding where to focus.
 
 ---
 
-### 3. `scope_task` — find the right files
+### 4. `scope_hint` — cheap first pass when you have rough keywords
 
-Call this **first** on any task involving existing code. Give it a plain-English description of what you want to do. It extracts symbol names, searches the workspace, and returns a ranked list of the most relevant files with matched symbol locations and suggested `get_symbol` calls.
+Call this **before** `scope_task` when you have vague descriptions and are unsure of the exact symbol or class names used in the codebase. It performs a quick symbol lookup across all terms, returns what it found per term, and suggests a refined `scope_task` query using the actual names it discovered.
+
+Because it returns only names and file paths — no blueprints — it costs very few tokens.
 
 **Example:**
-> `scope_task("change how the live tutor handles pronunciation errors")`
+> `scope_hint("timer refresh current jobs")`
 
-Returns: keywords searched, matched symbols with file:line locations, ranked files by relevance, and suggested next calls:
 ```
-## Suggested next calls (read just the symbols you need)
-  get_symbol("lib/lessonProgress.ts", "advanceProgress")
-  get_symbol("lib/geminiLive.ts", "LiveTutorSession")
+# Scope Hint: 'timer refresh current jobs'
+
+## Term matches
+  'timer' → Services/Realtime/GroupProfileRealtimeRefreshServiceTests.cs, ...
+  'refresh' → Services/Realtime/GroupProfileRealtimeRefreshService.cs, ...
+  'current' → ViewModels/CurrentJobs/CurrentJobsViewModel.cs, ...
+
+## Top files
+  InControl.Carps.Mobile/UI/ViewModels/MyCurrentViewModel.cs
+    → StartOrStopAutoRefresh, _refreshIntervalInSeconds
+
+## Suggested scope_task query
+  scope_task("MyCurrentViewModel StartOrStopAutoRefresh")
 ```
 
-**Tip:** Use technical/class names when known rather than feature names — the symbol index matches code identifiers, not domain language. `"RectificationFilter section order"` finds the right file faster than `"corrective actions filter UI"`.
+The suggested query uses the actual symbol names found — copy it directly into `scope_task` for a precise, high-confidence result.
 
-Pass `include_blueprints=True` to get full symbol maps inline (useful for small repos).
+**Sub-token matching:** `scope_hint` and `scope_task` both understand compound identifiers. Searching for `"refresh"` will find files containing `StartOrStopAutoRefresh` or `_refreshIntervalInSeconds` — you don't need to know the exact compound name to find the right file.
 
 ---
 
-### 4. `get_symbol` — read just the code you need
+### 5. `scope_task` — find the right files
+
+Call this on any task involving existing code. Give it a plain-English description — or ideally specific class/method names once you know them from `scope_hint`. It extracts keywords, searches the workspace (symbol index + path matching + import graph + git recency), and returns a ranked list of the most relevant files with matched symbol locations and suggested `get_symbol` calls.
+
+**Example — using exact names (most precise):**
+> `scope_task("MyCurrentViewModel StartOrStopAutoRefresh refresh interval")`
+
+**Example — using feature description (less precise, use scope_hint first if uncertain):**
+> `scope_task("timer that polls refresh in My Current Jobs")`
+
+Returns: keywords searched, matched symbols with file:line locations, ranked files by relevance, and suggested next calls:
+```
+## Ranked files
+  1. InControl.Carps.Mobile/UI/ViewModels/MyCurrentViewModel.cs  (18 matches)
+  2. ...
+
+## Suggested next calls (read just the symbols you need)
+  get_symbol("InControl.Carps.Mobile/UI/ViewModels/MyCurrentViewModel.cs", "MyCurrentViewModel")
+  get_symbol("InControl.Carps.Mobile/UI/ViewModels/MyCurrentViewModel.cs", "StartOrStopAutoRefresh")
+```
+
+**Tips for better results:**
+- Use technical/class names when known rather than feature descriptions. `"RectificationFilter section order"` finds the right file faster than `"corrective actions filter UI"`.
+- If you're in a mono-repo with multiple projects, call `set_focus` first so the right project's files rank above sibling projects with similar naming.
+- If the results look wrong, try `scope_hint` to discover the actual names and re-run.
+- Pass `include_blueprints=True` to get full symbol maps inline (useful for small repos or when you want the structure in one call).
+
+**How scores work:** Symbol definition hits score 3×, usage hits score 1×. Path/filename matches also score 3×. Files inside the active `set_focus` prefix get a multiplier applied on top. Git recency gives a small additional boost to already-matched files.
+
+---
+
+### 6. `get_symbol` — read just the code you need
 
 Returns the complete source of ONE named function, class, or method — bodies included. The efficient middle ground between `get_file_structure` (signatures only) and reading the whole raw file.
 
@@ -329,7 +418,7 @@ If the symbol is not found, the response includes the file's full blueprint so y
 
 ---
 
-### 5. `get_file_structure` — understand a file
+### 7. `get_file_structure` — understand a file
 
 Returns a compact map of a single file: every class, function, method, and their signatures — with line numbers, bodies stripped.
 
@@ -340,7 +429,7 @@ Use this when you want the full symbol map of a file before deciding which symbo
 
 ---
 
-### 6. `get_imports` — trace where symbols come from
+### 8. `get_imports` — trace where symbols come from
 
 Lists every import in a file. Resolves relative paths and the `@/` alias (Next.js) to actual workspace files. Distinguishes workspace files from external packages.
 
@@ -362,7 +451,7 @@ Works for: TypeScript, JavaScript, Python, Kotlin, Swift, C#, Go, Rust.
 
 ---
 
-### 7. `get_directory_structure` — browse a module
+### 9. `get_directory_structure` — browse a module
 
 Returns structural blueprints for every source file under a directory. Use this when you know *where* to look but not *which* file.
 
@@ -373,18 +462,18 @@ Use `scope_task` when you don't know where to look. Use `get_directory_structure
 
 ---
 
-### 8. `verify_symbol_existence` — confirm a symbol is real
+### 10. `verify_symbol_existence` — confirm a symbol is real
 
 Searches the entire workspace for a symbol definition and returns its exact location and signature.
 
 **Example:**
-> `verify_symbol_existence("advanceProgress")`
+> `verify_symbol_existence("StartOrStopAutoRefresh")`
 
 Use this before assuming a function or type exists, before importing it, or when a symbol appears in a blueprint and you want its definition location.
 
 ---
 
-### 9. `find_callers` — trace who calls a symbol
+### 11. `find_callers` — trace who calls a symbol
 
 Searches raw source text across the entire workspace for every call site and usage of a symbol. Unlike `verify_symbol_existence` (which only finds definitions), this finds where a symbol is called, passed, or referenced in implementation code.
 
@@ -395,7 +484,7 @@ WHEN TO USE: after `verify_symbol_existence` tells you where something is define
 
 ---
 
-### 10. `get_dependents` — blast-radius analysis
+### 12. `get_dependents` — blast-radius analysis
 
 Returns every workspace file that directly imports a given file. Built from the reverse import index constructed at startup — no extra configuration needed.
 
@@ -408,7 +497,7 @@ WHEN TO USE: before modifying a widely-used utility, service, or model — get t
 
 ---
 
-### 11. `record_alias` — teach mimir your project's vocabulary
+### 13. `record_alias` — teach mimir your project's vocabulary
 
 Records a mapping from a domain/feature name to the code name used in the codebase. Once saved, `scope_task` automatically expands matching phrases before searching.
 
@@ -437,7 +526,7 @@ push notifications = PushNotificationService, PushManager
 
 ---
 
-### 12. `add_ignore` — exclude noisy files on the fly
+### 14. `add_ignore` — exclude noisy files on the fly
 
 Adds a gitignore-style pattern to `.mimirignore` and takes effect immediately — no restart needed. The AI uses this when it encounters vendor libraries, generated code, test fixtures, or build artefacts that pollute blueprints and `get_architecture` output.
 
@@ -478,7 +567,7 @@ Run `mimir status` to confirm which patterns are active.
 
 ---
 
-### 13. `execute_local_sandbox` — run a quick snippet
+### 15. `execute_local_sandbox` — run a quick snippet
 
 Runs a Python or bash snippet locally with a timeout, captures output, and returns it.
 
@@ -493,29 +582,91 @@ Not for long-running jobs. Not a security sandbox — code runs as your user.
 
 ## Recommended workflow
 
+### General session
+
 ```
 Session start
-  1. get_status()                           ← confirm index ready, see exclusions
-  2. get_architecture()                     ← understand the project layout
-  3. get_changed_files()                    ← see what's currently in flight
+  1. get_status()                           ← confirm index ready; check if focus is set
+  2. set_focus("your-sub-project")          ← if in a mono-repo — boost your project, suppress others
+                                               (AI calls this automatically when you name a sub-project)
+  3. get_architecture()                     ← understand the project layout
+  4. get_changed_files()                    ← see what's currently in flight
 
 Finding and reading code
-  4. scope_task("what you want to do")      ← find relevant files + suggested calls
-  5. get_symbol("file.py", "SymbolName")    ← read just the function/class you need
+  5. scope_hint("rough description")        ← cheap first pass: discover the right symbol names
+  6. scope_task("ClassName MethodName")     ← precise search using names from scope_hint
+  7. get_symbol("file.cs", "SymbolName")   ← read just the function/class you need
      — or —
-     get_file_structure("file.py")          ← full symbol map if you need the overview
+     get_file_structure("file.cs")          ← full symbol map if you need the overview
 
 Tracing dependencies
-  6. get_imports("file.py")                 ← where do its symbols come from?
-  7. get_dependents("file.py")              ← what breaks if I change this?
-  8. find_callers("SymbolName")             ← who calls this?
+  8. get_imports("file.cs")                ← where do its symbols come from?
+  9. get_dependents("file.cs")             ← what breaks if I change this?
+  10. find_callers("SymbolName")           ← who calls this?
 
 Keeping the index clean
-  9. add_ignore("**/pattern/**", "reason")  ← exclude noise when you find it
-     record_alias("feature", "CodeName")    ← teach mimir your project's language
+  11. add_ignore("**/pattern/**", "reason")  ← exclude noise when you find it
+      record_alias("feature", "CodeName")    ← teach mimir your project's language
 ```
 
-Following this order means the AI reads raw file contents as little as possible, keeping context usage low and responses faster.
+### Jira ticket workflow
+
+This is the highest-value pattern when working from a ticket or bug report.
+
+**Step 1 — Set context once per ticket:**
+```
+set_focus("InControl.Carps.Mobile")
+```
+Tell the AI what project/area the ticket is about. It should call `set_focus` for you, but you can also call it yourself.
+
+**Step 2 — Use scope_hint when the ticket is written in feature language:**
+```
+scope_hint("timer polling refresh my current jobs")
+```
+The hint tells you what the codebase calls things:
+```
+Top files:
+  InControl.Carps.Mobile/UI/ViewModels/MyCurrentViewModel.cs
+    → StartOrStopAutoRefresh, _refreshIntervalInSeconds
+```
+
+**Step 3 — Use those exact names in scope_task:**
+```
+scope_task("MyCurrentViewModel StartOrStopAutoRefresh refresh interval")
+```
+This finds the right file at #1 with high confidence, shows matched symbol locations, and gives you exact `get_symbol` calls to read just the code you need.
+
+**Step 4 — Read only what you need:**
+```
+get_symbol("InControl.Carps.Mobile/UI/ViewModels/MyCurrentViewModel.cs", "StartOrStopAutoRefresh")
+get_symbol("InControl.Carps.Mobile/UI/ViewModels/MyCurrentViewModel.cs", "MyCurrentViewModel")
+```
+
+This three-step pattern (hint → task → symbol) uses a fraction of the tokens that reading files directly would cost, and lands on the right code much faster than grepping.
+
+### When scope_hint isn't needed
+
+Skip `scope_hint` when you already know the class or method name — go straight to `scope_task`:
+```
+scope_task("JobCancelled JobPaused IRecipient MyCurrentViewModel")
+```
+Technical names in the query give `scope_task` enough signal to find the right file in one call. `scope_hint` is the warm-up round when you only have feature/domain language to start from.
+
+---
+
+## Connecting the AI to your project context — tips
+
+**For the AI to get the best results automatically:**
+
+1. **Name your sub-project early.** Say "I'm working on the mobile app" or "this ticket is for the Keypad project" at the start of a session. The AI will call `set_focus` for you based on what it finds in `get_status` and `get_architecture`.
+
+2. **Use ticket language freely.** `scope_hint` bridges the gap between feature descriptions and code names. You don't need to know the class names — tell the AI what the feature does and let it discover the names first.
+
+3. **Record aliases for your team's vocabulary.** When you notice `scope_task` consistently needing the same bridging — e.g., "corrective actions" always means `RectificationFilter` — run `record_alias` once and it applies to every future session.
+
+4. **Commit `.mimirignore` and `.mimiraliases`.** These are the institutional memory of your codebase. The whole team benefits from shared exclusions and vocabulary mappings.
+
+5. **Commit `.mimir-focus` if your team works in the same sub-project.** If everyone on the team is working in `InControl.Carps.Mobile`, checking in `.mimir-focus` means the right focus is active from the first session with no manual setup.
 
 ---
 
@@ -537,7 +688,7 @@ Requires the mimir development install (Option C) and pytest:
 ~/.local/pipx/venvs/mimir-mcp/bin/python -m pytest tests/ -q
 ```
 
-Expected: **127 passed** (~25s — smoke tests spawn real subprocesses).
+Expected: **157 passed** (~28s — smoke tests spawn real subprocesses).
 
 ### Run unit tests only (fast)
 
