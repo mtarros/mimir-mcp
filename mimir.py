@@ -558,6 +558,12 @@ REGEX_PROFILES: dict[str, list[re.Pattern]] = {
 _CACHE: "OrderedDict[str, tuple[float, int, str]]" = OrderedDict()
 _CACHE_MAX = 8192  # raised from 2048 — blueprints are ~2KB each so 8192 ≈ 16MB
 
+# Maps abs-path → {sig: (start_byte, end_byte)} captured during blueprint build.
+# Lets _extract_symbol_body skip the ~8ms tree-sitter re-parse when offsets are warm.
+# Written from ThreadPoolExecutor threads during warmup — each thread writes a
+# different path key so no locking is needed (dict assignment is GIL-atomic).
+_OFFSET_CACHE: dict[str, dict[str, tuple[int, int]]] = {}
+
 
 def _cache_get(path: Path) -> Optional[str]:
     """Return cached blueprint iff the file is unchanged since we cached it."""
@@ -624,6 +630,7 @@ def _cache_evict(path: Path) -> None:
     """
     global _FILE_LIST, _FILE_LIST_TS
     _CACHE.pop(str(path), None)
+    _OFFSET_CACHE.pop(str(path), None)
     if _DISK_CACHE is not None:
         try:
             rel = str(path.relative_to(WORKSPACE_ROOT))
@@ -637,6 +644,36 @@ def _cache_evict(path: Path) -> None:
     # Force a file-list re-walk so new/deleted files are picked up immediately
     _FILE_LIST = []
     _FILE_LIST_TS = 0.0
+
+
+def _smart_invalidate(path: Path) -> None:
+    """Re-index a changed file; skip DB writes when only body code changed.
+
+    During active development most saves touch method bodies, not signatures.
+    When the blueprint is unchanged we refresh mtime/size in memory and skip
+    the ~15ms of SQLite DELETEs + INSERTs that a full evict+reindex would cost.
+    """
+    cached = _CACHE.get(str(path))
+    if cached is None:
+        _cache_evict(path)
+        return
+    old_blueprint = cached[2]
+    # Remove from both caches before re-parse so _build_blueprint does a fresh read
+    _CACHE.pop(str(path), None)
+    _OFFSET_CACHE.pop(str(path), None)
+    try:
+        new_blueprint = _build_blueprint(path)  # populates _cache_put internally if new
+    except Exception:
+        _cache_evict(path)
+        return
+    if new_blueprint == old_blueprint:
+        # Structure unchanged — refresh mtime/size in memory only, skip all DB I/O
+        try:
+            st = path.stat()
+            _CACHE[str(path)] = (st.st_mtime, st.st_size, new_blueprint)
+        except OSError:
+            pass
+    # If different: _build_blueprint already called _cache_put which wrote to DB
 
 
 # --------------------------------------------------------------------------- #
@@ -869,6 +906,19 @@ def _extract_symbol_body(path: Path, symbol_name: str) -> Optional[str]:
     Tries tree-sitter first; falls back to indentation/brace heuristics. Returns
     None when the symbol is not found in the file.
     """
+    pat = re.compile(r'\b' + re.escape(symbol_name) + r'\b')
+
+    # Fast path: byte offsets captured during blueprint build — skip tree-sitter re-parse
+    cached_offsets = _OFFSET_CACHE.get(str(path))
+    if cached_offsets:
+        for sig, (start, end) in cached_offsets.items():
+            if pat.search(sig):
+                try:
+                    raw = path.read_bytes()
+                    return raw[start:end].decode('utf-8', 'replace')
+                except OSError:
+                    break  # fall through to full parse below
+
     try:
         raw = path.read_bytes()
         text = raw.decode('utf-8', 'replace')
@@ -877,7 +927,6 @@ def _extract_symbol_body(path: Path, symbol_name: str) -> Optional[str]:
 
     suffix = path.suffix
     ts_lang, _ = EXT_LANG.get(suffix, (None, None))
-    pat = re.compile(r'\b' + re.escape(symbol_name) + r'\b')
 
     # --- Tree-sitter path ---
     if TREE_SITTER_OK and ts_lang:
@@ -948,14 +997,37 @@ def _extract_symbol_body(path: Path, symbol_name: str) -> Optional[str]:
     return ''.join(lines[start_idx:end_idx + 1])
 
 
+_SYMBOL_NAME_STOPWORDS = frozenset({
+    # C#/Java/TS modifiers and primitive types that can appear after keyword-stripping
+    'async', 'await', 'static', 'readonly', 'string', 'int', 'bool', 'void',
+    'Task', 'List', 'IEnumerable', 'IList', 'object', 'var', 'new',
+    'override', 'virtual', 'abstract', 'sealed', 'partial', 'const',
+    'event', 'delegate', 'extern', 'unsafe',
+    # Python
+    'def', 'cls', 'self',
+})
+
 def _symbol_name_from_sig(sig: str) -> Optional[str]:
-    """Extract bare symbol name from a blueprint signature line."""
+    """Extract bare symbol name from a blueprint signature line.
+
+    For callables, the name is the last identifier before '(' — this handles
+    multi-keyword prefixes like 'public async Task MethodName(...)' correctly.
+    For fields/types, fall back to stripping known modifiers.
+    """
     sig = sig.strip()
+    paren = sig.find('(')
+    if paren > 0:
+        # Method/ctor/function: find last identifier immediately before the paren
+        m = re.search(r'([A-Za-z_]\w*)$', sig[:paren])
+        if m:
+            return m.group(1)
+    # Field, property, type declaration: strip leading modifiers then grab first ident
     for kw in _BLUEPRINT_TOPLEVEL_KWS:
         if sig.startswith(kw):
             sig = sig[len(kw):]
     m = re.match(r'([A-Za-z_]\w*)', sig)
-    return m.group(1) if m else None
+    name = m.group(1) if m else None
+    return name if name and name not in _SYMBOL_NAME_STOPWORDS else None
 
 
 def _start_file_watcher() -> bool:
@@ -979,7 +1051,7 @@ def _start_file_watcher() -> bool:
                 return
             p = Path(getattr(event, 'dest_path', event.src_path))
             if p.suffix in EXT_LANG and not _is_blacklisted(p):
-                _cache_evict(p)
+                _smart_invalidate(p)
                 _ARCHITECTURE_MAP = ""
                 # Incrementally refresh reverse-import index in the background
                 import threading
@@ -1234,6 +1306,8 @@ def _extract_tree_sitter(path: Path, src: bytes, ts_lang: str) -> Optional[str]:
 
     lines: list[str] = []
     seen_line_nos: set[int] = set()
+    path_key = str(path)
+    offsets: dict[str, tuple[int, int]] = {}
 
     # Signatures that are just bare keywords have no name to reference — skip them
     _anon = re.compile(r'^(?:async\s+)?(?:function|class|interface|enum)\s*[<({]?$')
@@ -1248,11 +1322,14 @@ def _extract_tree_sitter(path: Path, src: bytes, ts_lang: str) -> Optional[str]:
                     seen_line_nos.add(line_no)
                     indent = "  " * min(depth, 6)
                     lines.append(f"L{line_no:<5}{indent}{sig}")
+                    # Capture byte offsets so get_symbol can skip re-parsing
+                    offsets[sig] = (node.start_byte(), node.end_byte())
                 child_depth = depth + 1
         for i in range(node.child_count()):
             walk(node.child(i), child_depth)
 
     walk(tree.root_node(), 0)
+    _OFFSET_CACHE[path_key] = offsets
     return "\n".join(lines)
 
 
@@ -2425,12 +2502,33 @@ def scope_task(task: str, max_files: int = 5, include_blueprints: bool = False, 
         multi_hits = _symbol_hits_multi(valid_kws + _sub_kws, max_per_kw=10)
     except Exception:
         multi_hits = {}
+
+    # Per-keyword score cap + IDF weighting:
+    # - IDF makes rare keywords count more than common ones. "audit" appearing in
+    #   900 of 2040 files has low IDF; "frequency" in 66 files has high IDF.
+    #   Files matching specific rare keywords therefore rank above files that
+    #   repeat a generic ubiquitous keyword many times.
+    # - Cap limits how much any one keyword can contribute per file so repeated
+    #   hits of the same word hit diminishing returns.
+    _KW_CAP = 9.0
+    _file_kw_scores: dict[str, dict[str, float]] = {}   # {rel: {kw: capped_score}}
+    _file_kw_primary: dict[str, set[str]] = {}           # distinct primary kws per file
+
     for kw in valid_kws + _sub_kws:
         sub_weight_factor = 0.3 if kw in _sub_kw_set else 1.0
+        is_primary = kw not in _sub_kw_set
+        cap = _KW_CAP * sub_weight_factor
         for rel, line, sig in multi_hits.get(kw, []):
             all_hits.append((kw, rel, line, sig))
             weight = (3 if _DEF_LINE_PAT.search(sig) else 1) * sub_weight_factor
-            file_hit_count[rel] = file_hit_count.get(rel, 0) + weight
+            kw_scores = _file_kw_scores.setdefault(rel, {})
+            prev = kw_scores.get(kw, 0.0)
+            if prev < cap:
+                delta = min(weight, cap - prev)
+                kw_scores[kw] = prev + delta
+                file_hit_count[rel] = file_hit_count.get(rel, 0.0) + delta
+            if is_primary:
+                _file_kw_primary.setdefault(rel, set()).add(kw)
     _used_fts = _SEMANTIC_READY  # path loop uses FTS5; byte-scan tiebreaker skipped
 
     # Path-based supplement: files whose name/directory contains task keywords.
@@ -2452,9 +2550,23 @@ def scope_task(task: str, max_files: int = 5, include_blueprints: bool = False, 
                 score = sum(3 if kw in stem_lc else (1 if kw in dir_lc else 0)
                             for kw in path_kws)
                 if score > 0:
-                    file_hit_count[rel] = file_hit_count.get(rel, 0) + score
+                    file_hit_count[rel] = file_hit_count.get(rel, 0.0) + score
+                    # Path keyword matches count as primary for diversity tracking
+                    for kw in path_kws:
+                        if kw in stem_lc or kw in dir_lc:
+                            _file_kw_primary.setdefault(rel, set()).add(kw)
         except Exception:
             pass
+
+    # Keyword diversity multiplier: reward files that match many distinct query
+    # keywords over files that repeat one keyword many times. Each additional
+    # primary keyword matched beyond the first multiplies the score by 1.5×.
+    # Example: 3 keywords matched → ×2.25 vs 1 keyword matched 10× → ×1.0.
+    if _file_kw_primary:
+        for rel in list(file_hit_count):
+            matched = len(_file_kw_primary.get(rel, set()))
+            if matched > 1:
+                file_hit_count[rel] *= 1.5 ** (matched - 1)
 
     # Forward import expansion: for the top 3 keyword/path-matched files, parse
     # their imports and add workspace-resolved targets at 40% of the parent's score.
@@ -2646,8 +2758,6 @@ def get_context(task: str, max_files: int = 3, focus: str = "") -> str:
             multi_hits = _symbol_hits_multi(valid_kws, max_per_kw=5)
             for kw in valid_kws:
                 for rel, line, sig in multi_hits.get(kw, []):
-                    if not _DEF_LINE_PAT.search(sig):
-                        continue
                     name = _symbol_name_from_sig(sig)
                     if not name:
                         continue
@@ -3251,13 +3361,11 @@ def find_callers(symbol_name: str, max_results: int = 20) -> str:
     for path, rel in priority:
         _scan(path, rel)
 
-    # For remainder: use ripgrep when FTS found nothing (symbol has no FTS tokens,
-    # e.g. short names like GetById where all components are <4 chars). In that case
-    # rg's parallel SIMD scan beats Python for large repos. When FTS DID find priority
-    # files, most matches are already captured and the Python byte-scan is fast enough
-    # for the remainder (exits early on `if needle not in raw`).
+    # For remainder: always use ripgrep when available — its parallel SIMD scan beats
+    # sequential Python reads regardless of whether FTS found priority files first.
+    # Priority files are already scanned above; rg handles the long tail.
     if len(results) < cutoff:
-        if _RG_BIN and not priority_rels:
+        if _RG_BIN:
             # rg -l: list matching files only — minimal output, no JSON overhead.
             # --no-ignore: search same files as mimir (don't skip .gitignored files).
             # Post-filter by mimir's indexed file set to avoid unindexed files.
@@ -3635,7 +3743,10 @@ def get_status() -> str:
                 pass
 
         index_state = "warm" if _FTS_READY else "building (tools still work, slower until complete)"
-        warmup_state = "complete" if _WARMUP_COMPLETE else "in progress"
+        warmup_state = (
+            "complete" if _WARMUP_COMPLETE
+            else "in progress — wait ~30s then call get_status again before using scope_task"
+        )
 
         ignore_path = WORKSPACE_ROOT / ".mimirignore"
         if _MIMIRIGNORE_PATTERNS:

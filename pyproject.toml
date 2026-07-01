@@ -29,7 +29,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "mimir-mcp"
-version = "0.1.0"
+version = "0.2.0"
 description = "Mimir: a lightweight local MCP server returning dense structural blueprints of source files to cut LLM token usage."
 requires-python = ">=3.10"
 dependencies = [
