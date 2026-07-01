@@ -38,6 +38,7 @@ from __future__ import annotations
 
 import functools
 import json as _json_mod
+import math
 import os
 import re
 import shutil
@@ -386,6 +387,19 @@ _PATH_STRINGS_TS: float = 0.0
 # large repos). Falls back to the Python scan silently when unavailable.
 _RG_BIN: str | None = shutil.which("rg")
 
+# Document-frequency cache backing IDF-weighted ranking (BM25 IDF).
+# Built once at warmup from the symbols table; only Zipf-head tokens
+# (df >= floor) are stored so memory stays bounded on 60k-file repos —
+# anything rarer is near-max IDF anyway and gets a default.
+_TOKEN_DF: dict[str, int] = {}   # lowercased token → distinct-file count
+_TOKEN_DF_N: int = 0             # corpus size (file count) at build time
+_TOKEN_DF_FLOOR: int = 4         # tokens with df below this are not stored
+_IDF_REF: float = 1.0            # IDF at the reference df; normalizes weights to ~1.0
+_DF_DIRTY: int = 0               # file changes since the last DF build
+_DF_REBUILDING: bool = False
+_FILE_NLINES: dict[str, int] = {}  # rel → blueprint line count (doc-length norm)
+_AVG_NLINES: float = 0.0           # mean blueprint line count across the corpus
+
 
 
 def _load_disk_cache() -> int:
@@ -497,6 +511,10 @@ _SCOPE_STOPWORDS = frozenset({
     "are", "was", "be", "do", "we", "i", "my", "its", "has", "have", "will",
     "not", "now", "how", "what", "when", "where", "why", "can", "could", "would",
     "should", "just", "also", "then", "some", "other", "there", "about", "which",
+    "against", "between", "without", "within", "during", "before", "after",
+    "under", "above", "below", "every", "their", "these", "those", "being",
+    "been", "might", "shall", "still", "however", "because", "through",
+    "themselves", "only", "them", "they",
     "make", "made", "get", "set", "use", "new", "old", "used", "using", "based",
     "add", "added", "fix", "fixed", "change", "update", "modify", "refactor",
     "create", "build", "need", "want", "like", "work", "works", "working",
@@ -619,6 +637,7 @@ def _cache_put(path: Path, blueprint: str) -> None:
                         fts_rows,
                     )
             _DISK_CACHE.commit()
+            _df_note_change()
         except Exception:
             pass
 
@@ -640,6 +659,7 @@ def _cache_evict(path: Path) -> None:
             _DISK_CACHE.execute("DELETE FROM lines WHERE file = ?", (rel,))
             _DISK_CACHE.execute("DELETE FROM symbol_fts WHERE file = ?", (rel,))
             _DISK_CACHE.commit()
+            _df_note_change()
         except Exception:
             pass
     # Force a file-list re-walk so new/deleted files are picked up immediately
@@ -1168,6 +1188,7 @@ def _warm_cache() -> None:
     _build_cs_ns_index()
     _build_java_class_index()
     _build_symbol_index()
+    _build_token_df()          # document frequencies for IDF-weighted ranking
     _build_fts_index()         # FTS5 BM25 table for semantic_search
     _build_path_strings()      # pre-compute (rel, stem_lower, dir_lower) for scope_task path loop
     _build_reverse_imports()
@@ -2281,6 +2302,113 @@ def _build_symbol_index() -> None:
         pass
 
 
+def _build_token_df() -> None:
+    """Build the token document-frequency cache for IDF-weighted ranking.
+
+    One GROUP BY over the symbols table (off idx_symbols_token) at warmup.
+    Tokens are merged case-insensitively taking the max df — the table stores
+    whole tokens verbatim plus lowercase sub-tokens, and for discounting a
+    common word the larger count is the honest one.
+    """
+    global _TOKEN_DF, _TOKEN_DF_N, _TOKEN_DF_FLOOR, _IDF_REF, _DF_DIRTY
+    if _DISK_CACHE is None:
+        return
+    try:
+        n = _DISK_CACHE.execute(
+            "SELECT COUNT(DISTINCT file) FROM symbols"
+        ).fetchone()[0]
+        if not n:
+            return
+        floor = max(4, n // 1000)
+        rows = _DISK_CACHE.execute(
+            "SELECT token, COUNT(DISTINCT file) AS fc FROM symbols"
+            " GROUP BY token HAVING fc >= ?",
+            (floor,),
+        ).fetchall()
+        df: dict[str, int] = {}
+        for tok, fc in rows:
+            k = tok.lower()
+            if fc > df.get(k, 0):
+                df[k] = fc
+        # Reference point: a token present in 2% of files weighs 1.0
+        ref_df = max(1.0, n / 50.0)
+        idf_ref = math.log(1 + (n - ref_df + 0.5) / (ref_df + 0.5))
+        _TOKEN_DF, _TOKEN_DF_N = df, n
+        _TOKEN_DF_FLOOR, _IDF_REF = floor, max(idf_ref, 1e-9)
+        # Blueprint line counts for BM25 document-length normalization: a
+        # god-file (EF DbContext, generated registry) mentions every entity
+        # and racks up weak matches on any query — its score is divided down;
+        # a small file specifically about the queried concept is boosted.
+        global _FILE_NLINES, _AVG_NLINES
+        try:
+            nl = dict(_DISK_CACHE.execute(
+                "SELECT file, COUNT(*) FROM lines GROUP BY file"
+            ).fetchall())
+            if nl:
+                _FILE_NLINES = nl
+                _AVG_NLINES = sum(nl.values()) / len(nl)
+        except Exception:
+            pass  # length norm is optional; _doc_len_norm returns 1.0 without it
+        _DF_DIRTY = 0
+    except Exception:
+        pass
+
+
+def _doc_len_norm(rel: str) -> float:
+    """BM25-style length normalization factor for a file, clamped to [0.25, 1.3].
+
+    norm = 1 / (1 - b + b * len/avglen) with b = 0.4 — gentle enough that a
+    legitimately large ViewModel keeps its rank, strong enough that a DbContext
+    with 10× the average blueprint lines loses its everything-matches edge.
+    """
+    if not _AVG_NLINES:
+        return 1.0
+    n = _FILE_NLINES.get(rel)
+    if not n:
+        return 1.0
+    w = 1.0 / (0.6 + 0.4 * (n / _AVG_NLINES))
+    return 0.25 if w < 0.25 else (1.3 if w > 1.3 else w)
+
+
+def _idf_weight(kw: str) -> float:
+    """Normalized BM25 IDF for a query keyword, clamped to [0.05, 2.0].
+
+    Rare identifiers (df below the storage floor) weigh ~2.0; a word present
+    in 2% of files weighs 1.0; ubiquitous vocabulary ("Types", "Get", project
+    prefixes) bottoms out at 0.05. Returns 1.0 before the DF cache is built,
+    which is exactly the pre-IDF scoring behavior.
+    """
+    n = _TOKEN_DF_N
+    if not n:
+        return 1.0
+    df = _TOKEN_DF.get(kw.lower(), max(1, _TOKEN_DF_FLOOR // 2))
+    idf = math.log(1 + (n - df + 0.5) / (df + 0.5))
+    w = idf / _IDF_REF
+    return 0.05 if w < 0.05 else (2.0 if w > 2.0 else w)
+
+
+def _df_note_change() -> None:
+    """Track index churn; refresh the DF cache on a daemon thread when stale.
+
+    DF is a corpus-wide statistic — a few dozen changed files can't move it
+    meaningfully, so queries never block on a rebuild.
+    """
+    global _DF_DIRTY, _DF_REBUILDING
+    _DF_DIRTY += 1
+    if (_TOKEN_DF_N and not _DF_REBUILDING
+            and _DF_DIRTY > max(50, _TOKEN_DF_N // 50)):
+        _DF_REBUILDING = True
+
+        def _run() -> None:
+            global _DF_REBUILDING
+            try:
+                _build_token_df()
+            finally:
+                _DF_REBUILDING = False
+
+        threading.Thread(target=_run, daemon=True, name="mimir-df-rebuild").start()
+
+
 def _build_fts_index() -> None:
     """Populate symbol_fts FTS5 table from all cached blueprints.
 
@@ -2655,11 +2783,13 @@ def scope_hint(terms: str) -> str:
         else:
             lines.append(f"  '{orig}' → (no matches)")
 
-    # Top files ranked by number of distinct terms that hit them, then symbol count.
+    # Top files ranked by IDF-weighted sum of distinct terms that hit them
+    # (rare terms count more than ubiquitous ones), then symbol count.
     lines.append("\n## Top files")
     ranked = sorted(
         file_syms,
-        key=lambda f: (-len(file_term_hits.get(f, set())), -len(file_syms[f]))
+        key=lambda f: (-sum(_idf_weight(t) for t in file_term_hits.get(f, ())),
+                       -len(file_syms[f]))
     )[:8]
     for rel in ranked:
         syms = ", ".join(file_syms[rel][:6])
@@ -2741,6 +2871,27 @@ def scope_task(task: str, max_files: int = 5, include_blueprints: bool = False, 
 
     valid_kws = [kw for kw in keywords if re.match(r"^\w[\w]*$", kw)]
 
+    # Compound bigrams: tickets name domain concepts in prose ("Unavailable
+    # Types are set against a category...") that the code spells as ONE
+    # compound identifier (UnavailableType / UnavailableTypeCategory). For
+    # each pair of adjacent capitalized words, also search their concatenation
+    # and its singular form. Nonexistent compounds simply return no hits;
+    # existing ones are rare tokens (near-max IDF) that anchor the ranking to
+    # the files actually about that concept.
+    _seen_kw_lc = {k.lower() for k in valid_kws}
+    _compounds: list[str] = []
+    for m in re.finditer(r'\b([A-Z][a-zA-Z0-9]+)\s+([A-Z][a-zA-Z0-9]+)\b', expanded):
+        a, b = m.group(1), m.group(2)
+        cands = [a + b]
+        if b.endswith('s') and len(b) > 3:
+            cands.append(a + b[:-1])
+        for cand in cands:
+            cl = cand.lower()
+            if cl not in _seen_kw_lc:
+                _seen_kw_lc.add(cl)
+                _compounds.append(cand)
+    valid_kws = valid_kws + _compounds[:4]
+
     # Expand with sub-tokens from compound identifiers (e.g. StartOrStopAutoRefresh
     # → refresh) so files with compound method names surface for plain-word queries.
     # Sub-token hits are scored at 0.3× so a direct whole-token definition match
@@ -2757,17 +2908,21 @@ def scope_task(task: str, max_files: int = 5, include_blueprints: bool = False, 
     _sub_kw_set = set(_sub_kws)
 
     try:
-        multi_hits = _symbol_hits_multi(valid_kws + _sub_kws, max_per_kw=10)
+        # 40 hits/keyword (was 10): with IDF controlling common-word inflation,
+        # a bigger sample matters more than a small cap — at 10, a keyword
+        # present in 100+ files had its hits sampled so sparsely the right
+        # file's evidence was often simply never fetched.
+        multi_hits = _symbol_hits_multi(valid_kws + _sub_kws, max_per_kw=40)
     except Exception:
         multi_hits = {}
 
-    # Per-keyword score cap + IDF weighting:
-    # - IDF makes rare keywords count more than common ones. "audit" appearing in
-    #   900 of 2040 files has low IDF; "frequency" in 66 files has high IDF.
-    #   Files matching specific rare keywords therefore rank above files that
-    #   repeat a generic ubiquitous keyword many times.
-    # - Cap limits how much any one keyword can contribute per file so repeated
-    #   hits of the same word hit diminishing returns.
+    # BM25-style scoring: capped term frequency × IDF.
+    # - The per-keyword cap is TF saturation: repeated hits of one word give
+    #   diminishing returns (at most _KW_CAP per keyword per file).
+    # - IDF makes rare keywords count more than common ones. "audit" appearing
+    #   in 900 of 2040 files gets a heavy discount; a compound identifier in
+    #   3 files gets a boost. This is what stops generic business vocabulary
+    #   ("Types", "All", "Operative") from burying the specific file.
     _KW_CAP = 9.0
     _file_kw_scores: dict[str, dict[str, float]] = {}   # {rel: {kw: capped_score}}
     _file_kw_primary: dict[str, set[str]] = {}           # distinct primary kws per file
@@ -2782,11 +2937,20 @@ def scope_task(task: str, max_files: int = 5, include_blueprints: bool = False, 
             kw_scores = _file_kw_scores.setdefault(rel, {})
             prev = kw_scores.get(kw, 0.0)
             if prev < cap:
-                delta = min(weight, cap - prev)
-                kw_scores[kw] = prev + delta
-                file_hit_count[rel] = file_hit_count.get(rel, 0.0) + delta
+                kw_scores[kw] = prev + min(weight, cap - prev)
             if is_primary:
                 _file_kw_primary.setdefault(rel, set()).add(kw)
+
+    # Apply IDF post-cap (equivalent to scaling both weight and cap): a
+    # ubiquitous keyword can now contribute at most 9 × 0.05, a rare
+    # identifier up to 9 × 2.0. Sub-tokens keep their 0.3 factor and get
+    # their own (usually low) IDF on top — the correct double discount.
+    # Document-length normalization then divides down god-files (DbContext,
+    # generated registries) that weakly match everything.
+    idf_w = {kw: _idf_weight(kw) for kw in valid_kws + _sub_kws}
+    for rel, kws in _file_kw_scores.items():
+        raw = sum(s * idf_w[kw] for kw, s in kws.items())
+        file_hit_count[rel] = raw * _doc_len_norm(rel)
     _used_fts = _SEMANTIC_READY  # path loop uses FTS5; byte-scan tiebreaker skipped
 
     # Path-based supplement: files whose name/directory contains task keywords.
@@ -2803,9 +2967,13 @@ def scope_task(task: str, max_files: int = 5, include_blueprints: bool = False, 
             )
             for src_path in _iter_source_files()
         ]
+        # IDF-scaled with a 0.3 floor: a filename-stem match stays high-signal
+        # even for a common word ("email" → EmailService.cs must keep working).
+        _path_idf = {kw: max(0.3, min(_idf_weight(kw), 1.0)) for kw in path_kws}
         try:
             for rel, stem_lc, dir_lc in path_source:
-                score = sum(3 if kw in stem_lc else (1 if kw in dir_lc else 0)
+                score = sum((3 if kw in stem_lc else (1 if kw in dir_lc else 0))
+                            * _path_idf[kw]
                             for kw in path_kws)
                 if score > 0:
                     file_hit_count[rel] = file_hit_count.get(rel, 0.0) + score
@@ -2819,10 +2987,13 @@ def scope_task(task: str, max_files: int = 5, include_blueprints: bool = False, 
     # Keyword diversity multiplier: reward files that match many distinct query
     # keywords over files that repeat one keyword many times. Each additional
     # primary keyword matched beyond the first multiplies the score by 1.5×.
-    # Example: 3 keywords matched → ×2.25 vs 1 keyword matched 10× → ×1.0.
+    # Only keywords with meaningful IDF (>= 0.25) count toward the exponent —
+    # matching three ubiquitous words ("Types", "All", "Operative") is not
+    # evidence of relevance and must not earn a ×2.25.
     if _file_kw_primary:
         for rel in list(file_hit_count):
-            matched = len(_file_kw_primary.get(rel, set()))
+            matched = sum(1 for kw in _file_kw_primary.get(rel, ())
+                          if _idf_weight(kw) >= 0.25)
             if matched > 1:
                 file_hit_count[rel] *= 1.5 ** (matched - 1)
 
@@ -2884,11 +3055,13 @@ def scope_task(task: str, max_files: int = 5, include_blueprints: bool = False, 
 
     # Git recency boost: files modified recently in git rise in the ranking when
     # they're already keyword-matched — high-signal for regression bug tickets.
+    # Bounded to at most double the match score: IDF shrinks common-word scores,
+    # and an unbounded additive boost would let recency swamp weak matches.
     try:
         recency = _git_recency_scores()
         for rel, rscore in recency.items():
             if rel in file_hit_count:
-                file_hit_count[rel] += rscore * 0.5
+                file_hit_count[rel] += min(rscore * 0.5, file_hit_count[rel])
     except Exception:
         pass
 
@@ -3204,8 +3377,9 @@ def semantic_search(query: str, max_results: int = 10, focus: str = "") -> str:
                 sym_hits = _symbol_hits_multi(valid_scope_kws, max_per_kw=8)
                 sym_scores: dict[str, float] = {}
                 for kw in valid_scope_kws:
+                    kw_idf = _idf_weight(kw)   # discount common-word hits pre-RRF
                     for rel, _line, sig in sym_hits.get(kw, []):
-                        w = 3.0 if _DEF_LINE_PAT.search(sig) else 1.0
+                        w = (3.0 if _DEF_LINE_PAT.search(sig) else 1.0) * kw_idf
                         sym_scores[rel] = sym_scores.get(rel, 0.0) + w
 
                 K = 60
