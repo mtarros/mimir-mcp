@@ -36,12 +36,14 @@ Environment variables:
 
 from __future__ import annotations
 
+import functools
 import os
 import re
 import sys
 import signal
 import subprocess
 import tempfile
+import threading
 import time
 from collections import OrderedDict
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -56,11 +58,20 @@ from fastmcp import FastMCP
 # TREE_SITTER_OK stays False and every tool uses the regex tokenizer instead.
 # --------------------------------------------------------------------------- #
 TREE_SITTER_OK = False
+_TS_PARSER_LOCAL = threading.local()  # thread-local: .cache = {lang: parser}
 try:
     from tree_sitter_language_pack import get_parser as _ts_get_parser  # type: ignore
     TREE_SITTER_OK = True
 except Exception:  # noqa: BLE001 - we genuinely want to swallow everything here
     _ts_get_parser = None  # type: ignore
+
+
+def _get_ts_parser(ts_lang: str) -> object:
+    """Return a thread-local tree-sitter parser for ts_lang (parsers are not thread-safe)."""
+    cache = _TS_PARSER_LOCAL.__dict__.setdefault('cache', {})
+    if ts_lang not in cache:
+        cache[ts_lang] = _ts_get_parser(ts_lang)  # type: ignore[misc]
+    return cache[ts_lang]
 
 # Optional file watcher — graceful fallback if watchdog is not installed
 _WATCHER_OK = False
@@ -673,18 +684,35 @@ def _iter_source_files() -> list[Path]:
     return result
 
 
+# Languages where _resolve_import reliably returns 'workspace' hits.
+# C# uses namespace matching (unreliable), Swift always returns 'external'.
+# Including them just wastes a full file read per file with no payoff.
+_REVERSE_IMPORT_EXTS = frozenset({
+    '.ts', '.tsx', '.js', '.jsx', '.mjs',
+    '.py', '.pyi',
+    '.java', '.kt', '.kts',
+})
+# Imports always live at the top of the file. Reading beyond the first 8KB
+# (≈ 200 lines) is wasted I/O — no language puts import blocks mid-file.
+_IMPORT_READ_BYTES = 8192
+
+
 def _build_reverse_imports() -> None:
     """Build _REVERSE_IMPORTS: for each workspace file, which other files import it.
 
     Only covers languages where _resolve_import can produce 'workspace' hits
-    (TypeScript/JS and Python). Called from _warm_cache and incrementally
-    when the file watcher detects a change.
+    (TypeScript/JS, Python, Java/Kotlin). C# and Swift are skipped — their
+    namespace/module resolution doesn't produce reliable file-level reverse links.
+    Reads only the first 8KB per file since imports are always at the top.
     """
     global _REVERSE_IMPORTS
     rev: dict[str, set[str]] = {}
     for src_path in _iter_source_files():
+        if src_path.suffix not in _REVERSE_IMPORT_EXTS:
+            continue
         try:
-            text = src_path.read_text(encoding='utf-8', errors='replace')
+            raw = src_path.read_bytes()
+            text = raw[:_IMPORT_READ_BYTES].decode('utf-8', 'replace') if len(raw) > _IMPORT_READ_BYTES else raw.decode('utf-8', 'replace')
         except OSError:
             continue
         entries = _parse_import_entries(src_path, text)
@@ -838,7 +866,7 @@ def _extract_symbol_body(path: Path, symbol_name: str) -> Optional[str]:
     # --- Tree-sitter path ---
     if TREE_SITTER_OK and ts_lang:
         try:
-            parser = _ts_get_parser(ts_lang)  # type: ignore[misc]
+            parser = _get_ts_parser(ts_lang)
             tree = parser.parse(text)
 
             def _find(node) -> Optional[object]:
@@ -1157,7 +1185,7 @@ def _extract_tree_sitter(path: Path, src: bytes, ts_lang: str) -> Optional[str]:
     if not TREE_SITTER_OK:
         return None
     try:
-        parser = _ts_get_parser(ts_lang)  # type: ignore[misc]
+        parser = _get_ts_parser(ts_lang)
         tree = parser.parse(src.decode("utf-8", "replace"))
     except Exception:  # grammar missing/broken -> let caller use regex
         return None
@@ -1695,14 +1723,18 @@ def _extract_blueprint_lines(rel: str, blueprint: str) -> list[tuple[str, str, s
     return rows
 
 
-def _decompose_identifier(token: str) -> list[str]:
+@functools.lru_cache(maxsize=8192)
+def _decompose_identifier(token: str) -> tuple[str, ...]:
     """Split a compound identifier into lowercase sub-tokens of ≥ 4 chars.
 
     Handles PascalCase, camelCase, snake_case, and mixed forms.
     Examples:
-        StartOrStopAutoRefresh  → ['start', 'stop', 'auto', 'refresh']
-        _refreshIntervalInSeconds → ['refresh', 'interval', 'seconds']
-        MyCurrentViewModel      → ['current', 'view', 'model']
+        StartOrStopAutoRefresh  → ('start', 'stop', 'auto', 'refresh')
+        _refreshIntervalInSeconds → ('refresh', 'interval', 'seconds')
+        MyCurrentViewModel      → ('current', 'view', 'model')
+
+    Returns a tuple (not list) so the result is hashable and the lru_cache
+    can store it — a single decomposed call per unique identifier per process.
     """
     parts = [p for p in token.strip('_').split('_') if p]
     sub: list[str] = []
@@ -1710,7 +1742,7 @@ def _decompose_identifier(token: str) -> list[str]:
         for component in (_CAMEL_SPLIT_RE.findall(part) or [part]):
             if len(component) >= 4:
                 sub.append(component.lower())
-    return sub
+    return tuple(sub)
 
 
 def _fts_rows_for_blueprint(
@@ -2565,7 +2597,7 @@ def _decompose_query_for_fts(query: str) -> list[str]:
     seen: set[str] = set()
     terms: list[str] = []
     for tok in re.findall(r'[a-zA-Z_]\w*', query):
-        parts_list = [tok.lower()] + _decompose_identifier(tok)
+        parts_list = (tok.lower(),) + _decompose_identifier(tok)
         for p in parts_list:
             pl = p.lower()
             if len(pl) >= 3 and pl not in _QUERY_STOPWORDS and pl not in seen:
@@ -2664,11 +2696,15 @@ def semantic_search(query: str, max_results: int = 10, focus: str = "") -> str:
         # with 100 weak matches beats a file with 1 perfect match. Max-score fixes that.
         file_scores: dict[str, float] = {}
         file_symbols: dict[str, list[tuple[str, str]]] = {}
+        file_symbols_seen: dict[str, set[tuple[str, str]]] = {}  # O(1) dedup
         for file, lineno, sym_name, sig, score in fts_hits:
             abs_score = abs(score)
             if abs_score > file_scores.get(file, 0.0):
                 file_scores[file] = abs_score
-            file_symbols.setdefault(file, []).append((lineno, sig))
+            key = (lineno, sig)
+            if key not in file_symbols_seen.setdefault(file, set()):
+                file_symbols_seen[file].add(key)
+                file_symbols.setdefault(file, []).append(key)
 
         # Path boost: if any query term appears in the file path, multiply the score.
         # scope_task wins on class-name queries (e.g. "excel" → TableToExcel.cs) because
@@ -2713,10 +2749,10 @@ def semantic_search(query: str, max_results: int = 10, focus: str = "") -> str:
                 # populate file_symbols for files found only by the symbol index
                 for kw in valid_scope_kws:
                     for rel, line, sig in sym_hits.get(kw, []):
-                        if rel not in file_symbols:
-                            file_symbols[rel] = []
-                        if (line, sig) not in ((l, s) for l, s in file_symbols[rel]):
-                            file_symbols[rel].append((line, sig))
+                        key = (line, sig)
+                        if key not in file_symbols_seen.setdefault(rel, set()):
+                            file_symbols_seen[rel].add(key)
+                            file_symbols.setdefault(rel, []).append(key)
 
                 file_scores = rrf
         except Exception:
@@ -3077,11 +3113,17 @@ def find_callers(symbol_name: str, max_results: int = 20) -> str:
         except Exception:
             pass
 
-    all_files = list(_iter_source_files())
-    priority = [p for p in all_files if str(p.relative_to(WORKSPACE_ROOT)) in priority_rels]
-    remainder = [p for p in all_files if str(p.relative_to(WORKSPACE_ROOT)) not in priority_rels]
+    # Use _PATH_STRINGS (pre-computed rel+path tuples) to avoid calling
+    # relative_to() on every file in the inner loop — saves ~2ms on 2k-file repos.
+    if _PATH_STRINGS:
+        path_pairs = [(WORKSPACE_ROOT / rel, rel) for rel, _, _ in _PATH_STRINGS]
+    else:
+        path_pairs = [(p, str(p.relative_to(WORKSPACE_ROOT))) for p in _iter_source_files()]
 
-    def _scan(path: Path) -> None:
+    priority   = [(p, r) for p, r in path_pairs if r in priority_rels]
+    remainder  = [(p, r) for p, r in path_pairs if r not in priority_rels]
+
+    def _scan(path: Path, rel: str) -> None:
         if len(results) >= cutoff:
             return
         try:
@@ -3090,17 +3132,16 @@ def find_callers(symbol_name: str, max_results: int = 20) -> str:
             return
         if needle not in raw:
             return
-        rel = str(path.relative_to(WORKSPACE_ROOT))
         for i, line in enumerate(raw.decode('utf-8', 'replace').splitlines(), 1):
             if word_re.search(line):
                 results.append((rel, i, line.strip()[:120]))
 
-    for path in priority:
-        _scan(path)
-    for path in remainder:
+    for path, rel in priority:
+        _scan(path, rel)
+    for path, rel in remainder:
         if len(results) >= cutoff:
             break
-        _scan(path)
+        _scan(path, rel)
 
     if not results:
         return f"No usages of '{symbol_name}' found in the workspace."
@@ -3383,30 +3424,12 @@ def set_focus(entries: str, persist: bool = True) -> str:
             _FOCUS_WEIGHTS = {}
             return "Focus cleared. All projects now score equally."
 
-        parsed: dict[str, float] = {}
-        lines_out: list[str] = []
-        for part in raw.split(","):
-            part = part.strip()
-            if not part:
-                continue
-            if ":" in part:
-                prefix, _, wraw = part.rpartition(":")
-                try:
-                    weight = float(wraw.strip())
-                except ValueError:
-                    weight = 3.0
-            else:
-                prefix = part
-                weight = 3.0
-            prefix = prefix.strip()
-            if prefix:
-                parsed[prefix.lower()] = weight
-                lines_out.append(f"{prefix} = {weight}")
-
+        parsed = _parse_focus_str(raw)
         if not parsed:
             return "Error: no valid entries found. Format: 'Prefix.Name' or 'Prefix.Name:0.3'"
 
         if persist:
+            lines_out = [f"{prefix} = {weight}" for prefix, weight in parsed.items()]
             focus_file.write_text(
                 "# mimir project focus weights  (prefix = multiplier)\n"
                 + "\n".join(lines_out) + "\n",
@@ -3454,8 +3477,11 @@ def get_status() -> str:
         sym_count = 0
         if _FTS_READY and _DISK_CACHE is not None:
             try:
+                # COUNT(*) on the symbols table (total rows, not unique tokens) is a
+                # table scan but uses the index; DISTINCT would be more expensive.
+                # The row count is a good-enough proxy for index size.
                 sym_count = _DISK_CACHE.execute(
-                    "SELECT COUNT(DISTINCT token) FROM symbols"
+                    "SELECT COUNT(*) FROM symbols"
                 ).fetchone()[0]
             except Exception:
                 pass

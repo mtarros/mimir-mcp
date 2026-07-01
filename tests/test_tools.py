@@ -349,7 +349,7 @@ class TestDecomposeIdentifier:
 
     def test_short_plain_word_returns_empty(self):
         result = mimir._decompose_identifier("Get")
-        assert result == []
+        assert result == () or result == []
 
     def test_camel_case_splits(self):
         result = mimir._decompose_identifier("myCurrentViewModel")
@@ -359,8 +359,8 @@ class TestDecomposeIdentifier:
 
     def test_all_caps_acronym_no_crash(self):
         result = mimir._decompose_identifier("HTTPSRequest")
-        # Should not raise; result may vary but must be a list
-        assert isinstance(result, list)
+        # Should not raise; result may vary but must be a sequence
+        assert isinstance(result, (list, tuple))
 
     def test_leading_trailing_underscores_stripped(self):
         result = mimir._decompose_identifier("__private_method__")
