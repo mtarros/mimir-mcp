@@ -359,6 +359,7 @@ _SEMANTIC_READY = False   # True once symbol_fts FTS5 table is populated
 _WARMUP_COMPLETE = False  # True once _warm_cache() finishes its first full pass
 _WARMUP_IN_PROGRESS = False  # True during parallel parse; suppresses per-file disk writes
 _REVERSE_IMPORTS: dict[str, list[str]] = {}  # rel_target → sorted list of rel files that import it
+_REVERSE_IMPORTS_FWD: dict[str, set[str]] = {}  # rel_src → set of rel_targets it resolves to (for O(1) incremental updates)
 _FILE_WATCHER_ACTIVE = False  # True if a watchdog observer started successfully
 _ARCHITECTURE_MAP: str = ""   # cached architecture overview; built once in _warm_cache
 _GIT_RECENCY_CACHE: dict = {"ts": 0.0, "scores": {}}  # TTL cache: rel_path → recency rank
@@ -758,8 +759,9 @@ def _build_reverse_imports() -> None:
     namespace/module resolution doesn't produce reliable file-level reverse links.
     Reads only the first 8KB per file since imports are always at the top.
     """
-    global _REVERSE_IMPORTS
+    global _REVERSE_IMPORTS, _REVERSE_IMPORTS_FWD
     rev: dict[str, set[str]] = {}
+    fwd: dict[str, set[str]] = {}
     for src_path in _iter_source_files():
         if src_path.suffix not in _REVERSE_IMPORT_EXTS:
             continue
@@ -772,6 +774,7 @@ def _build_reverse_imports() -> None:
         if not entries:
             continue
         rel_src = str(src_path.relative_to(WORKSPACE_ROOT))
+        targets: set[str] = set()
         for spec, _ in entries:
             try:
                 kind, resolved = _resolve_import(spec, src_path)
@@ -779,7 +782,66 @@ def _build_reverse_imports() -> None:
                 continue
             if kind == 'workspace':
                 rev.setdefault(resolved, set()).add(rel_src)
+                targets.add(resolved)
+        if targets:
+            fwd[rel_src] = targets
     _REVERSE_IMPORTS = {k: sorted(v) for k, v in rev.items()}
+    _REVERSE_IMPORTS_FWD = fwd
+
+
+def _update_reverse_imports_for_file(path: Path, deleted: bool) -> None:
+    """Incrementally update _REVERSE_IMPORTS for a single changed/deleted file.
+
+    Avoids the full-corpus re-read _build_reverse_imports() would otherwise do
+    on every watcher event — this only touches the one file that changed, using
+    _REVERSE_IMPORTS_FWD to find (and drop) its previous contributions in O(1)
+    per target instead of scanning every value-set in _REVERSE_IMPORTS.
+    """
+    global _REVERSE_IMPORTS, _REVERSE_IMPORTS_FWD
+    if path.suffix not in _REVERSE_IMPORT_EXTS:
+        return
+    try:
+        rel_src = str(path.relative_to(WORKSPACE_ROOT))
+    except ValueError:
+        return
+
+    # Drop this file's previous contributions before recomputing.
+    old_targets = _REVERSE_IMPORTS_FWD.pop(rel_src, None)
+    if old_targets:
+        for target in old_targets:
+            importers = _REVERSE_IMPORTS.get(target)
+            if importers and rel_src in importers:
+                remaining = [r for r in importers if r != rel_src]
+                if remaining:
+                    _REVERSE_IMPORTS[target] = remaining
+                else:
+                    _REVERSE_IMPORTS.pop(target, None)
+
+    if deleted:
+        return
+
+    try:
+        raw = path.read_bytes()
+        text = raw[:_IMPORT_READ_BYTES].decode('utf-8', 'replace') if len(raw) > _IMPORT_READ_BYTES else raw.decode('utf-8', 'replace')
+    except OSError:
+        return
+    entries = _parse_import_entries(path, text)
+    if not entries:
+        return
+    new_targets: set[str] = set()
+    for spec, _ in entries:
+        try:
+            kind, resolved = _resolve_import(spec, path)
+        except Exception:
+            continue
+        if kind == 'workspace':
+            new_targets.add(resolved)
+            importers = _REVERSE_IMPORTS.setdefault(resolved, [])
+            if rel_src not in importers:
+                importers.append(rel_src)
+                importers.sort()
+    if new_targets:
+        _REVERSE_IMPORTS_FWD[rel_src] = new_targets
 
 
 # ---------------------------------------------------------------------------
@@ -1051,14 +1113,12 @@ def _start_file_watcher() -> bool:
                 return
             p = Path(getattr(event, 'dest_path', event.src_path))
             if p.suffix in EXT_LANG and not _is_blacklisted(p):
+                deleted = event.event_type == 'deleted'
                 _smart_invalidate(p)
                 _ARCHITECTURE_MAP = ""
-                # Incrementally refresh reverse-import index in the background
-                import threading
-                threading.Thread(
-                    target=_build_reverse_imports, daemon=True,
-                    name="mimir-reimports"
-                ).start()
+                # Update only this file's reverse-import contributions — O(1) per
+                # target instead of _build_reverse_imports()'s full-corpus re-read.
+                _update_reverse_imports_for_file(p, deleted)
 
     try:
         obs = _WatchdogObserver()
@@ -1599,9 +1659,34 @@ def _extract_scope_keywords(task: str) -> list[str]:
     seen: set[str] = set()
     out: list[str] = []
 
-    # CamelCase — almost certainly code symbols
+    # Multi-hump identifiers (PushNotificationSenderServiceWorker, doWorkAsync)
+    # collected FIRST, ahead of plain capitalized prose words. Tickets/task
+    # descriptions often lead with several sentences of prose before an
+    # embedded code snippet or stack trace — without this priority pass, plain
+    # sentence-initial capitalized words ("Investigation", "The", "Observation")
+    # fill the keyword cap below before the scan ever reaches the real
+    # identifiers later in the text. Requires a lowercase/digit run between
+    # capitals (not just 2+ capitals) so ALL-CAPS acronyms like "DB", "AWS",
+    # "APK", "SDP" — common in ticket metadata headers ("DB 8.24, AWS 8.2.1,
+    # APK 8.0.28...") — don't get mistaken for real identifiers; those have no
+    # lowercase letters at all, unlike genuine CamelCase.
+    for m in re.finditer(r'\b[A-Za-z][a-z0-9]+[A-Z][a-zA-Z0-9]*\b', task):
+        w = m.group()
+        if w.lower() not in seen:
+            seen.add(w.lower())
+            out.append(w)
+
+    # CamelCase (single hump) — almost certainly code symbols. Skips short
+    # ALL-CAPS-only tokens (DB, AWS, APK, SDP...) — these are virtually always
+    # version/client codes from a ticket's metadata header ("DB 8.24, AWS
+    # 8.2.1, APK 8.0.28..."), never real identifiers, and since truncation to
+    # the cap only happens once at the very end (not per-pass), a header full
+    # of them would otherwise consume the entire keyword budget before the
+    # scan ever reaches real content words later in this same pass.
     for m in re.finditer(r'\b[A-Z][a-zA-Z0-9]+\b', task):
         w = m.group()
+        if w.isupper() and len(w) <= 4:
+            continue
         if w.lower() not in seen:
             seen.add(w.lower())
             out.append(w)
@@ -2897,13 +2982,12 @@ def semantic_search(query: str, max_results: int = 10, focus: str = "") -> str:
                 "Try more specific language with concrete nouns or identifier-like words."
             )
 
-        # Layer 1: FTS5 BM25 retrieval (top 50 candidates)
+        # Layer 1: FTS5 BM25 retrieval (top 50 candidates). Deliberately NOT an
+        # early-return when empty — a query with zero lexical/token overlap
+        # (BM25's blind spot) can still be answered by the symbol-index layer
+        # below via exact-token matches. We only give up once every layer has
+        # had a chance to contribute (see the file_scores check after Layer 2).
         fts_hits = _fts_search(query_terms, limit=50)
-        if not fts_hits:
-            return (
-                f"No matches found for terms: {', '.join(query_terms)}.\n"
-                "Try broader terms or use scope_task for exact symbol names."
-            )
 
         # Group by file: keep the BEST (most negative = highest BM25) score per file.
         # Summing rewards high-symbol-count files for volume, not relevance — a file
@@ -2971,6 +3055,12 @@ def semantic_search(query: str, max_results: int = 10, focus: str = "") -> str:
                 file_scores = rrf
         except Exception:
             pass  # RRF is best-effort; fall back to FTS5-only ranking
+
+        if not file_scores:
+            return (
+                f"No matches found for terms: {', '.join(query_terms)}.\n"
+                "Try broader terms or use scope_task for exact symbol names."
+            )
 
         # Layer 3: reverse-import graph expansion — add files that import the top 3 hits
         if _REVERSE_IMPORTS and file_scores:
@@ -3366,27 +3456,33 @@ def find_callers(symbol_name: str, max_results: int = 20) -> str:
     # Priority files are already scanned above; rg handles the long tail.
     if len(results) < cutoff:
         if _RG_BIN:
-            # rg -l: list matching files only — minimal output, no JSON overhead.
+            # rg -n: emit path:line:content directly for every match — avoids
+            # reopening and re-splitting every matched file in Python (rg -l
+            # would only give filenames, requiring a second Python read pass).
             # --no-ignore: search same files as mimir (don't skip .gitignored files).
             # Post-filter by mimir's indexed file set to avoid unindexed files.
             try:
                 indexed_rels: set[str] = {r for _, r in path_pairs}
                 proc = subprocess.run(
-                    [_RG_BIN, "-l", "--no-ignore", "--word-regexp", "--", symbol_name, str(WORKSPACE_ROOT)],
+                    [_RG_BIN, "-n", "--no-heading", "--no-ignore", "--word-regexp",
+                     "--", symbol_name, str(WORKSPACE_ROOT)],
                     capture_output=True, timeout=15,
                 )
                 if proc.returncode in (0, 1):
                     ws_str = str(WORKSPACE_ROOT).replace("\\", "/")
                     for raw_line in proc.stdout.splitlines():
-                        path_text = raw_line.decode('utf-8', 'replace').strip().replace("\\", "/")
+                        if len(results) >= cutoff:
+                            break
+                        decoded = raw_line.decode('utf-8', 'replace').replace("\\", "/")
+                        path_text, _, rest = decoded.partition(':')
+                        lineno_text, _, content = rest.partition(':')
                         if path_text.startswith(ws_str):
                             rel = path_text[len(ws_str):].lstrip("/")
                         else:
                             rel = path_text
-                        if rel in indexed_rels:
-                            _scan(WORKSPACE_ROOT / rel, rel)
-                        if len(results) >= cutoff:
-                            break
+                        if rel not in indexed_rels or not lineno_text.isdigit():
+                            continue
+                        results.append((rel, int(lineno_text), content.strip()[:120]))
             except Exception:
                 # rg failed — fall back to Python scan of remainder
                 for path, rel in remainder:
@@ -3624,8 +3720,115 @@ def add_ignore(pattern: str, reason: str = "") -> str:
     _FILE_LIST_TS = 0.0
     _ARCHITECTURE_MAP = ''
 
+    # Prune already-indexed files that now match the new pattern — otherwise
+    # they keep surfacing in scope_task/semantic_search/find_callers until
+    # some unrelated event happens to evict them.
+    evicted = 0
+    for path_str in list(_CACHE.keys()):
+        path = Path(path_str)
+        if _is_blacklisted(path):
+            _cache_evict(path)
+            evicted += 1
+
     suffix = f"  # {reason}" if reason else ""
-    return f"Added to .mimirignore: {pattern}{suffix}"
+    evicted_note = f"  ({evicted} already-indexed file(s) removed from the index)" if evicted else ""
+    return f"Added to .mimirignore: {pattern}{suffix}{evicted_note}"
+
+
+@mcp.tool()
+def audit_index_health(max_findings: int = 5) -> str:
+    """Proactively scan the current index for noise that will degrade search
+    quality, and suggest add_ignore patterns to fix it — before you stumble
+    into the noise via a bad scope_task/semantic_search result.
+
+    WHEN TO USE: the first call when connecting to an unfamiliar or very large
+    repo, especially a monorepo — run this before scope_task/semantic_search
+    so you can exclude vendor/generated noise up front instead of discovering
+    it result-by-result. Also useful any time search results seem oddly
+    diluted (e.g. every query returns the same handful of unrelated files).
+
+    Checks two things, both computed from data already in memory/SQLite — no
+    extra disk scan beyond what warmup already did:
+      1. Bloated files: large on disk but almost no extracted symbols (vendor
+         bundles, generated migrations, minified assets that slipped past
+         .mimirignore) — these cost cache memory and token budget for ~zero
+         structural value.
+      2. Over-saturated search terms: identifiers so common across the
+         codebase that they dilute scope_task/semantic_search ranking for
+         everyone (e.g. a generic 'Data' or 'Handler' suffix used in hundreds
+         of unrelated files).
+
+    Args:
+        max_findings: cap on findings shown per section (default 5).
+
+    IMPORTANT: like add_ignore itself, review suggested patterns before
+    applying them — a pattern that's too broad can exclude real source files.
+    """
+    try:
+        report: list[str] = ["# Mimir Index Health Audit\n"]
+
+        # ── Bloat: large file size, almost no extracted symbols ─────────────
+        bloat: list[tuple[str, int, int]] = []  # (rel, size_bytes, symbol_count)
+        for path_str, (_mtime, size, blueprint) in _CACHE.items():
+            if size < 20_000:  # not worth flagging small files regardless of symbol count
+                continue
+            symbol_count = sum(1 for line in blueprint.splitlines() if re.match(r'L\d+\s', line))
+            if symbol_count <= 2:
+                try:
+                    rel = str(Path(path_str).relative_to(WORKSPACE_ROOT))
+                except ValueError:
+                    rel = path_str
+                bloat.append((rel, size, symbol_count))
+
+        if bloat:
+            bloat.sort(key=lambda x: -x[1])
+            report.append("## Bloated files (large, almost no structure)")
+            report.append("Candidates for .mimirignore — vendor bundles, generated code, or")
+            report.append("assets that parsed but yielded little to no useful structure:\n")
+            for rel, size, symbol_count in bloat[:max_findings]:
+                report.append(f"* `{rel}`  ({size // 1024:,}KB, {symbol_count} symbol(s) extracted)")
+            report.append("")
+
+        # ── Lexical pollution: tokens so common they dilute ranking ─────────
+        pollution: list[tuple[str, int, int]] = []  # (token, file_count, total_count)
+        if _FTS_READY and _DISK_CACHE is not None:
+            try:
+                total_files = max(len(_iter_source_files()), 1)
+                floor = max(150, int(total_files * 0.05))
+                rows = _DISK_CACHE.execute(
+                    "SELECT token, COUNT(DISTINCT file) AS fc, COUNT(*) AS tc"
+                    " FROM symbols GROUP BY token HAVING fc >= ? ORDER BY fc DESC LIMIT ?",
+                    (floor, max_findings * 2),
+                ).fetchall()
+                pollution = [(t, fc, tc) for t, fc, tc in rows]
+            except Exception:
+                pass
+
+        if pollution:
+            report.append("## Over-saturated search terms")
+            report.append("These identifiers appear across so many files that they dilute")
+            report.append("scope_task/semantic_search ranking — not necessarily a problem to")
+            report.append("fix, but worth knowing when a query returns oddly generic results:\n")
+            for token, file_count, total_count in pollution[:max_findings]:
+                try:
+                    sample = _DISK_CACHE.execute(
+                        "SELECT file FROM symbols WHERE token = ? LIMIT 200", (token,)
+                    ).fetchall()
+                    dirs = [str(Path(f).parent) for (f,) in sample]
+                    top_dir = max(set(dirs), key=dirs.count) if dirs else "?"
+                except Exception:
+                    top_dir = "?"
+                report.append(
+                    f"* `{token}` — {total_count:,} hits across {file_count:,} files "
+                    f"(top source: `{top_dir}/`)"
+                )
+            report.append("")
+
+        if len(report) == 1:
+            return "Index looks healthy — no significant bloat or search-term pollution detected."
+        return "\n".join(report).rstrip()
+    except Exception as e:
+        return f"Error in audit_index_health: {type(e).__name__}: {e}"
 
 
 @mcp.tool()

@@ -93,7 +93,7 @@ def workspace(tmp_path):
 
 class TestToolRegistration:
     async def test_all_tools_listed(self, workspace):
-        """All 17 tools must be registered — any missing tool fails silently in production."""
+        """All 18 tools must be registered — any missing tool fails silently in production."""
         async with Client(_make_transport(workspace)) as client:
             tools = await client.list_tools()
             names = {t.name for t in tools}
@@ -116,6 +116,7 @@ class TestToolRegistration:
             "get_changed_files",
             "get_architecture",
             "semantic_search",
+            "audit_index_health",
         }
         assert expected == names, f"Tool mismatch. Extra: {names - expected}, Missing: {expected - names}"
 
