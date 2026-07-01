@@ -269,7 +269,7 @@ _SYMBOL_STOPWORDS = frozenset({
 
 # Increment when the blueprint text format changes so cached blueprints are
 # automatically invalidated and re-parsed on the next server start.
-BLUEPRINT_VERSION = "6"  # bump when index schema or tokenisation changes
+BLUEPRINT_VERSION = "7"  # bump when index schema or tokenisation changes
 
 # Splits PascalCase / camelCase into components: 'StartAutoRefresh' → ['Start','Auto','Refresh']
 _CAMEL_SPLIT_RE = re.compile(r'[A-Z][a-z0-9]*|[a-z][a-z0-9]*')
@@ -1254,6 +1254,162 @@ def _is_def_node(node) -> bool:
     return False
 
 
+# ---------------------------------------------------------------------------
+# Exception / log message string-literal extraction
+#
+# Blueprints strip bodies by design, which makes error/log message text
+# invisible to scope_task and semantic_search — a ticket quoting
+# "Maximum retry attempts exceeded" can't find the file that throws it.
+# We selectively surface string-literal arguments of throw/raise statements
+# and known logging calls as an indented "#strings" section appended to the
+# blueprint. Deliberately NOT all string literals: that would pollute the
+# index with UI text, SQL, and format noise.
+# ---------------------------------------------------------------------------
+# AST node kinds that can carry an indexable message, per tree-sitter language.
+# Creation kinds are included independently of throw statements because real
+# codebases wrap exceptions instead of throwing them at the construction site
+# (e.g. Result.ErrorResult(new Exception("Maximum retry attempts exceeded."))).
+_LIT_NODE_KINDS: dict[str, frozenset[str]] = {
+    "csharp":     frozenset({"throw_statement", "object_creation_expression",
+                             "invocation_expression"}),
+    "python":     frozenset({"raise_statement", "call"}),
+    "javascript": frozenset({"throw_statement", "new_expression", "call_expression"}),
+    "typescript": frozenset({"throw_statement", "new_expression", "call_expression"}),
+    "tsx":        frozenset({"throw_statement", "new_expression", "call_expression"}),
+    "java":       frozenset({"throw_statement", "object_creation_expression",
+                             "method_invocation"}),
+}
+_LIT_THROW_KINDS = frozenset({"throw_statement", "raise_statement"})
+_LIT_NEW_KINDS = frozenset({"object_creation_expression", "new_expression"})
+# The expression inside a throw/raise that carries the constructor + message
+_LIT_CREATION_KINDS = frozenset({
+    "object_creation_expression", "new_expression", "call",
+    "invocation_expression", "call_expression",
+})
+# Constructed-type / called-function suffixes treated as exception constructors
+_LIT_EXC_SUFFIXES = ("Exception", "Error", "Fault", "Failure")
+_LIT_STRING_KINDS = frozenset({
+    "string_literal", "string", "template_string",
+    "interpolated_string_expression", "verbatim_string_literal",
+    "raw_string_literal",
+})
+# Text-content children of a string node. Joining only these skips
+# interpolation holes ({x} / ${x}) in C# $-strings and JS template strings.
+_LIT_CONTENT_KINDS = frozenset({
+    "string_literal_content", "string_content", "string_fragment",
+})
+_LIT_ARG_KINDS = frozenset({"argument_list", "arguments"})
+# Simple callee names (lowercased) recognised as logging calls. Matched
+# against the last identifier of the callee chain (logger.LogWarning → logwarning).
+_LOG_METHOD_NAMES = frozenset({
+    "logwarning", "logerror", "loginformation", "logcritical", "logdebug",
+    "logtrace", "logfatal", "logexception",
+    "warn", "warning", "error", "exception", "critical", "fatal",
+    "info", "information", "debug", "trace",
+    "log_warning", "log_error", "log_info", "log_debug", "log_exception",
+    "log_critical",
+})
+_LIT_MIN_LEN = 10        # message must be at least this long...
+_LIT_MAX_LEN = 120       # ...and is truncated to this
+_LIT_MAX_PER_FILE = 40   # bound blueprint growth on log-heavy files
+
+
+def _lit_first_string(node) -> object | None:
+    """Depth-first search for the first string-typed descendant (document order)."""
+    for i in range(node.child_count()):
+        c = node.child(i)
+        if c.kind() in _LIT_STRING_KINDS:
+            return c
+        r = _lit_first_string(c)
+        if r is not None:
+            return r
+    return None
+
+
+def _lit_string_text(string_node, src: bytes) -> str:
+    """Literal text of a string node, interpolation holes skipped, whitespace collapsed."""
+    parts: list[str] = []
+
+    def collect(n) -> None:
+        if n.kind() in _LIT_CONTENT_KINDS:
+            parts.append(src[n.start_byte():n.end_byte()].decode("utf-8", "replace"))
+            return
+        for i in range(n.child_count()):
+            collect(n.child(i))
+
+    collect(string_node)
+    return " ".join(" ".join(parts).split())
+
+
+def _lit_args_child(node) -> object | None:
+    for i in range(node.child_count()):
+        if node.child(i).kind() in _LIT_ARG_KINDS:
+            return node.child(i)
+    return None
+
+
+def _lit_callee_name(node, args, src: bytes) -> str:
+    """Last identifier before the argument list: logger.LogWarning → LogWarning."""
+    head = src[node.start_byte():args.start_byte()].decode("utf-8", "replace")
+    toks = re.findall(r'\w+', head)
+    return toks[-1] if toks else ""
+
+
+def _literal_row(node, src: bytes) -> Optional[str]:
+    """Signature-style row for a throw/raise/log node, or None if not indexable."""
+    try:
+        kind = node.kind()
+        if kind in _LIT_THROW_KINDS:
+            inner = None
+            for i in range(node.child_count()):
+                if node.child(i).kind() in _LIT_CREATION_KINDS:
+                    inner = node.child(i)
+                    break
+            if inner is None:
+                return None
+            args = _lit_args_child(inner)
+            if args is None:
+                return None
+            callee = _lit_callee_name(inner, args, src)
+            word = "raise" if kind == "raise_statement" else "throw"
+        elif kind in _LIT_NEW_KINDS:
+            # new SomeException("...") anywhere — thrown, returned, or wrapped
+            args = _lit_args_child(node)
+            if args is None:
+                return None
+            callee = _lit_callee_name(node, args, src)
+            if not callee.endswith(_LIT_EXC_SUFFIXES):
+                return None
+            word = "new"
+        else:
+            args = _lit_args_child(node)
+            if args is None:
+                return None
+            callee = _lit_callee_name(node, args, src)
+            if not callee:
+                return None
+            # Logging call (logger.LogWarning / log.warn / console.error) or an
+            # exception constructed via plain call syntax (Python ValueError(...)).
+            if callee.lower() in _LOG_METHOD_NAMES:
+                word = ""
+            elif callee.endswith(_LIT_EXC_SUFFIXES):
+                word = "new"
+            else:
+                return None
+        string_node = _lit_first_string(args)
+        if string_node is None:
+            return None
+        text = _lit_string_text(string_node, src)
+        # Multi-word natural-language messages only — a single-word literal is
+        # either an identifier (indexed elsewhere) or noise.
+        if len(text) < _LIT_MIN_LEN or " " not in text:
+            return None
+        text = text[:_LIT_MAX_LEN]
+        return f'{word} {callee}("{text}")'.lstrip() if callee else None
+    except Exception:
+        return None
+
+
 _XML_COMMENT_RE = re.compile(r'<!--.*?-->', re.DOTALL)
 _XML_PI_RE      = re.compile(r'<\?.*?\?>', re.DOTALL)
 _XML_TAG_RE     = re.compile(r'<(/?)(\w[\w:.-]*)([^>]*?)(/?)>', re.DOTALL)
@@ -1368,6 +1524,9 @@ def _extract_tree_sitter(path: Path, src: bytes, ts_lang: str) -> Optional[str]:
     seen_line_nos: set[int] = set()
     path_key = str(path)
     offsets: dict[str, tuple[int, int]] = {}
+    lit_kinds = _LIT_NODE_KINDS.get(ts_lang)
+    lit_lines: list[str] = []
+    seen_lit_line_nos: set[int] = set()
 
     # Signatures that are just bare keywords have no name to reference — skip them
     _anon = re.compile(r'^(?:async\s+)?(?:function|class|interface|enum)\s*[<({]?$')
@@ -1385,12 +1544,26 @@ def _extract_tree_sitter(path: Path, src: bytes, ts_lang: str) -> Optional[str]:
                     # Capture byte offsets so get_symbol can skip re-parsing
                     offsets[sig] = (node.start_byte(), node.end_byte())
                 child_depth = depth + 1
+        elif (lit_kinds is not None
+              and len(lit_lines) < _LIT_MAX_PER_FILE
+              and node.kind() in lit_kinds):
+            row = _literal_row(node, src)
+            if row:
+                line_no = node.start_position().row + 1
+                if line_no not in seen_lit_line_nos:
+                    seen_lit_line_nos.add(line_no)
+                    # Indented so _toplevel_names_from_blueprint never treats a
+                    # literal as a top-level symbol in get_architecture output.
+                    lit_lines.append(f"L{line_no:<5}  {row}")
         for i in range(node.child_count()):
             walk(node.child(i), child_depth)
 
     walk(tree.root_node(), 0)
     _OFFSET_CACHE[path_key] = offsets
-    return "\n".join(lines)
+    body = "\n".join(lines)
+    if lit_lines:
+        body = (body + "\n" if body else "") + "#strings\n" + "\n".join(lit_lines)
+    return body
 
 
 def _extract_regex(text: str, profile_key: str) -> str:
