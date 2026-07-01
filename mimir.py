@@ -3209,69 +3209,11 @@ def find_callers(symbol_name: str, max_results: int = 20) -> str:
 
     cutoff = max_results * 4
     results: list[tuple[str, int, str]] = []
-
-    # --- Fast path: ripgrep (if available) -----------------------------------
-    # rg uses SIMD substring search + parallel I/O, ~10× faster than the Python
-    # byte-scan for large repos (343ms → ~30ms on 8k-file C# repo).
-    if _RG_BIN:
-        try:
-            proc = subprocess.run(
-                [
-                    _RG_BIN,
-                    "--json",
-                    "--word-regexp",
-                    "--max-count", str(cutoff),
-                    "--",
-                    symbol_name,
-                    str(WORKSPACE_ROOT),
-                ],
-                capture_output=True,
-                timeout=15,
-            )
-            if proc.returncode in (0, 1):  # 0=matches found, 1=no matches
-                ws_str = str(WORKSPACE_ROOT)
-                for raw_line in proc.stdout.splitlines():
-                    try:
-                        obj = _json_mod.loads(raw_line)
-                    except Exception:
-                        continue
-                    if obj.get("type") != "match":
-                        continue
-                    data = obj["data"]
-                    path_text: str = data["path"]["text"]
-                    # Normalize to forward slashes (Windows compat) and make relative
-                    path_text = path_text.replace("\\", "/")
-                    ws_prefix = ws_str.replace("\\", "/")
-                    if path_text.startswith(ws_prefix):
-                        rel = path_text[len(ws_prefix):].lstrip("/")
-                    else:
-                        rel = path_text
-                    lineno: int = data["line_number"]
-                    line_text: str = data["lines"]["text"].rstrip("\r\n").strip()[:120]
-                    results.append((rel, lineno, line_text))
-                    if len(results) >= cutoff:
-                        break
-
-                if not results and proc.returncode == 1:
-                    return f"No usages of '{symbol_name}' found in the workspace."
-
-                results = results[:max_results]
-                lines = [f"# Usages of '{symbol_name}'  ({len(results)} shown)\n"]
-                for rel, lineno, ctx in results:
-                    lines.append(f"  {rel}:{lineno}  {ctx}")
-                if len(results) >= max_results:
-                    lines.append(f"\n... capped at {max_results}; use a more specific name to narrow down")
-                return '\n'.join(lines)
-        except Exception:
-            pass  # rg failed; fall through to Python scan
-
-    # --- Python fallback scan ------------------------------------------------
     needle = symbol_name.encode('utf-8')
     word_re = re.compile(rf'(?<!\w){re.escape(symbol_name)}(?!\w)')
 
-    # Use the FTS5 blueprint index as a prefilter: files where the symbol appears
-    # in any signature are already indexed and can be identified in ~1ms without
-    # reading disk. Search those files first; remaining files only if cap not met.
+    # FTS5 prefilter: files where the symbol appears in any signature are already
+    # indexed and can be identified in ~1ms without reading disk.
     priority_rels: set[str] = set()
     if _FTS_READY and _DISK_CACHE is not None:
         try:
@@ -3305,12 +3247,49 @@ def find_callers(symbol_name: str, max_results: int = 20) -> str:
             if word_re.search(line):
                 results.append((rel, i, line.strip()[:120]))
 
+    # Always Python-scan priority files (few, already in memory via FTS).
     for path, rel in priority:
         _scan(path, rel)
-    for path, rel in remainder:
-        if len(results) >= cutoff:
-            break
-        _scan(path, rel)
+
+    # For remainder: use ripgrep when FTS found nothing (symbol has no FTS tokens,
+    # e.g. short names like GetById where all components are <4 chars). In that case
+    # rg's parallel SIMD scan beats Python for large repos. When FTS DID find priority
+    # files, most matches are already captured and the Python byte-scan is fast enough
+    # for the remainder (exits early on `if needle not in raw`).
+    if len(results) < cutoff:
+        if _RG_BIN and not priority_rels:
+            # rg -l: list matching files only — minimal output, no JSON overhead.
+            # --no-ignore: search same files as mimir (don't skip .gitignored files).
+            # Post-filter by mimir's indexed file set to avoid unindexed files.
+            try:
+                indexed_rels: set[str] = {r for _, r in path_pairs}
+                proc = subprocess.run(
+                    [_RG_BIN, "-l", "--no-ignore", "--word-regexp", "--", symbol_name, str(WORKSPACE_ROOT)],
+                    capture_output=True, timeout=15,
+                )
+                if proc.returncode in (0, 1):
+                    ws_str = str(WORKSPACE_ROOT).replace("\\", "/")
+                    for raw_line in proc.stdout.splitlines():
+                        path_text = raw_line.decode('utf-8', 'replace').strip().replace("\\", "/")
+                        if path_text.startswith(ws_str):
+                            rel = path_text[len(ws_str):].lstrip("/")
+                        else:
+                            rel = path_text
+                        if rel in indexed_rels:
+                            _scan(WORKSPACE_ROOT / rel, rel)
+                        if len(results) >= cutoff:
+                            break
+            except Exception:
+                # rg failed — fall back to Python scan of remainder
+                for path, rel in remainder:
+                    if len(results) >= cutoff:
+                        break
+                    _scan(path, rel)
+        else:
+            for path, rel in remainder:
+                if len(results) >= cutoff:
+                    break
+                _scan(path, rel)
 
     if not results:
         return f"No usages of '{symbol_name}' found in the workspace."
