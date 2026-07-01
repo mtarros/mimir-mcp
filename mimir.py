@@ -37,8 +37,10 @@ Environment variables:
 from __future__ import annotations
 
 import functools
+import json as _json_mod
 import os
 import re
+import shutil
 import sys
 import signal
 import subprocess
@@ -377,6 +379,11 @@ _DEF_LINE_PAT = re.compile(
 # on every scope_task call. Built once in _warm_cache(); rebuilt on file-list TTL expiry.
 _PATH_STRINGS: list[tuple[str, str, str]] = []
 _PATH_STRINGS_TS: float = 0.0
+
+# Optional ripgrep accelerator for find_callers. If `rg` is on PATH it replaces
+# the Python byte-scan loop with SIMD-accelerated parallel I/O (~10× faster on
+# large repos). Falls back to the Python scan silently when unavailable.
+_RG_BIN: str | None = shutil.which("rg")
 
 
 
@@ -2604,6 +2611,68 @@ def scope_task(task: str, max_files: int = 5, include_blueprints: bool = False, 
     return "\n".join(parts)
 
 
+@mcp.tool()
+def get_context(task: str, max_files: int = 3, focus: str = "") -> str:
+    """One-shot context loader: ranked files + blueprints + key symbol bodies.
+
+    Combines scope_task, get_file_structure, and get_symbol into a single call.
+    Use this when starting work on a task to get everything you need up front
+    without 3–4 serial round trips.
+
+    WHEN TO USE: prefer this over scope_task when you know you will immediately
+    need to read the file structures. Skip it if you only want the ranked file
+    list (use scope_task instead) or if max_files > 3 (output becomes large).
+
+    Args:
+        task: plain-English description of what you want to do.
+        max_files: number of top files to include blueprints for (default 3).
+        focus: optional comma-separated "prefix:weight" pairs for this call only.
+
+    Returns ranked file list, blueprints for the top files, and the full bodies
+    of the 2 most relevant definition symbols found in those files.
+    """
+    # Step 1: rank files and collect symbol hits (reuse scope_task scoring)
+    scope_out = scope_task(task, max_files=max_files, include_blueprints=True, focus=focus)
+
+    # Step 2: find the best 2 definition symbols across the top files and
+    # append their full bodies so the AI doesn't need a follow-up get_symbol call.
+    keywords = _extract_scope_keywords(_expand_task_with_aliases(task))
+    valid_kws = [kw for kw in keywords if re.match(r"^\w[\w]*$", kw)]
+
+    sym_bodies: list[str] = []
+    seen_sym_keys: set[tuple[str, str]] = set()
+    if valid_kws:
+        try:
+            multi_hits = _symbol_hits_multi(valid_kws, max_per_kw=5)
+            for kw in valid_kws:
+                for rel, line, sig in multi_hits.get(kw, []):
+                    if not _DEF_LINE_PAT.search(sig):
+                        continue
+                    name = _symbol_name_from_sig(sig)
+                    if not name:
+                        continue
+                    key = (rel, name)
+                    if key in seen_sym_keys:
+                        continue
+                    seen_sym_keys.add(key)
+                    try:
+                        body = _extract_symbol_body(_resolve_in_workspace(rel), name)
+                    except Exception:
+                        body = None
+                    if body:
+                        sym_bodies.append(f"### {name}  ({rel}:{line})\n{body}")
+                    if len(sym_bodies) >= 2:
+                        break
+                if len(sym_bodies) >= 2:
+                    break
+        except Exception:
+            pass
+
+    if sym_bodies:
+        return scope_out + "\n\n## Key symbol bodies\n\n" + "\n\n".join(sym_bodies)
+    return scope_out
+
+
 # ---------------------------------------------------------------------------
 # semantic_search helpers
 # ---------------------------------------------------------------------------
@@ -2885,7 +2954,19 @@ def get_imports(path: str) -> str:
         if kind == 'workspace':
             workspace_lines.append(f"  [workspace]  {imp_resolved}{suffix}")
         elif kind == 'unresolved':
-            workspace_lines.append(f"  [workspace?] {spec}  (not found on disk){suffix}")
+            # Try to resolve by extracting the type name (last dot segment) and
+            # searching the symbol index — common for C# namespace imports like
+            # "InControl.Core.Services.IAuthService" where only "IAuthService" is indexable.
+            type_name = spec.rsplit('.', 1)[-1] if '.' in spec else spec
+            hint = ""
+            if type_name and type_name != spec and _FTS_READY:
+                try:
+                    hits = _symbol_hits(type_name, max_results=1)
+                    if hits:
+                        hint = f"\n             → found: {hits[0][0]}:{hits[0][1]}"
+                except Exception:
+                    pass
+            workspace_lines.append(f"  [workspace?] {spec}{hint}  (not found on disk){suffix}")
         else:
             external_lines.append(f"  [external]   {imp_resolved}{suffix}")
 
@@ -3126,16 +3207,71 @@ def find_callers(symbol_name: str, max_results: int = 20) -> str:
     if not re.match(r'^\w+$', symbol_name):
         return "Error: symbol_name must be a bare identifier (letters, digits, underscore)."
 
-    needle = symbol_name.encode('utf-8')
-    word_re = re.compile(rf'(?<!\w){re.escape(symbol_name)}(?!\w)')
     cutoff = max_results * 4
     results: list[tuple[str, int, str]] = []
 
+    # --- Fast path: ripgrep (if available) -----------------------------------
+    # rg uses SIMD substring search + parallel I/O, ~10× faster than the Python
+    # byte-scan for large repos (343ms → ~30ms on 8k-file C# repo).
+    if _RG_BIN:
+        try:
+            proc = subprocess.run(
+                [
+                    _RG_BIN,
+                    "--json",
+                    "--word-regexp",
+                    "--max-count", str(cutoff),
+                    "--",
+                    symbol_name,
+                    str(WORKSPACE_ROOT),
+                ],
+                capture_output=True,
+                timeout=15,
+            )
+            if proc.returncode in (0, 1):  # 0=matches found, 1=no matches
+                ws_str = str(WORKSPACE_ROOT)
+                for raw_line in proc.stdout.splitlines():
+                    try:
+                        obj = _json_mod.loads(raw_line)
+                    except Exception:
+                        continue
+                    if obj.get("type") != "match":
+                        continue
+                    data = obj["data"]
+                    path_text: str = data["path"]["text"]
+                    # Normalize to forward slashes (Windows compat) and make relative
+                    path_text = path_text.replace("\\", "/")
+                    ws_prefix = ws_str.replace("\\", "/")
+                    if path_text.startswith(ws_prefix):
+                        rel = path_text[len(ws_prefix):].lstrip("/")
+                    else:
+                        rel = path_text
+                    lineno: int = data["line_number"]
+                    line_text: str = data["lines"]["text"].rstrip("\r\n").strip()[:120]
+                    results.append((rel, lineno, line_text))
+                    if len(results) >= cutoff:
+                        break
+
+                if not results and proc.returncode == 1:
+                    return f"No usages of '{symbol_name}' found in the workspace."
+
+                results = results[:max_results]
+                lines = [f"# Usages of '{symbol_name}'  ({len(results)} shown)\n"]
+                for rel, lineno, ctx in results:
+                    lines.append(f"  {rel}:{lineno}  {ctx}")
+                if len(results) >= max_results:
+                    lines.append(f"\n... capped at {max_results}; use a more specific name to narrow down")
+                return '\n'.join(lines)
+        except Exception:
+            pass  # rg failed; fall through to Python scan
+
+    # --- Python fallback scan ------------------------------------------------
+    needle = symbol_name.encode('utf-8')
+    word_re = re.compile(rf'(?<!\w){re.escape(symbol_name)}(?!\w)')
+
     # Use the FTS5 blueprint index as a prefilter: files where the symbol appears
-    # in any signature (parameter type, return type, class name, decorator) are
-    # already indexed and can be identified in ~1ms without reading disk.
-    # Search those files first; they account for most real callers.  The remaining
-    # files are searched sequentially only if the result cap is not yet reached.
+    # in any signature are already indexed and can be identified in ~1ms without
+    # reading disk. Search those files first; remaining files only if cap not met.
     priority_rels: set[str] = set()
     if _FTS_READY and _DISK_CACHE is not None:
         try:
@@ -3148,8 +3284,6 @@ def find_callers(symbol_name: str, max_results: int = 20) -> str:
         except Exception:
             pass
 
-    # Use _PATH_STRINGS (pre-computed rel+path tuples) to avoid calling
-    # relative_to() on every file in the inner loop — saves ~2ms on 2k-file repos.
     if _PATH_STRINGS:
         path_pairs = [(WORKSPACE_ROOT / rel, rel) for rel, _, _ in _PATH_STRINGS]
     else:

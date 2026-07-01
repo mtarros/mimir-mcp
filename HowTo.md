@@ -413,9 +413,30 @@ Returns: keywords searched, matched symbols with file:line locations, ranked fil
 - Use technical/class names when known rather than feature descriptions. `"RectificationFilter section order"` finds the right file faster than `"corrective actions filter UI"`.
 - If you're in a mono-repo with multiple projects, call `set_focus` first so the right project's files rank above sibling projects with similar naming.
 - If the results look wrong, try `scope_hint` to discover the actual names and re-run.
-- Pass `include_blueprints=True` to get full symbol maps inline (useful for small repos or when you want the structure in one call).
+- Pass `include_blueprints=True` to get full symbol maps inline (useful for small repos or when you want the structure in one call, without needing `get_file_structure` as a follow-up).
 
 **How scores work:** Symbol definition hits score 3×, usage hits score 1×. Path/filename matches also score 3×. Files inside the active `set_focus` prefix get a multiplier applied on top. Git recency gives a small additional boost to already-matched files.
+
+---
+
+### 5b. `get_context` — one-shot context loader
+
+Combines `scope_task`, `get_file_structure`, and `get_symbol` into a single call. Use this when you know you'll need to read file structures and key symbols right away, and you want to avoid 3–4 serial round trips.
+
+**Example:**
+> `get_context("UserService authenticate login", max_files=3)`
+
+Returns: ranked files section (same as `scope_task`), blueprints for each top file, and the full bodies of the 2 most relevant definition symbols.
+
+**When to prefer `get_context` over `scope_task`:**
+- You're starting fresh on a task and need to orient quickly
+- `max_files` is 2–3 (output stays manageable)
+- You expect to call `get_file_structure` immediately after `scope_task` anyway
+
+**When to prefer `scope_task` instead:**
+- You only want the ranked file list to decide what to look at next
+- `max_files` > 3 (blueprints for many files produce very large output)
+- You're in a mono-repo and want to scan the ranked list before committing to reading anything
 
 ---
 
@@ -487,7 +508,7 @@ Works for: TypeScript, JavaScript, Python, Kotlin, Swift, C#, Go, Rust.
 
 > **Note:** Kotlin, C#, and Swift use module/namespace imports rather than file paths. Mimir identifies whether they belong to the project or an external SDK, but cannot resolve them to a specific file.
 
-> **Tip for namespace imports (C#, Kotlin, Swift):** When `get_imports` returns `[workspace?] SomeNamespace.TypeName`, pluck the type name and call `verify_symbol_existence("TypeName")` to jump to the file that defines it. Use `find_callers("TypeName")` to find its usage sites instead.
+> **Tip for namespace imports (C#, Kotlin, Swift):** When `get_imports` returns `[workspace?] SomeNamespace.TypeName`, mimir now automatically searches the symbol index for the type name and shows a `→ found:` hint with the definition file and line number when it can resolve it. If the hint doesn't appear, call `verify_symbol_existence("TypeName")` manually.
 
 ---
 
@@ -521,6 +542,8 @@ Searches raw source text across the entire workspace for every call site and usa
 > `find_callers("AuthenticationService", max_results=20)`
 
 WHEN TO USE: after `verify_symbol_existence` tells you where something is defined, use `find_callers` to trace who calls it — for impact analysis, understanding data flow, or finding all consumers of an interface.
+
+> **Performance tip:** If [ripgrep](https://github.com/BurntSushi/ripgrep) (`rg`) is installed, mimir uses it automatically for ~10× faster scanning on large repos (macOS: `brew install ripgrep`, Windows: `winget install BurntSushi.ripgrep.MSVC`). Falls back to Python scan transparently when unavailable.
 
 ---
 

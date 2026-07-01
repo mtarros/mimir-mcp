@@ -11,6 +11,7 @@ They are excluded from the default test run to keep `pytest tests/` fast.
 Add -m smoke to target just these: pytest -m smoke tests/test_smoke.py -v
 """
 import os
+import re
 import sys
 import asyncio
 from pathlib import Path
@@ -92,7 +93,7 @@ def workspace(tmp_path):
 
 class TestToolRegistration:
     async def test_all_tools_listed(self, workspace):
-        """All 16 tools must be registered — any missing tool fails silently in production."""
+        """All 17 tools must be registered — any missing tool fails silently in production."""
         async with Client(_make_transport(workspace)) as client:
             tools = await client.list_tools()
             names = {t.name for t in tools}
@@ -101,6 +102,7 @@ class TestToolRegistration:
             "verify_symbol_existence",
             "scope_task",
             "scope_hint",
+            "get_context",
             "set_focus",
             "get_imports",
             "get_dependents",
@@ -733,3 +735,27 @@ class TestSetFocusPersist:
         assert (workspace / ".mimir-focus").exists(), (
             ".mimir-focus must be written when persist=True"
         )
+
+
+@pytest.mark.asyncio
+class TestGetContextWire:
+    async def test_returns_ranked_files_and_blueprint(self, workspace):
+        async with Client(_make_transport(workspace)) as client:
+            r = await client.call_tool("get_context", {
+                "task": "UserService authenticate login",
+                "max_files": 2,
+            })
+        text = _text(r)
+        assert "EXCEPTION" not in text
+        assert "Ranked files" in text or "ranked" in text.lower()
+        # Blueprint content: at least one L-prefixed line number should appear
+        assert re.search(r'\bL\d+\b', text), "Expected blueprint line numbers in output"
+
+    async def test_no_crash_on_unknown_task(self, workspace):
+        async with Client(_make_transport(workspace)) as client:
+            r = await client.call_tool("get_context", {
+                "task": "xyzzy_nonexistent_feature_qwerty",
+            })
+        text = _text(r)
+        assert "EXCEPTION" not in text
+        assert len(text) > 0
