@@ -282,7 +282,10 @@ def _init_disk_cache() -> "Optional[object]":
         cache_dir.mkdir(parents=True, exist_ok=True)
         db = sqlite3.connect(str(cache_dir / f"{ws_hash}.db"), check_same_thread=False)
         db.execute("PRAGMA journal_mode=WAL")
-        db.execute("PRAGMA cache_size=-32768")   # 32MB page cache
+        db.execute("PRAGMA synchronous=NORMAL")   # safe with WAL; skips per-commit fsync
+        db.execute("PRAGMA cache_size=-32768")    # 32MB page cache
+        db.execute("PRAGMA temp_store=MEMORY")    # temp tables in RAM (FTS5 sort/merge)
+        db.execute("PRAGMA mmap_size=134217728")  # 128MB mmap for faster sequential reads
         db.execute(
             "CREATE TABLE IF NOT EXISTS blueprints"
             " (path TEXT PRIMARY KEY, mtime REAL, size INTEGER, blueprint TEXT)"
@@ -352,6 +355,7 @@ _DISK_CACHE = _init_disk_cache()
 _FTS_READY = False        # True once the symbols inverted index is built and queryable
 _SEMANTIC_READY = False   # True once symbol_fts FTS5 table is populated
 _WARMUP_COMPLETE = False  # True once _warm_cache() finishes its first full pass
+_WARMUP_IN_PROGRESS = False  # True during parallel parse; suppresses per-file disk writes
 _REVERSE_IMPORTS: dict[str, list[str]] = {}  # rel_target → sorted list of rel files that import it
 _FILE_WATCHER_ACTIVE = False  # True if a watchdog observer started successfully
 _ARCHITECTURE_MAP: str = ""   # cached architecture overview; built once in _warm_cache
@@ -570,6 +574,11 @@ def _cache_put(path: Path, blueprint: str) -> None:
     _CACHE.move_to_end(str(path))
     while len(_CACHE) > _CACHE_MAX:
         _CACHE.popitem(last=False)  # evict oldest
+    # During parallel warmup, skip individual disk writes — _flush_warmup_blueprints
+    # writes all blueprints in a single transaction after the ThreadPoolExecutor finishes.
+    # This avoids N×fsync and SQLite write contention from concurrent threads.
+    if _WARMUP_IN_PROGRESS:
+        return
     if _DISK_CACHE is not None:
         try:
             rel = str(path.relative_to(WORKSPACE_ROOT))
@@ -983,14 +992,40 @@ def _start_file_watcher() -> bool:
         return False
 
 
+def _flush_warmup_blueprints() -> None:
+    """Batch-write all in-memory blueprints to disk in one transaction.
+
+    Called after the parallel warmup parse completes. Writing N×8280 individual
+    commits from worker threads causes SQLite write contention and N fsyncs.
+    A single executemany + commit writes everything atomically with one fsync.
+    """
+    if _DISK_CACHE is None:
+        return
+    try:
+        rows = [
+            (path_str, mtime, size, blueprint)
+            for path_str, (mtime, size, blueprint) in list(_CACHE.items())
+        ]
+        _DISK_CACHE.executemany(
+            "INSERT OR REPLACE INTO blueprints VALUES (?,?,?,?)",
+            rows,
+        )
+        _DISK_CACHE.commit()
+    except Exception:
+        pass
+
+
 def _warm_cache() -> None:
     """Parse all source files in parallel so the first search is fast."""
-    global _WARMUP_COMPLETE
+    global _WARMUP_COMPLETE, _WARMUP_IN_PROGRESS
     files = _iter_source_files()
     workers = min(8, os.cpu_count() or 4)
+    _WARMUP_IN_PROGRESS = True
     with ThreadPoolExecutor(max_workers=workers) as ex:
         for _ in as_completed(ex.submit(_build_blueprint, p) for p in files):
             pass
+    _WARMUP_IN_PROGRESS = False
+    _flush_warmup_blueprints()   # single batch write — no per-file fsyncs
     _build_cs_ns_index()
     _build_java_class_index()
     _build_symbol_index()
