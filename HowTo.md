@@ -415,7 +415,7 @@ Returns: keywords searched, matched symbols with file:line locations, ranked fil
 - If the results look wrong, try `scope_hint` to discover the actual names and re-run.
 - Pass `include_blueprints=True` to get full symbol maps inline (useful for small repos or when you want the structure in one call, without needing `get_file_structure` as a follow-up).
 
-**How scores work:** Symbol definition hits score 3×, usage hits score 1×. Path/filename matches also score 3×. Files inside the active `set_focus` prefix get a multiplier applied on top. Git recency gives a small additional boost to already-matched files.
+**How scores work:** BM25-style. Symbol definition hits score 3×, usage hits 1×, capped per keyword (repeated hits of one word give diminishing returns), then weighted by IDF — rare identifiers count up to 2×, ubiquitous words as little as 0.05×. Scores are length-normalized so god-files that weakly match everything don't dominate. Path/filename matches score 3×. Adjacent capitalized words ("Unavailable Types") are also searched as their compound identifier (`UnavailableType`). Files inside the active `set_focus` prefix get a multiplier on top, and git recency gives a bounded boost to already-matched files.
 
 ---
 
@@ -717,17 +717,25 @@ scope_task("JobCancelled JobPaused IRecipient MyCurrentViewModel")
 ```
 Technical names in the query give `scope_task` enough signal to find the right file in one call. `scope_hint` is the warm-up round when you only have feature/domain language to start from.
 
-### Known limitations & next TODOs (found testing real tickets on Carps, ~8,000 files)
+### Fixed limitations (found testing real tickets on Carps, ~8,000 files)
 
-Three distinct problems surfaced, at three different layers of the pipeline. Two are fixed; two remain open as prioritized TODOs for next session.
+Four distinct problems surfaced across the pipeline while testing real tickets. All four are now fixed and guarded by `tests/bench_rank_eval.py`, a ground-truth ranking eval that runs the actual failing tickets against Carps and Topcat.
 
 **Fixed — query understanding (`_extract_scope_keywords`):**
 1. Plain sentence-initial capitalized words ("Investigation", "The", "Observation") were crowding out real identifiers embedded later in a ticket (e.g. in a code snippet or stack trace) — the keyword cap filled before the scan ever reached them. Fixed by giving multi-hump identifiers (`PushNotificationSenderServiceWorker`, `DoWorkAsync`) priority over single-capital prose words.
 2. Short ALL-CAPS version/client codes from a ticket's metadata header (`DB 8.24, AWS 8.2.1, APK 8.0.28..., Client: SCGH, SDP: 20631`) were being mistaken for real identifiers for the same reason. Fixed by excluding ALL-CAPS tokens ≤4 chars from that pass.
 
-**TODO #1 (recommended next, lower risk) — index coverage:** bodies are stripped from blueprints by design (that's the whole point — compact, signature-only), so exception/log message string literals (e.g. `"Maximum retry attempts exceeded"`, `"ConnectionId not found for the operativeId"`) are structurally invisible to `scope_task`/`semantic_search`, even though the codebase absolutely contains that exact text. Confirmed with a real Rollbar-style ticket: `scope_task`/`semantic_search` both missed it entirely; `find_callers("MaxRetryAttempts")` found it instantly once given the right identifier by hand. Proposed fix: selectively index string-literal arguments to exception constructors and logging calls (`throw new Exception("...")`, `LogWarning(...)`, etc.) — NOT all string literals (would reintroduce the pollution problem this whole night has been fighting). Confirmed this codebase's backend error strings are plain literals, not `.resx`-localized, so no resource-file cross-referencing is needed for this specific case — `.resx`/localized UI-text search is a separate, bigger, lower-priority feature to consider only if it comes up as a real need later.
+**Fixed — index coverage (`#strings` blueprint section):** exception/log message strings (`"Maximum retry attempts exceeded"`) used to be structurally invisible to `scope_task`/`semantic_search` because blueprints strip bodies. Blueprints now end with a `#strings` section listing string-literal arguments of throw/raise statements, exception constructors (`new *Exception(...)` matched anywhere — Carps wraps them in `Result` objects rather than throwing at the construction site), and known logging calls (`LogWarning`, `logger.error`, `console.error`, ...). Interpolated (`$"..."`) and template strings are supported with the interpolation holes skipped. Deliberately NOT all string literals: messages must be ≥10 chars and multi-word, are truncated at 120 chars, and cap at 40 per file — so UI text, SQL, and format noise stay out of the index. The real Rollbar ticket that motivated this went from a complete miss to **#1** in both `scope_task` and `semantic_search`.
 
-**TODO #2 (bigger, higher risk) — ranking:** `scope_task` ranks by raw match-count, which is exactly why generic business-vocabulary tickets (e.g. "Unavailable Types are set against a category... Categories/Teams that they have access to") rank the right file too low — confirmed present in the results, just buried below files that rack up more matches on common words like "Types"/"All"/"Operative". `semantic_search` already uses BM25 (via its FTS5 layer) which inherently discounts common terms; `scope_task` doesn't use that scoring at all — it's a separate, older path. Likely fix: converge `scope_task`'s ranking onto the same BM25 approach instead of maintaining two scoring formulas with two different blind spots. Higher risk than TODO #1 because `scope_task` is the shared backbone almost every other tool depends on (`get_context`, suggested-symbol logic, etc.) — needs broad testing across many query types, not just the tickets that currently fail, before shipping. Do this only after TODO #1 is done and verified, not both at once.
+**Fixed — ranking (BM25 on the fast path):** `scope_task` ranked by capped raw match-count, so generic business-vocabulary tickets ("Unavailable Types are set against a category... Categories/Teams that they have access to") buried the right file under files racking up matches on common words like "Types"/"All"/"Operative". Ranking is now the full BM25 recipe on the existing exact-token path (kept separate from FTS5 on purpose — exact-token retrieval semantics and ~ms latency are the tool's core promise):
+- **IDF weighting** — document frequencies computed at warmup from the symbol index; ubiquitous words are discounted down to 0.05×, rare identifiers boosted up to 2×. Refreshed in the background as files change.
+- **Document-length normalization** — god-files (EF `DbContext`, generated registries) that weakly match every entity are divided down; small files specifically about the queried concept are boosted.
+- **Compound bigrams** — adjacent capitalized prose words ("Unavailable Types") are also searched as the code's compound identifier (`UnavailableType(s)`), anchoring the ranking to the concept's actual files.
+- The keyword-diversity multiplier only counts keywords with meaningful IDF, and the git-recency boost is bounded to at most double a match score.
+
+Eval results: ticket MRR 0.394 → 0.800, all four failing ticket cases now top-5 (three at #1), zero regressions on precise-identifier queries (5/5 still #1), p50 latency 16ms on 8k files. Re-run anytime with `python tests/bench_rank_eval.py`.
+
+**Still open (deliberately):** `.resx`/localized UI-text search — a separate, bigger feature to consider only if it comes up as a real need later.
 
 ---
 
@@ -765,7 +773,7 @@ Requires the mimir development install (Option C) and pytest:
 ~/.local/pipx/venvs/mimir-mcp/bin/python -m pytest tests/ -q
 ```
 
-Expected: **215 passed** (~30s — smoke tests spawn real subprocesses).
+Expected: **272 passed** (~35s — smoke tests spawn real subprocesses).
 
 ### Run unit tests only (fast)
 
