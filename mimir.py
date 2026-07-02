@@ -150,6 +150,34 @@ def _load_mimiraliases() -> dict[str, list[str]]:
 _MIMIRALIASES: dict[str, list[str]] = _load_mimiraliases()
 
 
+def _load_mimirnotes() -> dict[str, list[str]]:
+    """Read path-prefix -> free-text note mappings from .mimirnotes.
+
+    File format (one note per line, notes accumulate under a prefix — this is
+    an append-only log, unlike .mimiraliases which merges into one line):
+        Features/Playback = background sync uses platform-native timers, not SyncService
+        Features/Playback = check MainActivity.java/AppDelegate.swift for the real logic
+        # comments are ignored
+    Returns lowercased path-prefix -> list of note strings (insertion order).
+    """
+    p = WORKSPACE_ROOT / ".mimirnotes"
+    if not p.exists():
+        return {}
+    notes: dict[str, list[str]] = {}
+    for line in p.read_text(encoding="utf-8").splitlines():
+        line = line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        prefix, _, note = line.partition("=")
+        prefix, note = prefix.strip().lower(), note.strip()
+        if prefix and note:
+            notes.setdefault(prefix, []).append(note)
+    return notes
+
+
+_MIMIRNOTES: dict[str, list[str]] = _load_mimirnotes()
+
+
 def _load_focus() -> dict[str, float]:
     """Read project focus weights from .mimir-focus.
 
@@ -1609,6 +1637,38 @@ def _extract_regex(text: str, profile_key: str) -> str:
     return "\n".join(lines)
 
 
+_NOTES_MAX_SHOWN = 3
+_NOTE_MAX_CHARS = 200
+
+
+def _notes_for_path(rel_path: str, weights: dict[str, list[str]] | None = None) -> list[str]:
+    """Display-ready note lines for a workspace-relative path.
+
+    Substring match, longest-prefix-first — same convention as _FOCUS_WEIGHTS.
+    Unlike focus weights (which break at the first match since multipliers
+    can't meaningfully combine), notes are additive context: ALL matching
+    prefixes' notes are shown, just capped at _NOTES_MAX_SHOWN so one
+    broad-prefix note doesn't drown every query in text.
+
+    `weights` defaults to the module-level _MIMIRNOTES; the parameter exists
+    purely so tests can pass a fabricated dict without monkeypatching.
+    """
+    source = weights if weights is not None else _MIMIRNOTES
+    if not source:
+        return []
+    rel_lc = rel_path.lower()
+    matched = [(p, n) for p in sorted(source, key=len, reverse=True)
+               if p in rel_lc for n in source[p]]
+    if not matched:
+        return []
+    shown = matched[:_NOTES_MAX_SHOWN]
+    lines = [f"note: {n if len(n) <= _NOTE_MAX_CHARS else n[:_NOTE_MAX_CHARS] + '…'}"
+             for _, n in shown]
+    if len(matched) > len(shown):
+        lines.append(f"note: (+{len(matched) - len(shown)} more — see .mimirnotes)")
+    return lines
+
+
 def _build_blueprint(path: Path) -> str:
     """Core: produce a compact structural map for one file (cache-aware)."""
     cached = _cache_get(path)
@@ -2693,9 +2753,13 @@ def get_file_structure(path: str) -> str:
     if _is_blacklisted(resolved):
         return f"Error: '{path}' lives in a blacklisted directory and is not mapped."
     try:
-        return _build_blueprint(resolved)
+        blueprint = _build_blueprint(resolved)
     except Exception as e:  # last-resort guard: never break the stdio stream
         return f"Error mapping '{path}': {type(e).__name__}: {e}. Try a smaller file or a line range."
+    notes = _notes_for_path(path)
+    if notes:
+        blueprint += "\n" + "\n".join(f"  {n}" for n in notes)
+    return blueprint
 
 
 @mcp.tool()
@@ -3199,6 +3263,8 @@ def scope_task(task: str, max_files: int = 5, include_blueprints: bool = False, 
     for i, rel in enumerate(top_files, 1):
         n = int(round(file_hit_count[rel]))
         parts.append(f"  {i}. {rel}  ({n} {'match' if n == 1 else 'matches'})")
+        for note in _notes_for_path(rel):
+            parts.append(f"       {note}")
 
     # Suggest targeted get_symbol calls for definition hits — faster than reading a whole file
     sym_suggestions: list[tuple[str, str]] = []
@@ -3990,6 +4056,9 @@ def get_directory_structure(dir_path: str, max_files: int = 10) -> str:
     for path in shown:
         try:
             parts.append(_build_blueprint(path))
+            notes = _notes_for_path(str(path.relative_to(WORKSPACE_ROOT)))
+            if notes:
+                parts.extend(f"  {n}" for n in notes)
             parts.append("")
         except Exception:
             pass
@@ -4100,6 +4169,79 @@ def record_alias(domain_term: str, code_name: str) -> str:
     _MIMIRALIASES[domain] = existing[domain]
 
     return f"Saved: '{domain}' → {', '.join(existing[domain])}  (.mimiraliases updated)"
+
+
+@mcp.tool()
+def record_note(path_prefix: str, note: str) -> str:
+    """Attach a free-text contextual note to files/paths matching a prefix, so
+    future scope_task/get_file_structure/get_directory_structure calls surface
+    it as prose alongside those files.
+
+    DIFFERENT FROM record_alias: record_alias teaches mimir SEARCH VOCABULARY
+    (a domain term expands into a code name, silently feeding scope_task's
+    keyword extraction). record_note attaches CONTEXT (shown verbatim as a
+    "note:" line, never used for ranking or search). Use record_note for things
+    like non-obvious architecture ("this uses platform-native timers, not the
+    shared service"), gotchas, or pointers to the real implementation file when
+    it differs from what the name suggests. Use record_alias when a plain-English
+    term and a code identifier are just two names for the same thing.
+
+    WHEN TO USE: after discovering something about a path/feature that a future
+    reader would NOT be able to infer purely from the file/symbol names — e.g.
+    you found out the "real" logic lives elsewhere, or that a method looks
+    unused but is called reflectively. Prefer narrow, specific prefixes — a
+    note on a broad prefix like "" or "src" will surface on every file.
+
+    Args:
+        path_prefix: a workspace-relative path or substring identifying the
+                     files this note applies to (e.g. "Features/Playback" or
+                     "SyncService.cs"). Matches by substring, same as .mimir-focus.
+        note: the free-text note. Kept short (multi-line input is flattened
+              to one line — the storage format is one note per line).
+
+    Returns a confirmation showing the saved note, or "Already recorded" if
+    this exact (prefix, note) pair already exists.
+    """
+    prefix = path_prefix.strip().lower()
+    if "=" in prefix:
+        return "Error: path_prefix must not contain '='."
+    text = " ".join(note.split())  # flatten multi-line input to one line
+    if not prefix or not text:
+        return "Error: both path_prefix and note must be non-empty strings."
+
+    notes_path = WORKSPACE_ROOT / ".mimirnotes"
+
+    # Load existing content
+    existing: dict[str, list[str]] = {}
+    lines_raw: list[str] = []
+    if notes_path.exists():
+        lines_raw = notes_path.read_text(encoding="utf-8").splitlines()
+        for line in lines_raw:
+            stripped = line.strip()
+            if stripped and not stripped.startswith("#") and "=" in stripped:
+                p, _, n = stripped.partition("=")
+                existing.setdefault(p.strip().lower(), []).append(n.strip())
+
+    if text in existing.get(prefix, []):
+        return f"Already recorded: '{prefix}' → {text}"
+
+    # Append-only log — no merge/rewrite needed, just add a new line.
+    out_lines = list(lines_raw)
+    if not notes_path.exists():
+        out_lines = [
+            "# mimir contextual notes — free-text context attached to a path prefix",
+            "# Format:  path/prefix = note text",
+            "# Shown as prose alongside matching files; never used for search ranking.",
+            "",
+        ] + out_lines
+    out_lines.append(f"{prefix} = {text}")
+
+    notes_path.write_text("\n".join(out_lines) + "\n", encoding="utf-8")
+
+    # Update in-memory cache
+    _MIMIRNOTES.setdefault(prefix, []).append(text)
+
+    return f"Saved note for '{prefix}': {text}  (.mimirnotes updated)"
 
 
 @mcp.tool()
@@ -4419,6 +4561,25 @@ def get_status() -> str:
                 "    feature name maps to a different code name in the codebase"
             )
 
+        notes_path = WORKSPACE_ROOT / ".mimirnotes"
+        if _MIMIRNOTES:
+            total_notes = sum(len(v) for v in _MIMIRNOTES.values())
+            notes_section = (
+                f"context_notes ({len(_MIMIRNOTES)} prefix(es), {total_notes} note(s)):\n"
+                + "\n".join(f"  {p}  ({len(v)} note{'s' if len(v) != 1 else ''})"
+                            for p, v in _MIMIRNOTES.items())
+                + "\n  → seen in get_file_structure / get_directory_structure / scope_task output"
+            )
+        elif notes_path.exists():
+            notes_section = "context_notes: .mimirnotes exists but contains no active notes"
+        else:
+            notes_section = (
+                "context_notes: none  (.mimirnotes not found)\n"
+                "  → call record_note(path_prefix, note) to attach context to a path\n"
+                "    (e.g. non-obvious architecture, gotchas — different from record_alias,\n"
+                "    which is for search-vocabulary synonyms)"
+            )
+
         rev_count = len(_REVERSE_IMPORTS)
         watcher_line = (
             "file_watcher:       on (changes invalidate cache instantly)"
@@ -4468,6 +4629,8 @@ def get_status() -> str:
             ignore_section,
             "",
             alias_section,
+            "",
+            notes_section,
         ]
         return "\n".join(lines)
     except Exception as e:

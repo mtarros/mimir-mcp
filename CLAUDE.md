@@ -47,7 +47,7 @@ Everything lives in `mimir.py`. There is no package structure. Key sections in o
 3. **Structure extraction** — `_extract_tree_sitter()` (preferred) and `_extract_regex()` (fallback). Both return the same dense line format `L{lineno}  {indent}{signature}`. Tree-sitter blueprints additionally end with a `#strings` section listing exception/log message literals (`_literal_row`) so error text from tickets is searchable. `_build_blueprint()` orchestrates cache → tree-sitter → regex.
 4. **Warm-up** — `_warm_cache()` runs at startup: walks all source files, builds blueprints, populates `_SYMBOL_INDEX`, builds the token document-frequency cache (`_build_token_df`, backs IDF ranking + length norm), builds the FTS5 table, `_REVERSE_IMPORTS` map, and `_ARCHITECTURE_MAP`, then starts the file watcher (`watchdog`).
 5. **File watcher** — `_start_file_watcher()` invalidates `_CACHE` and `_REVERSE_IMPORTS` entries on file change/create/delete events within the workspace.
-6. **MCP tools** (18 total):
+6. **MCP tools** (20 total):
    - `get_status` — index health, file count, exclusion patterns, domain aliases, active focus weights
    - `set_focus` — save per-prefix score multipliers to `.mimir-focus`; takes effect immediately; `persist=False` for session-only weights
    - `get_architecture` — high-level directory/symbol map of the whole workspace
@@ -64,6 +64,7 @@ Everything lives in `mimir.py`. There is no package structure. Key sections in o
    - `find_callers` — text search for every call/usage site of a symbol; auto-uses ripgrep (`rg`) if on PATH for ~10× speedup on large repos
    - `get_dependents` — reverse import index: which files import a given file
    - `record_alias` — save a domain-term → code-name mapping for `scope_task` expansion
+   - `record_note` — attach a free-text contextual note to a path prefix; surfaced as prose in `get_file_structure`/`get_directory_structure`/`scope_task`, never used for ranking
    - `add_ignore` — append a pattern to `.mimirignore` and reload immediately
    - `audit_index_health` — reports bloated files and over-saturated search terms in the index
    - `execute_local_sandbox` — run python/bash snippets with timeout + process-group kill

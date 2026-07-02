@@ -93,7 +93,7 @@ def workspace(tmp_path):
 
 class TestToolRegistration:
     async def test_all_tools_listed(self, workspace):
-        """All 18 tools must be registered — any missing tool fails silently in production."""
+        """All 20 tools must be registered — any missing tool fails silently in production."""
         async with Client(_make_transport(workspace)) as client:
             tools = await client.list_tools()
             names = {t.name for t in tools}
@@ -110,6 +110,7 @@ class TestToolRegistration:
             "get_directory_structure",
             "get_status",
             "record_alias",
+            "record_note",
             "add_ignore",
             "execute_local_sandbox",
             "get_symbol",
@@ -401,6 +402,106 @@ class TestRecordAliasWire:
             r = await client.call_tool("record_alias", {"domain_term": "", "code_name": "Foo"})
         text = _text(r)
         assert "Error" in text
+
+
+# ---------------------------------------------------------------------------
+# record_note
+# ---------------------------------------------------------------------------
+
+class TestRecordNoteWire:
+    async def test_saves_note_and_confirms(self, workspace):
+        async with Client(_make_transport(workspace)) as client:
+            r = await client.call_tool(
+                "record_note",
+                {"path_prefix": "src/service.py", "note": "watch for the auth quirk here"},
+            )
+        text = _text(r)
+        assert "src/service.py" in text
+        assert "watch for the auth quirk here" in text
+        assert "EXCEPTION" not in text
+        notes_file = workspace / ".mimirnotes"
+        assert notes_file.exists()
+        assert "watch for the auth quirk here" in notes_file.read_text()
+
+    async def test_duplicate_returns_already_recorded(self, workspace):
+        async with Client(_make_transport(workspace)) as client:
+            await client.call_tool("record_note", {"path_prefix": "src/models.py", "note": "dup note"})
+            r = await client.call_tool("record_note", {"path_prefix": "src/models.py", "note": "dup note"})
+        text = _text(r)
+        assert "already" in text.lower()
+
+    async def test_empty_inputs_rejected(self, workspace):
+        async with Client(_make_transport(workspace)) as client:
+            r = await client.call_tool("record_note", {"path_prefix": "", "note": "x"})
+        text = _text(r)
+        assert "Error" in text
+
+    async def test_prefix_with_equals_rejected(self, workspace):
+        async with Client(_make_transport(workspace)) as client:
+            r = await client.call_tool("record_note", {"path_prefix": "Config=Prod", "note": "x"})
+        text = _text(r)
+        assert "Error" in text
+
+    async def test_multiline_note_flattened(self, workspace):
+        async with Client(_make_transport(workspace)) as client:
+            r = await client.call_tool(
+                "record_note",
+                {"path_prefix": "src/models.py", "note": "line one\nline two\nline three"},
+            )
+            text = _text(r)
+            assert "EXCEPTION" not in text
+            notes_file = workspace / ".mimirnotes"
+            raw = notes_file.read_text()
+            assert "line one line two line three" in raw
+            # No embedded raw newline inside a note entry — file stays one-line-per-note.
+            assert "line one\nline two" not in raw
+            # File must still parse cleanly after the flattened write.
+            r2 = await client.call_tool("get_status", {})
+            assert "EXCEPTION" not in _text(r2)
+
+    async def test_note_surfaces_in_get_file_structure(self, workspace):
+        async with Client(_make_transport(workspace)) as client:
+            await client.call_tool(
+                "record_note",
+                {"path_prefix": "src/service.py", "note": "check the retry logic here"},
+            )
+            r = await client.call_tool("get_file_structure", {"path": "src/service.py"})
+        text = _text(r)
+        assert "note: check the retry logic here" in text
+
+    async def test_note_surfaces_in_scope_task(self, workspace):
+        async with Client(_make_transport(workspace)) as client:
+            await client.call_tool(
+                "record_note",
+                {"path_prefix": "src/service.py", "note": "surfaces in ranked output"},
+            )
+            r = await client.call_tool("scope_task", {"task": "UserService authenticate login"})
+        text = _text(r)
+        assert "note: surfaces in ranked output" in text
+
+    async def test_note_does_not_affect_ranking(self, workspace):
+        """A note's text must never influence scope_task's scores — notes are
+        display-only, unlike record_alias which deliberately does affect ranking."""
+        async with Client(_make_transport(workspace)) as client:
+            before = _text(await client.call_tool(
+                "scope_task", {"task": "UserService authenticate login"}
+            ))
+            await client.call_tool(
+                "record_note",
+                {"path_prefix": "src/service.py",
+                 "note": "totally unrelated keywords xylophone zeppelin quokka"},
+            )
+            after = _text(await client.call_tool(
+                "scope_task", {"task": "UserService authenticate login"}
+            ))
+
+        def match_counts(text: str) -> list[str]:
+            return [l for l in text.splitlines() if re.match(r"\s*\d+\.\s", l)]
+
+        assert match_counts(before) == match_counts(after), (
+            f"ranked-file match counts changed after recording an unrelated note:\n"
+            f"before={match_counts(before)}\nafter={match_counts(after)}"
+        )
 
 
 # ---------------------------------------------------------------------------

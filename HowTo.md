@@ -216,6 +216,8 @@ your-project/
   .mcp.json                        ← picked up by Claude Code
   .mimirignore                     ← exclusion patterns (commit this to share with the team)
   .mimir-focus                     ← active project focus weights (commit if team works in same sub-project)
+  .mimiraliases                    ← domain-term → code-name mappings (commit to share vocabulary)
+  .mimirnotes                      ← free-text context notes tied to path prefixes (commit to share tribal knowledge)
   .vscode/
     mcp.json                       ← picked up by VS Code Copilot (MCP connection)
   .github/
@@ -590,6 +592,32 @@ push notifications = PushNotificationService, PushManager
 
 ---
 
+### 14b. `record_note` — attach context to a path
+
+Records a free-text note tied to a path prefix. **Different from `record_alias`**: aliases expand search vocabulary (silently fed into `scope_task`'s keyword matching); notes attach context — shown as prose next to matching files, never used for ranking or search.
+
+**Example:**
+> `record_note("Features/Playback", "background sync uses platform-native timers, not the shared cross-platform service — check MainActivity.java/AppDelegate.swift, not SyncService.cs")`
+
+**How it works:**
+- Writes to `.mimirnotes` in the workspace root (human-editable, commit to git)
+- Shown as `note: ...` lines under matching files in `get_file_structure`, `get_directory_structure`, and `scope_task`'s ranked-files list
+- Multiple notes can accumulate under the same prefix — it's an append-only log, unlike `.mimiraliases` which merges into one line per domain term
+- Shown longest-matching-prefix first, capped at 3 notes per file (with a "+N more" line if truncated) so one broad-prefix note doesn't drown every query in text
+- `get_status` shows a count summary only — full notes appear in the file-scoped output above, not in `get_status` itself
+
+**Maintaining `.mimirnotes` manually:**
+
+```
+# mimir contextual notes — free-text context attached to a path prefix
+# Format:  path/prefix = note text
+
+Features/Playback = background sync uses platform-native timers, not SyncService.cs
+Features/Playback = check MainActivity.java/AppDelegate.swift for the real logic
+```
+
+---
+
 ### 15. `add_ignore` — exclude noisy files on the fly
 
 Adds a gitignore-style pattern to `.mimirignore` and takes effect immediately — no restart needed. The AI uses this when it encounters vendor libraries, generated code, test fixtures, or build artefacts that pollute blueprints and `get_architecture` output.
@@ -750,9 +778,11 @@ Eval results: ticket MRR 0.394 → 0.800, all four failing ticket cases now top-
 
 3. **Record aliases for your team's vocabulary.** When you notice `scope_task` consistently needing the same bridging — e.g., "corrective actions" always means `RectificationFilter` — run `record_alias` once and it applies to every future session.
 
-4. **Commit `.mimirignore` and `.mimiraliases`.** These are the institutional memory of your codebase. The whole team benefits from shared exclusions and vocabulary mappings.
+4. **Record notes for non-obvious tribal knowledge.** When you discover something a future reader couldn't infer from names alone — e.g. "this uses platform-native timers, not the shared service" — run `record_note` once and it surfaces automatically whenever that path comes up again, without affecting search ranking the way aliases do.
 
-5. **Commit `.mimir-focus` if your team works in the same sub-project.** If everyone on the team is working in `InControl.Carps.Mobile`, checking in `.mimir-focus` means the right focus is active from the first session with no manual setup.
+5. **Commit `.mimirignore`, `.mimiraliases`, and `.mimirnotes`.** These are the institutional memory of your codebase. The whole team benefits from shared exclusions, vocabulary mappings, and tribal-knowledge notes.
+
+6. **Commit `.mimir-focus` if your team works in the same sub-project.** If everyone on the team is working in `InControl.Carps.Mobile`, checking in `.mimir-focus` means the right focus is active from the first session with no manual setup.
 
 ---
 

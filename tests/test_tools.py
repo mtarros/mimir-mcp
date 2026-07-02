@@ -780,3 +780,60 @@ class TestCliDispatch:
 
     def test_help_text_documents_hint(self):
         assert "mimir hint" in mimir._CLI_HELP
+
+
+# ---------------------------------------------------------------------------
+# _notes_for_path — display helper for record_note
+# ---------------------------------------------------------------------------
+
+class TestNotesForPath:
+    def test_single_match(self):
+        weights = {"src/service.py": ["watch the retry logic"]}
+        result = mimir._notes_for_path("src/service.py", weights=weights)
+        assert result == ["note: watch the retry logic"]
+
+    def test_no_match_returns_empty(self):
+        weights = {"src/other.py": ["irrelevant"]}
+        assert mimir._notes_for_path("src/service.py", weights=weights) == []
+
+    def test_empty_source_returns_empty(self):
+        assert mimir._notes_for_path("src/service.py", weights={}) == []
+
+    def test_substring_match_not_just_startswith(self):
+        # Same convention as _FOCUS_WEIGHTS: substring, not path-segment-aware.
+        weights = {"service": ["generic service note"]}
+        result = mimir._notes_for_path("src/UserService.py", weights=weights)
+        assert result == ["note: generic service note"]
+
+    def test_multiple_nested_prefixes_longest_first(self):
+        weights = {
+            "src": ["broad src note"],
+            "src/auth": ["specific auth note"],
+        }
+        result = mimir._notes_for_path("src/auth/login.py", weights=weights)
+        assert result == ["note: specific auth note", "note: broad src note"]
+
+    def test_multiple_notes_under_one_prefix_all_shown(self):
+        weights = {"src/service.py": ["first note", "second note"]}
+        result = mimir._notes_for_path("src/service.py", weights=weights)
+        assert result == ["note: first note", "note: second note"]
+
+    def test_truncates_beyond_max_shown(self):
+        weights = {"src/service.py": [f"note {i}" for i in range(mimir._NOTES_MAX_SHOWN + 5)]}
+        result = mimir._notes_for_path("src/service.py", weights=weights)
+        assert len(result) == mimir._NOTES_MAX_SHOWN + 1  # +1 for the "(+N more)" line
+        assert "more" in result[-1]
+        assert "+5" in result[-1]
+
+    def test_long_note_truncated_with_ellipsis(self):
+        long_note = "x" * (mimir._NOTE_MAX_CHARS + 50)
+        weights = {"src/service.py": [long_note]}
+        result = mimir._notes_for_path("src/service.py", weights=weights)
+        assert len(result) == 1
+        assert result[0].endswith("…")
+        assert len(result[0]) < len(f"note: {long_note}")
+
+    def test_defaults_to_module_global(self, monkeypatch):
+        monkeypatch.setattr(mimir, "_MIMIRNOTES", {"src/service.py": ["from global dict"]})
+        result = mimir._notes_for_path("src/service.py")
+        assert result == ["note: from global dict"]
