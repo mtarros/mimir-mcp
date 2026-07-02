@@ -75,13 +75,14 @@ The command is safe to re-run — it skips any file that already exists, and onl
 You don't need an AI client to query the index. Run these directly in your terminal from inside any project that has mimir set up:
 
 ```bash
-mimir scope "change how jobs are retried on failure"   # find relevant files
+mimir hint   "quiet zone notification volume"          # discover what the codebase calls things
+mimir scope  "change how jobs are retried on failure"   # find relevant files
 mimir find   JobScheduler                              # locate a symbol definition
 mimir callers authenticate                             # find every call site
 mimir status                                           # check index state + exclusions
 ```
 
-These are the same tools Claude uses — you can explore a codebase, verify a symbol exists, or trace call chains without opening a chat session.
+These are the same tools Claude uses — you can explore a codebase, verify a symbol exists, or trace call chains without opening a chat session. `mimir hint` is worth running yourself before writing an AI prompt from a vague ticket: it shows you the actual symbol/class names the codebase uses for the terms you typed, so you can spot right away if your search vocabulary doesn't overlap the code's (e.g. business/support language like "quiet zone" that has no lexical match anywhere) before spending a prompt on it.
 
 ---
 

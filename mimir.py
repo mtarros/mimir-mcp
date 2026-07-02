@@ -380,6 +380,12 @@ _DEF_LINE_PAT = re.compile(
 # List of (rel, stem_lower, dir_lower) tuples — avoids Path.relative_to() and .stem
 # on every scope_task call. Built once in _warm_cache(); rebuilt on file-list TTL expiry.
 _PATH_STRINGS: list[tuple[str, str, str]] = []
+# Inverted index: lowercase path-component token -> indices into _PATH_STRINGS.
+# Lets scope_task's path-matching loop visit only candidate files instead of
+# scanning every source file on every call (O(matches) instead of O(files) —
+# matters most on 30k+ file repos where the old linear scan dominated latency).
+_PATH_TOKEN_INDEX: dict[str, list[int]] = {}
+_PATH_WORD_RE = re.compile(r'[A-Za-z0-9]+')
 _PATH_STRINGS_TS: float = 0.0
 
 # Optional ripgrep accelerator for find_callers. If `rg` is on PATH it replaces
@@ -1737,30 +1743,40 @@ def _symbol_hits(name: str, max_results: int = 25) -> list[tuple[str, str, str]]
 
 
 def _symbol_hits_multi(
-    names: list[str], max_per_kw: int = 10
+    names: list[str], max_per_kw: int | dict[str, int] = 10
 ) -> dict[str, list[tuple[str, str, str]]]:
     """Multi-keyword search across blueprints.
 
     Uses the SQLite inverted index when available (fast path), otherwise
     falls back to a single-pass linear scan through the blueprint cache.
     Returns {keyword: [(rel_path, line_no, sig), ...]} for every keyword.
+
+    max_per_kw may be a single int (uniform cap) or a {keyword: cap} dict for
+    a per-keyword cap — callers use this to fetch deep on rare/high-IDF
+    keywords and shallow on common ones, since common keywords saturate the
+    scope_task scoring cap after a handful of hits regardless of how many
+    more rows are fetched.
     """
+    def _cap(name: str) -> int:
+        return max_per_kw.get(name, 10) if isinstance(max_per_kw, dict) else max_per_kw
+
     if _FTS_READY and _DISK_CACHE is not None:
         try:
             hits: dict[str, list[tuple[str, str, str]]] = {n: [] for n in names}
             for name in names:
+                cap = _cap(name)
                 word_re = re.compile(rf"(?<![\w]){re.escape(name)}(?![\w])")
                 rows = _DISK_CACHE.execute(
                     "SELECT l.file, l.lineno, l.context"
                     " FROM symbols s JOIN lines l ON s.file=l.file AND s.lineno=l.lineno"
                     " WHERE s.token=? LIMIT ?",
-                    (name, max_per_kw * 4),
+                    (name, cap * 4),
                 ).fetchall()
                 name_lc = name.lower()
                 for f, l, c in rows:
                     if word_re.search(c) or name_lc in c.lower():
                         hits[name].append((f, l, c))
-                        if len(hits[name]) >= max_per_kw:
+                        if len(hits[name]) >= cap:
                             break
             return hits
         except Exception:
@@ -1768,6 +1784,7 @@ def _symbol_hits_multi(
 
     patterns = {n: re.compile(rf"(?<![\w]){re.escape(n)}(?![\w])") for n in names}
     names_lc = {n: n.lower() for n in names}
+    caps = {n: _cap(n) for n in names}
     hits = {n: [] for n in names}
     saturated: set[str] = set()
 
@@ -1795,7 +1812,7 @@ def _symbol_hits_multi(
                 m = re.match(r"L(\d+)\s*(.*)", bl.strip())
                 if m:
                     hits[name].append((rel, m.group(1), m.group(2).strip()))
-                    if len(hits[name]) >= max_per_kw:
+                    if len(hits[name]) >= caps[name]:
                         saturated.add(name)
                         break
 
@@ -1913,6 +1930,13 @@ def _extract_path_keywords(task: str) -> list[str]:
     _path_stops = frozenset({
         "the", "and", "for", "with", "how", "add", "fix", "new", "get", "set",
         "use", "make", "do", "in", "on", "at", "to", "of", "by", "or", "a",
+        # Common English connectives/negation — near-zero path-search value,
+        # but short enough to coincidentally substring-match real identifiers
+        # (e.g. "not" inside "Notification"). Excluding them costs nothing
+        # under substring matching (they were never real signal) and avoids
+        # spurious candidates now that path matching is token-indexed.
+        "not", "are", "was", "has", "had", "can", "may", "but", "all", "any",
+        "out", "off", "yet", "too", "own",
     })
     words = re.findall(r'[a-zA-Z]{3,}', task.lower())
     # Split CamelCase terms into sub-components (min 4 chars to avoid noise)
@@ -2244,20 +2268,48 @@ def _index_blueprint_rows(rel: str, blueprint: str) -> list[tuple[str, str, str]
     return rows
 
 
+def _path_component_tokens(original: str) -> set[str]:
+    """Tokenize a filename stem or directory path into lowercase search tokens.
+
+    Splits on non-alphanumeric boundaries (path separators, dashes, dots,
+    underscores) and CamelCase humps — same splitting logic as
+    _decompose_identifier, but with a 2-char floor instead of 4, since path
+    components are often short (vm, ui, api) and still meaningful for
+    path matching. Must run on the ORIGINAL-case string; CamelCase boundaries
+    are invisible once lowercased.
+    """
+    tokens: set[str] = set()
+    for word in _PATH_WORD_RE.findall(original):
+        tokens.add(word.lower())
+        for part in (_CAMEL_SPLIT_RE.findall(word) or ()):
+            if len(part) >= 2:
+                tokens.add(part.lower())
+    return tokens
+
+
 def _build_path_strings() -> None:
-    """Pre-compute (rel, stem_lower, dir_lower) for every source file.
+    """Pre-compute (rel, stem_lower, dir_lower) for every source file, plus
+    an inverted token index (_PATH_TOKEN_INDEX) for candidate narrowing.
 
     Avoids repeated Path.relative_to() / .stem calls in the scope_task path loop,
-    reducing that loop from ~47ms to ~3ms on 2k-file repos.
+    reducing that loop from ~47ms to ~3ms on 2k-file repos. The token index
+    additionally lets that loop skip files with no chance of matching at all
+    on large repos, rather than substring-checking every file.
     """
-    global _PATH_STRINGS, _PATH_STRINGS_TS
+    global _PATH_STRINGS, _PATH_STRINGS_TS, _PATH_TOKEN_INDEX
     result: list[tuple[str, str, str]] = []
-    for src_path in _iter_source_files():
+    token_index: dict[str, list[int]] = {}
+    for idx, src_path in enumerate(_iter_source_files()):
         rel = str(src_path.relative_to(WORKSPACE_ROOT))
         stem_lc = src_path.stem.lower()
-        dir_lc = str(src_path.parent.relative_to(WORKSPACE_ROOT)).lower()
+        rel_dir = src_path.parent.relative_to(WORKSPACE_ROOT)
+        dir_lc = str(rel_dir).lower()
         result.append((rel, stem_lc, dir_lc))
+        tokens = _path_component_tokens(src_path.stem) | _path_component_tokens(str(rel_dir))
+        for tok in tokens:
+            token_index.setdefault(tok, []).append(idx)
     _PATH_STRINGS = result
+    _PATH_TOKEN_INDEX = token_index
     _PATH_STRINGS_TS = time.monotonic()
 
 
@@ -2907,12 +2959,21 @@ def scope_task(task: str, max_files: int = 5, include_blueprints: bool = False, 
     _sub_kws = _sub_kws[:16]
     _sub_kw_set = set(_sub_kws)
 
+    # Adaptive per-keyword sample depth: only truly ubiquitous (idf < 0.25 —
+    # the same threshold the diversity multiplier already uses to mean
+    # "not meaningfully distinctive") keywords get a shallow sample; they
+    # saturate the _KW_CAP scoring cap after ~3 definition hits regardless of
+    # how many more rows are fetched, so fetching 40 for them is wasted SQL +
+    # Python work. Everything else keeps the deep cap — SQL rows aren't
+    # relevance-ordered, so a moderately-common-but-still-specific keyword
+    # (e.g. a domain identifier used in 10% of files) genuinely needs the
+    # deeper sample to have a chance of surfacing the one row that matters;
+    # a mid-tier cap here was tried and cost a real ticket its #1 rank.
+    # Pre-warmup, _idf_weight returns 1.0 for everything, so every keyword
+    # gets the deep cap — identical to the prior uniform-40 behavior.
+    _kw_caps = {kw: (10 if _idf_weight(kw) < 0.25 else 40) for kw in valid_kws + _sub_kws}
     try:
-        # 40 hits/keyword (was 10): with IDF controlling common-word inflation,
-        # a bigger sample matters more than a small cap — at 10, a keyword
-        # present in 100+ files had its hits sampled so sparsely the right
-        # file's evidence was often simply never fetched.
-        multi_hits = _symbol_hits_multi(valid_kws + _sub_kws, max_per_kw=40)
+        multi_hits = _symbol_hits_multi(valid_kws + _sub_kws, max_per_kw=_kw_caps)
     except Exception:
         multi_hits = {}
 
@@ -2955,22 +3016,52 @@ def scope_task(task: str, max_files: int = 5, include_blueprints: bool = False, 
 
     # Path-based supplement: files whose name/directory contains task keywords.
     # Filename stem matches score 3×, directory matches 1×.
-    # Uses _PATH_STRINGS (pre-computed at warmup) — avoids Path.relative_to() overhead
-    # on every call. Falls back to live walk if the cache is empty.
+    # _PATH_TOKEN_INDEX (pre-computed at warmup) narrows the scan to files
+    # whose stem/dir contains at least one path keyword as a token — turning
+    # this from O(all files) to O(candidate files) on every scope_task call,
+    # which matters most on 30k+ file repos where the old full scan dominated
+    # per-query latency. A keyword can still be a genuine mid-word substring
+    # match that isn't at a token boundary (e.g. "man" inside "Human...");
+    # for the (typically rare) query keyword with ZERO index hits at all, we
+    # fall back to a bounded substring scan for just that keyword — recovers
+    # the coincidental-but-real matches without paying full-scan cost when
+    # (as usual) every keyword already hit the index via its whole-word token.
+    # Falls back to a full linear scan if the index isn't built yet.
     path_kws = _extract_path_keywords(expanded)
     if path_kws:
-        path_source = _PATH_STRINGS if _PATH_STRINGS else [
-            (
-                str(src_path.relative_to(WORKSPACE_ROOT)),
-                src_path.stem.lower(),
-                str(src_path.parent.relative_to(WORKSPACE_ROOT)).lower(),
-            )
-            for src_path in _iter_source_files()
-        ]
         # IDF-scaled with a 0.3 floor: a filename-stem match stays high-signal
         # even for a common word ("email" → EmailService.cs must keep working).
         _path_idf = {kw: max(0.3, min(_idf_weight(kw), 1.0)) for kw in path_kws}
         try:
+            if _PATH_STRINGS and _PATH_TOKEN_INDEX:
+                # Fast path: narrow to candidates via the inverted index.
+                candidates: set[int] = set()
+                missed_kws = []
+                for kw in path_kws:
+                    hits = _PATH_TOKEN_INDEX.get(kw)
+                    if hits:
+                        candidates.update(hits)
+                    else:
+                        missed_kws.append(kw)
+                if missed_kws:
+                    for i, (_rel, stem_lc, dir_lc) in enumerate(_PATH_STRINGS):
+                        if any(kw in stem_lc or kw in dir_lc for kw in missed_kws):
+                            candidates.add(i)
+                path_source = (_PATH_STRINGS[i] for i in candidates)
+            elif _PATH_STRINGS:
+                # Index not built yet but the precomputed list is — scan it
+                # directly rather than falling all the way to a live disk
+                # walk (matches the tool's pre-index behavior exactly).
+                path_source = iter(_PATH_STRINGS)
+            else:
+                path_source = (
+                    (
+                        str(src_path.relative_to(WORKSPACE_ROOT)),
+                        src_path.stem.lower(),
+                        str(src_path.parent.relative_to(WORKSPACE_ROOT)).lower(),
+                    )
+                    for src_path in _iter_source_files()
+                )
             for rel, stem_lc, dir_lc in path_source:
                 score = sum((3 if kw in stem_lc else (1 if kw in dir_lc else 0))
                             * _path_idf[kw]
@@ -4653,6 +4744,8 @@ SETUP (run once per project)
                             then restart Claude Code or reload VS Code
 
 TERMINAL COMMANDS
+  mimir hint   "<rough terms>"  Cheap first pass: discover what the codebase calls
+                                things before writing a scope/AI prompt
   mimir scope  "<task>"    Find files relevant to a plain-English task description
   mimir find   <Symbol>    Locate a symbol definition across the workspace
   mimir callers <Symbol>   Find every call site and usage of a symbol
@@ -4660,6 +4753,7 @@ TERMINAL COMMANDS
   mimir --help             Show this help
 
 EXAMPLES
+  mimir hint  "quiet zone notification volume"
   mimir scope "change how jobs are retried on failure"
   mimir find   JobScheduler
   mimir callers authenticate
@@ -4711,7 +4805,9 @@ def _cli_run(subcommand: str, arg: str) -> None:
     _load_disk_cache()
     _warm_cache()   # synchronous — small wait for full accuracy on first run
 
-    if subcommand == "scope":
+    if subcommand == "hint":
+        print(scope_hint(arg))
+    elif subcommand == "scope":
         print(scope_task(arg))
     elif subcommand == "find":
         print(verify_symbol_existence(arg))
@@ -4732,11 +4828,17 @@ def main() -> None:
     """
     args = sys.argv[1:]
 
-    if args and args[0] in ("scope", "find", "callers", "status"):
+    _CLI_ARG_HINT = {
+        "hint": "rough terms",
+        "scope": "task description",
+        "find": "SymbolName",
+        "callers": "SymbolName",
+    }
+    if args and args[0] in (*_CLI_ARG_HINT, "status"):
         subcommand = args[0]
         arg = " ".join(args[1:]) if len(args) > 1 else ""
         if subcommand != "status" and not arg:
-            print(f"Usage: mimir {subcommand} <{'task description' if subcommand == 'scope' else 'SymbolName'}>")
+            print(f"Usage: mimir {subcommand} <{_CLI_ARG_HINT[subcommand]}>")
             sys.exit(1)
         _cli_run(subcommand, arg)
         return

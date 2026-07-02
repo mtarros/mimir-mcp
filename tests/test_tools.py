@@ -740,3 +740,43 @@ class TestFocusWildcard:
         weights = mimir._load_focus()
         assert weights.get("android") == 5.0
         assert weights.get("*") == 0.1
+
+
+# ---------------------------------------------------------------------------
+# CLI dispatch — mimir <subcommand> <arg>
+# ---------------------------------------------------------------------------
+
+class TestCliDispatch:
+    """mimir.main() parses argv and routes to _cli_run; _cli_run calls the
+    matching tool function and prints its result. These tests exercise the
+    dispatch table directly rather than spawning a subprocess."""
+
+    def test_hint_subcommand_calls_scope_hint(self, monkeypatch, capsys):
+        calls = []
+        monkeypatch.setattr(mimir, "_load_disk_cache", lambda: None)
+        monkeypatch.setattr(mimir, "_warm_cache", lambda: None)
+        monkeypatch.setattr(mimir, "scope_hint", lambda terms: calls.append(terms) or "HINT OUTPUT")
+
+        mimir._cli_run("hint", "quiet zone notification")
+
+        assert calls == ["quiet zone notification"]
+        assert "HINT OUTPUT" in capsys.readouterr().out
+
+    def test_main_routes_hint_args_to_cli_run(self, monkeypatch):
+        seen = {}
+        monkeypatch.setattr(mimir.sys, "argv", ["mimir", "hint", "quiet", "zone"])
+        monkeypatch.setattr(mimir, "_cli_run", lambda sub, arg: seen.update(sub=sub, arg=arg))
+
+        mimir.main()
+
+        assert seen == {"sub": "hint", "arg": "quiet zone"}
+
+    def test_main_hint_without_arg_prints_usage_and_exits(self, monkeypatch, capsys):
+        monkeypatch.setattr(mimir.sys, "argv", ["mimir", "hint"])
+        with pytest.raises(SystemExit) as exc_info:
+            mimir.main()
+        assert exc_info.value.code == 1
+        assert "Usage: mimir hint" in capsys.readouterr().out
+
+    def test_help_text_documents_hint(self):
+        assert "mimir hint" in mimir._CLI_HELP

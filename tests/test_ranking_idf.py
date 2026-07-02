@@ -134,6 +134,12 @@ USAGE_SIG = "x = SomeUsage.Call()"                       # no def-pattern match
 DEF_SIG = "public class {0} : BaseService"               # def-pattern match
 
 
+def _cap_for(max_per_kw, kw: str, default: int = 10) -> int:
+    """_symbol_hits_multi's max_per_kw may be a uniform int or a per-keyword
+    dict (scope_task now sizes it by IDF) — mirror that contract in mocks."""
+    return max_per_kw.get(kw, default) if isinstance(max_per_kw, dict) else max_per_kw
+
+
 def _ranked(out: str) -> list[tuple[str, float]]:
     files = []
     in_section = False
@@ -171,7 +177,7 @@ class TestScopeTaskIdfRanking:
                 if k in ("types", "operative"):
                     # decoy racks up many usage hits on common words
                     hits[kw] = [("decoy.cs", str(10 + i), USAGE_SIG)
-                                for i in range(max_per_kw)]
+                                for i in range(_cap_for(max_per_kw, kw))]
                 elif k in ("unavailable", "categories"):
                     hits[kw] = [("target.cs", "5", DEF_SIG.format("UnavailableTypeService")),
                                 ("target.cs", "40", USAGE_SIG)]
@@ -219,7 +225,7 @@ class TestScopeTaskIdfRanking:
                                 ("vm.cs", "90", USAGE_SIG)]
                 elif k in ("types", "operative"):
                     hits[kw] = [("decoy.cs", str(10 + i), USAGE_SIG)
-                                for i in range(max_per_kw)]
+                                for i in range(_cap_for(max_per_kw, kw))]
             return hits
 
         monkeypatch.setattr(mimir, "_symbol_hits_multi", fake_hits)
@@ -241,7 +247,7 @@ class TestScopeTaskIdfRanking:
                                  DEF_SIG.format("UnavailableTypeService"))]
                 elif kw.lower() in ("types", "operative"):
                     hits[kw] = [("decoy.cs", str(10 + i), USAGE_SIG)
-                                for i in range(max_per_kw)]
+                                for i in range(_cap_for(max_per_kw, kw))]
             return hits
 
         monkeypatch.setattr(mimir, "_symbol_hits_multi", fake_hits)
@@ -259,3 +265,117 @@ class TestScopeTaskIdfRanking:
         out = mimir.scope_task("unavailable categories operative types", max_files=5)
         names = [f for f, _ in _ranked(out)]
         assert names and names[0] == "decoy.cs", f"got {names}"
+
+    def test_adaptive_max_per_kw_reaches_symbol_hits(self, monkeypatch):
+        # Common (low-IDF) keywords should request a shallow sample; rare
+        # (high-IDF) keywords a deep one — this is the whole point of sizing
+        # max_per_kw by IDF instead of a uniform 40.
+        seen_caps: dict[str, int] = {}
+
+        def fake_hits(kws, max_per_kw=10):
+            for kw in kws:
+                seen_caps[kw] = _cap_for(max_per_kw, kw)
+            return {}
+
+        monkeypatch.setattr(mimir, "_symbol_hits_multi", fake_hits)
+        mimir.scope_task("unavailable categories operative types", max_files=5)
+        assert seen_caps["types"] < seen_caps["unavailable"], seen_caps
+        assert seen_caps["types"] == 10       # idf < 0.25 -> shallow sample
+        assert seen_caps["unavailable"] == 40  # everything else -> deep sample
+
+
+# ---------------------------------------------------------------------------
+# Path-token index — inverted index for scope_task's path-matching loop
+# ---------------------------------------------------------------------------
+
+class TestPathTokenIndex:
+    def test_build_indexes_camelcase_and_whole_stem(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(mimir, "WORKSPACE_ROOT", tmp_path)
+        (tmp_path / "EmailNotificationService.cs").write_text("class A {}\n")
+        (tmp_path / "Unrelated.cs").write_text("class B {}\n")
+        monkeypatch.setattr(mimir, "_FILE_LIST", [])
+        monkeypatch.setattr(mimir, "_FILE_LIST_TS", 0.0)
+
+        mimir._build_path_strings()
+        try:
+            idx = mimir._PATH_TOKEN_INDEX
+            assert "email" in idx
+            assert "notification" in idx
+            assert "emailnotificationservice" in idx
+            rel = mimir._PATH_STRINGS[idx["email"][0]][0]
+            assert rel == "EmailNotificationService.cs"
+            assert "unrelated" in idx
+            assert idx["unrelated"] != idx.get("email")
+        finally:
+            mimir._PATH_STRINGS = []
+            mimir._PATH_TOKEN_INDEX = {}
+
+    def test_token_index_candidates_subset_of_linear_scan(self, monkeypatch):
+        # The index narrows candidates conservatively — it must never surface
+        # a file the full substring scan wouldn't also find. It CAN miss
+        # matches the full scan finds via cross-boundary/non-token substrings
+        # (e.g. "service" inside directory "services") — that's the accepted
+        # precision/speed trade documented at the call site.
+        _install_df(monkeypatch, {}, n=0)  # neutral IDF (pre-warmup)
+        monkeypatch.setattr(mimir, "_SEMANTIC_READY", True)
+        monkeypatch.setattr(mimir, "_REVERSE_IMPORTS", {})
+        monkeypatch.setattr(mimir, "_git_recency_scores", lambda: {})
+        monkeypatch.setattr(mimir, "_FOCUS_WEIGHTS", {})
+        monkeypatch.setattr(mimir, "_AVG_NLINES", 0.0)
+        monkeypatch.setattr(mimir, "_symbol_hits_multi", lambda kws, max_per_kw=10: {})
+
+        # (rel, ORIGINAL-case stem, ORIGINAL-case dir) — tokenized like real
+        # _build_path_strings does (before lowering); path_strings mirrors
+        # the lowered tuple shape scope_task actually consumes.
+        originals = [
+            ("Services/EmailNotificationService.cs", "EmailNotificationService", "Services"),
+            ("Services/Unrelated.cs", "Unrelated", "Services"),
+            ("Models/Email.cs", "Email", "Models"),
+        ]
+        path_strings = [(rel, stem.lower(), dir_.lower()) for rel, stem, dir_ in originals]
+        token_index: dict[str, list[int]] = {}
+        for i, (_, stem, dir_) in enumerate(originals):
+            for tok in mimir._path_component_tokens(stem) | mimir._path_component_tokens(dir_):
+                token_index.setdefault(tok, []).append(i)
+
+        def run(with_index: bool) -> list[str]:
+            monkeypatch.setattr(mimir, "_PATH_STRINGS", path_strings)
+            monkeypatch.setattr(mimir, "_PATH_TOKEN_INDEX", token_index if with_index else {})
+            out = mimir.scope_task("email notification service", max_files=10)
+            return set(f for f, _ in _ranked(out))
+
+        indexed, full_scan = run(with_index=True), run(with_index=False)
+        assert indexed <= full_scan, f"indexed found files the full scan didn't: {indexed - full_scan}"
+        # Both must still find the token-aligned, unambiguous match.
+        assert "Services/EmailNotificationService.cs" in indexed
+        assert "Models/Email.cs" in indexed
+
+    def test_token_aligned_query_matches_identically(self, monkeypatch):
+        # For keywords that align to real path tokens (the common case —
+        # queries drawn from ticket text rarely need cross-boundary
+        # substrings), indexed and full-scan results must be identical.
+        _install_df(monkeypatch, {}, n=0)
+        monkeypatch.setattr(mimir, "_SEMANTIC_READY", True)
+        monkeypatch.setattr(mimir, "_REVERSE_IMPORTS", {})
+        monkeypatch.setattr(mimir, "_git_recency_scores", lambda: {})
+        monkeypatch.setattr(mimir, "_FOCUS_WEIGHTS", {})
+        monkeypatch.setattr(mimir, "_AVG_NLINES", 0.0)
+        monkeypatch.setattr(mimir, "_symbol_hits_multi", lambda kws, max_per_kw=10: {})
+
+        originals = [
+            ("Services/EmailNotificationService.cs", "EmailNotificationService", "Services"),
+            ("Models/JobModel.cs", "JobModel", "Models"),
+        ]
+        path_strings = [(rel, stem.lower(), dir_.lower()) for rel, stem, dir_ in originals]
+        token_index: dict[str, list[int]] = {}
+        for i, (_, stem, dir_) in enumerate(originals):
+            for tok in mimir._path_component_tokens(stem) | mimir._path_component_tokens(dir_):
+                token_index.setdefault(tok, []).append(i)
+
+        def run(with_index: bool) -> list[str]:
+            monkeypatch.setattr(mimir, "_PATH_STRINGS", path_strings)
+            monkeypatch.setattr(mimir, "_PATH_TOKEN_INDEX", token_index if with_index else {})
+            out = mimir.scope_task("email notification", max_files=10)
+            return sorted(f for f, _ in _ranked(out))
+
+        assert run(with_index=True) == run(with_index=False) == ["Services/EmailNotificationService.cs"]
