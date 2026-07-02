@@ -55,7 +55,9 @@ TS_REL  = "src/api/jobQueue.ts"
 
 @pytest.fixture
 def db():
-    """In-memory SQLite database with the normalized schema."""
+    """In-memory SQLite database with the normalized schema (matches production:
+    token is COLLATE NOCASE so lookups are case-insensitive but storage/display
+    keeps the original casing — see mimir._init_disk_cache)."""
     conn = sqlite3.connect(":memory:")
     conn.execute(
         "CREATE TABLE lines"
@@ -64,7 +66,7 @@ def db():
     )
     conn.execute(
         "CREATE TABLE symbols"
-        " (token TEXT NOT NULL, file TEXT NOT NULL, lineno TEXT NOT NULL)"
+        " (token TEXT NOT NULL COLLATE NOCASE, file TEXT NOT NULL, lineno TEXT NOT NULL)"
     )
     conn.execute("CREATE INDEX idx_symbols_token ON symbols (token)")
     conn.commit()
@@ -348,6 +350,53 @@ class TestSearchCorrectness:
         db, _ = populated_db
         results = self._sql_hits(db, "NonExistentSymbolXYZ")
         assert results == []
+
+
+# ---------------------------------------------------------------------------
+# Case-insensitive token lookup (COLLATE NOCASE) — real mimir functions
+# ---------------------------------------------------------------------------
+
+class TestCaseInsensitiveLookup:
+    """A lowercase query must find a mixed-case token — e.g. querying 'signalr'
+    must find a symbol actually named 'SignalR', case-preserved in the result.
+    Regression test for a real bug: the symbols table used to be case-sensitive,
+    so scope_hint/scope_task/verify_symbol_existence silently found nothing for
+    a casually-lowercased technology name that was correctly cased in the code."""
+
+    @pytest.fixture(autouse=True)
+    def wire_up(self, db, monkeypatch):
+        _populate(db, CS_REL, SAMPLE_CS)
+        _populate(db, PY_REL, SAMPLE_PY)
+        _populate(db, TS_REL, SAMPLE_TS)
+        monkeypatch.setattr(mimir, "_DISK_CACHE", db)
+        monkeypatch.setattr(mimir, "_FTS_READY", True)
+
+    def test_symbol_hits_lowercase_query_finds_mixedcase_token(self):
+        hits = mimir._symbol_hits("userservice")
+        assert hits, "lowercase query found nothing for token stored as 'UserService'"
+        assert any("UserService" in ctx for _, _, ctx in hits), (
+            "result should show the token's real (mixed-case) casing, not the query's"
+        )
+
+    def test_symbol_hits_uppercase_query_finds_lowercase_token(self):
+        hits = mimir._symbol_hits("AUTHENTICATE")
+        assert hits, "uppercase query found nothing for token stored as 'authenticate'"
+
+    def test_symbol_hits_multi_case_insensitive(self):
+        hits = mimir._symbol_hits_multi(["getbyid", "JOBQUEUESERVICE"])
+        assert hits.get("getbyid"), "lowercase multi-query missed 'GetById'"
+        assert hits.get("JOBQUEUESERVICE"), "uppercase multi-query missed 'JobQueueService'"
+
+    def test_case_insensitive_query_matches_correct_case_query(self):
+        assert mimir._symbol_hits("processjob") == mimir._symbol_hits("processJob")
+
+    def test_still_respects_word_boundaries_case_insensitively(self):
+        # "get" (lowercase) must not match inside "GetById"/"GetAll".
+        hits = mimir._symbol_hits("get")
+        for _, _, ctx in hits:
+            assert re.search(r"(?<!\w)get(?!\w)", ctx, re.IGNORECASE), (
+                f"'get' matched inside a longer token in: {ctx!r}"
+            )
 
 
 # ---------------------------------------------------------------------------

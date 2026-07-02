@@ -298,7 +298,7 @@ _SYMBOL_STOPWORDS = frozenset({
 
 # Increment when the blueprint text format changes so cached blueprints are
 # automatically invalidated and re-parsed on the next server start.
-BLUEPRINT_VERSION = "7"  # bump when index schema or tokenisation changes
+BLUEPRINT_VERSION = "8"  # bump when index schema or tokenisation changes
 
 # Splits PascalCase / camelCase into components: 'StartAutoRefresh' → ['Start','Auto','Refresh']
 _CAMEL_SPLIT_RE = re.compile(r'[A-Z][a-z0-9]*|[a-z][a-z0-9]*')
@@ -321,12 +321,27 @@ def _init_disk_cache() -> "Optional[object]":
             "CREATE TABLE IF NOT EXISTS blueprints"
             " (path TEXT PRIMARY KEY, mtime REAL, size INTEGER, blueprint TEXT)"
         )
+        db.execute(
+            "CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT)"
+        )
+        # Check the stored schema version BEFORE creating lines/symbols — a
+        # version bump may require the symbols table itself to be dropped and
+        # recreated (e.g. adding COLLATE NOCASE to `token`), which a plain
+        # "CREATE TABLE IF NOT EXISTS" would silently skip on an existing table.
+        stored = db.execute(
+            "SELECT value FROM meta WHERE key='blueprint_version'"
+        ).fetchone()
+        version_changed = stored is None or stored[0] != BLUEPRINT_VERSION
+        if version_changed:
+            db.execute("DROP TABLE IF EXISTS symbols")
+            db.execute("DROP TABLE IF EXISTS lines")
+
         # Normalized symbol index: lines holds context (one row per definition line),
         # symbols holds tokens (one row per token — no context duplication).
-        # Migrate from the old denormalized schema if needed.
+        # Migrate from the old denormalized schema if needed (belt-and-suspenders —
+        # the version_changed drop above already covers this on a version bump).
         try:
             db.execute("SELECT context FROM symbols LIMIT 0")
-            # Old schema with context column present — rebuild both tables.
             db.execute("DROP TABLE symbols")
             db.execute("DROP TABLE IF EXISTS lines")
         except Exception:
@@ -336,15 +351,17 @@ def _init_disk_cache() -> "Optional[object]":
             " (file TEXT NOT NULL, lineno TEXT NOT NULL, context TEXT NOT NULL,"
             "  PRIMARY KEY (file, lineno))"
         )
+        # token is COLLATE NOCASE so lookups (and the index) are case-insensitive —
+        # e.g. querying "signalr" finds a stored token "SignalR". Tokens are still
+        # STORED exactly as they appear in source; only comparison/ordering ignores
+        # case. Data is preserved verbatim; case-preserved values are what's shown
+        # in tool output, e.g. "FOUND ... -> SignalR".
         db.execute(
             "CREATE TABLE IF NOT EXISTS symbols"
-            " (token TEXT NOT NULL, file TEXT NOT NULL, lineno TEXT NOT NULL)"
+            " (token TEXT NOT NULL COLLATE NOCASE, file TEXT NOT NULL, lineno TEXT NOT NULL)"
         )
         db.execute(
             "CREATE INDEX IF NOT EXISTS idx_symbols_token ON symbols (token)"
-        )
-        db.execute(
-            "CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT)"
         )
         # FTS5 virtual table for semantic_search — one row per definition line.
         # file/lineno are UNINDEXED (retrieval only); symbol_name, signature, and
@@ -364,10 +381,7 @@ def _init_disk_cache() -> "Optional[object]":
         except Exception:
             pass  # FTS5 unavailable in this SQLite build; semantic_search degrades gracefully
         # Invalidate all cached blueprints when the format version changes.
-        stored = db.execute(
-            "SELECT value FROM meta WHERE key='blueprint_version'"
-        ).fetchone()
-        if stored is None or stored[0] != BLUEPRINT_VERSION:
+        if version_changed:
             db.execute("DELETE FROM blueprints")
             db.execute("DELETE FROM lines")
             db.execute("DELETE FROM symbols")
@@ -2774,10 +2788,13 @@ def verify_symbol_existence(symbol_name: str, max_results: int = 25) -> str:
     grepping raw files yourself.
 
     Args:
-        symbol_name: the exact identifier to look for (case-sensitive).
+        symbol_name: the identifier to look for. Matched case-insensitively
+                     (e.g. "signalr" finds a symbol actually named "SignalR"),
+                     but results show the symbol's real casing as defined.
         max_results: cap on matches returned (default 25).
 
-    Returns 'FOUND' lines with file:line and signature, or a clear 'NOT FOUND'.
+    Returns 'FOUND' lines with file:line and signature (in the codebase's
+    actual casing), or a clear 'NOT FOUND'.
     """
     name = symbol_name.strip()
     if not name or not re.match(r"^\w[\w]*$", name):
