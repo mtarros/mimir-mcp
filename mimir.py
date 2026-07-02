@@ -216,6 +216,32 @@ def _load_focus() -> dict[str, float]:
 _FOCUS_WEIGHTS: dict[str, float] = _load_focus()
 
 
+def _load_scope() -> "Optional[str]":
+    """Read the active hard-scope path prefix from .mimir-scope, if set.
+
+    Unlike .mimir-focus (a soft ranking bias — the rest of the repo still
+    shows up, just lower-scored), an active scope is a hard filter: every
+    search tool excludes files outside it entirely until reset_scope() is
+    called. The two are independent and can be combined.
+    """
+    p = WORKSPACE_ROOT / ".mimir-scope"
+    if not p.exists():
+        return None
+    raw = p.read_text(encoding="utf-8").strip()
+    return raw or None
+
+
+_ACTIVE_SCOPE: "Optional[str]" = _load_scope()
+
+
+def _in_scope(rel: str) -> bool:
+    """True if a workspace-relative posix path is inside the active hard
+    scope, or if no scope is set (everything is in scope)."""
+    if not _ACTIVE_SCOPE:
+        return True
+    return rel == _ACTIVE_SCOPE or rel.startswith(_ACTIVE_SCOPE + "/")
+
+
 def _parse_focus_str(raw: str) -> dict[str, float]:
     """Parse a comma-separated "prefix:weight" string into {prefix_lower: float}.
 
@@ -1777,7 +1803,7 @@ def _symbol_hits(name: str, max_results: int = 25) -> list[tuple[str, str, str]]
             name_lc = name.lower()
             hits = [
                 (f, l, c) for f, l, c in rows
-                if word_re.search(c) or name_lc in c.lower()
+                if (word_re.search(c) or name_lc in c.lower()) and _in_scope(f)
             ]
             return hits[:max_results]
         except Exception:
@@ -1789,6 +1815,8 @@ def _symbol_hits(name: str, max_results: int = 25) -> list[tuple[str, str, str]]
     for path in _iter_source_files():
         if len(hits) >= max_results:
             break
+        if not _in_scope(str(path.relative_to(WORKSPACE_ROOT))):
+            continue
         cached = _cache_get(path)
         if cached is not None:
             if name not in cached and name_lc not in cached.lower():
@@ -1848,7 +1876,7 @@ def _symbol_hits_multi(
                 ).fetchall()
                 name_lc = name.lower()
                 for f, l, c in rows:
-                    if word_re.search(c) or name_lc in c.lower():
+                    if (word_re.search(c) or name_lc in c.lower()) and _in_scope(f):
                         hits[name].append((f, l, c))
                         if len(hits[name]) >= cap:
                             break
@@ -1865,10 +1893,12 @@ def _symbol_hits_multi(
     for path in _iter_source_files():
         if len(saturated) == len(names):
             break
+        rel = str(path.relative_to(WORKSPACE_ROOT))
+        if not _in_scope(rel):
+            continue
         cached = _cache_get(path)
         blueprint = cached if cached is not None else _build_blueprint(path)
         blueprint_lc = blueprint.lower()
-        rel = str(path.relative_to(WORKSPACE_ROOT))
 
         for name in names:
             if name in saturated:
@@ -2962,42 +2992,19 @@ def scope_hint(terms: str) -> str:
     return "\n".join(lines)
 
 
-@mcp.tool()
-def scope_task(task: str, max_files: int = 5, include_blueprints: bool = False, focus: str = "") -> str:
-    """Map a plain-English task description to the specific files and symbols it
-    touches — before reading any raw file contents.
+def _score_task_files(task: str, focus: str = "") -> tuple[dict[str, float], list[str], list[tuple[str, str, str, str]], str, bool]:
+    """Shared scoring core for scope_task and scope_area.
 
-    WHEN TO USE: call this as the FIRST step on any task that involves existing
-    code. It extracts candidate symbol names from your description, searches the
-    workspace for their definitions, and returns the ranked file list with matched
-    symbols. Then call get_file_structure on the specific files you need.
+    Expands aliases, extracts keywords, and returns EVERY matched file with its
+    relevance score — unranked and untruncated (scope_task sorts and slices to
+    max_files; scope_area rolls the full set up into a directory tree).
 
-    TIP: use technical/class names when known ("RectificationFilter") rather than
-    domain language ("corrective actions filter") — the symbol index matches code
-    names, not feature names.
-
-    Args:
-        task: plain-English description of what you want to do, e.g.
-              "add retry logic to the live tutor session handler".
-        max_files: how many files to rank and return (default 5).
-        include_blueprints: set True to include full structural blueprints inline
-                            (useful for small repos; may produce large output on
-                            large repos — prefer calling get_file_structure after).
-        focus: optional comma-separated "prefix:weight" pairs applied only for
-               this call — e.g. "src/auth:3.0,src/payments:2.0".  Does not
-               modify .mimir-focus or the session-wide weights.  Overrides any
-               persistent focus weights when non-empty.
-
-    Returns a compact context block: keywords searched, matched symbols with
-    file:line locations, and ranked files by relevance score.
+    Returns (file_hit_count, keywords, all_hits, expanded_task, used_fts).
     """
     expanded = _expand_task_with_aliases(task)
     keywords = _extract_scope_keywords(expanded)
     if not keywords:
-        return (
-            "No searchable terms found in task description. "
-            "Try including class names (e.g. 'TutorSession') or function names."
-        )
+        return {}, keywords, [], expanded, False
 
     file_hit_count: dict[str, float] = {}
     all_hits: list[tuple[str, str, str, str]] = []  # (keyword, rel, line, sig)
@@ -3237,9 +3244,55 @@ def scope_task(task: str, max_files: int = 5, include_blueprints: bool = False, 
     except Exception:
         pass
 
+    # Hard-scope filter: catches every path regardless of how it entered
+    # (symbol hits, path/filename matches, forward-import expansion, reverse-
+    # dependent expansion all funnel into file_hit_count) — one filter here
+    # instead of patching every section above.
+    if _ACTIVE_SCOPE:
+        file_hit_count = {r: s for r, s in file_hit_count.items() if _in_scope(r)}
+        all_hits = [h for h in all_hits if _in_scope(h[1])]
+
+    return file_hit_count, keywords, all_hits, expanded, _used_fts
+
+
+@mcp.tool()
+def scope_task(task: str, max_files: int = 5, include_blueprints: bool = False, focus: str = "") -> str:
+    """Map a plain-English task description to the specific files and symbols it
+    touches — before reading any raw file contents.
+
+    WHEN TO USE: call this as the FIRST step on any task that involves existing
+    code. It extracts candidate symbol names from your description, searches the
+    workspace for their definitions, and returns the ranked file list with matched
+    symbols. Then call get_file_structure on the specific files you need.
+
+    TIP: use technical/class names when known ("RectificationFilter") rather than
+    domain language ("corrective actions filter") — the symbol index matches code
+    names, not feature names.
+
+    Args:
+        task: plain-English description of what you want to do, e.g.
+              "add retry logic to the live tutor session handler".
+        max_files: how many files to rank and return (default 5).
+        include_blueprints: set True to include full structural blueprints inline
+                            (useful for small repos; may produce large output on
+                            large repos — prefer calling get_file_structure after).
+        focus: optional comma-separated "prefix:weight" pairs applied only for
+               this call — e.g. "src/auth:3.0,src/payments:2.0".  Does not
+               modify .mimir-focus or the session-wide weights.  Overrides any
+               persistent focus weights when non-empty.
+
+    Returns a compact context block: keywords searched, matched symbols with
+    file:line locations, and ranked files by relevance score.
+    """
+    file_hit_count, keywords, all_hits, expanded, _used_fts = _score_task_files(task, focus)
+    if not keywords:
+        return (
+            "No searchable terms found in task description. "
+            "Try including class names (e.g. 'TutorSession') or function names."
+        )
     if not file_hit_count:
         return (
-            f"No matches found for: {', '.join(keywords or path_kws)}.\n"
+            f"No matches found for: {', '.join(keywords)}.\n"
             "Try more specific terms — class names, function names, or file path segments."
         )
 
@@ -3326,6 +3379,112 @@ def scope_task(task: str, max_files: int = 5, include_blueprints: bool = False, 
             parts.append(f"### {rel}  ({n} {'match' if n == 1 else 'matches'})\n{blueprint}\n")
 
     return "\n".join(parts)
+
+
+@mcp.tool()
+def scope_area(task: str, max_depth: int = 4, focus: str = "") -> str:
+    """Like scope_task, but rolls matches up into a directory tree instead of a
+    flat file list — shows WHERE in a large monorepo a task's matches cluster,
+    so you can `cd`/pin MCP_WORKSPACE_ROOT into that sub-project first.
+
+    WHEN TO USE: in a multi-project repo (several apps/services under one root)
+    when you don't yet know which sub-project a task lives in, or a flat
+    scope_task result is spread thin across unrelated areas. Once you know the
+    sub-project, scope_task/scope_hint run cleaner scoped to just that folder.
+    Skip this for repos that are already a single project.
+
+    Args:
+        task: plain-English description of what you want to do.
+        max_depth: how many directory levels deep to roll scores up (default 4).
+        focus: optional comma-separated "prefix:weight" pairs for this call only.
+
+    Returns an indented directory tree annotated with match scores/file counts,
+    plus a suggested `cd` target — the most specific directory that still
+    captures a real cluster (2+ files) of the top matches.
+    """
+    file_hit_count, keywords, all_hits, expanded, _used_fts = _score_task_files(task, focus)
+    if not keywords:
+        return (
+            "No searchable terms found in task description. "
+            "Try including class names (e.g. 'TutorSession') or function names."
+        )
+    if not file_hit_count:
+        return (
+            f"No matches found for: {', '.join(keywords)}.\n"
+            "Try more specific terms — class names, function names, or file path segments."
+        )
+
+    # Roll each file's score up into every ancestor directory (bounded to
+    # max_depth levels) so a folder's number reflects everything matched
+    # beneath it, not just files directly inside it.
+    dir_score: dict[str, float] = {}
+    dir_files: dict[str, int] = {}
+    for rel, score in file_hit_count.items():
+        parts = Path(rel).parts[:-1]
+        for depth in range(1, min(len(parts), max_depth) + 1):
+            d = "/".join(parts[:depth])
+            dir_score[d] = dir_score.get(d, 0.0) + score
+            dir_files[d] = dir_files.get(d, 0) + 1
+
+    if not dir_score:
+        top = sorted(file_hit_count, key=lambda f: -file_hit_count[f])[:10]
+        lines = [f"# Scope area: {task!r}\n", "All matches sit directly at the workspace root:"]
+        for rel in top:
+            lines.append(f"  {rel}  ({int(round(file_hit_count[rel]))} matches)")
+        return "\n".join(lines)
+
+    # Parent -> children edges; "" is the synthetic root holding depth-1 dirs.
+    children: dict[str, list[str]] = {}
+    for d in dir_score:
+        parent = "/".join(d.split("/")[:-1])
+        children.setdefault(parent, []).append(d)
+
+    tree_lines: list[str] = []
+
+    def render(node: str, prefix: str, top_n: int = 5) -> None:
+        kids = sorted(children.get(node, []), key=lambda d: -dir_score[d])
+        shown, hidden = kids[:top_n], kids[top_n:]
+        for i, d in enumerate(shown):
+            is_last = (i == len(shown) - 1) and not hidden
+            branch = "└─ " if is_last else "├─ "
+            name = d.split("/")[-1]
+            n = dir_files[d]
+            tree_lines.append(
+                f"{prefix}{branch}{name}/  (score {dir_score[d]:.0f}, {n} file{'s' if n != 1 else ''} matched)"
+            )
+            render(d, prefix + ("   " if is_last else "│  "), top_n=top_n)
+        if hidden:
+            tree_lines.append(f"{prefix}└─ … {len(hidden)} more folder{'s' if len(hidden) != 1 else ''} with weaker matches")
+
+    render("", "")
+
+    parts_out = [
+        f"# Scope area: {task!r}\n",
+        f"Keywords searched: {', '.join(keywords)}\n",
+        "## Folders ranked by match concentration\n",
+        *tree_lines,
+    ]
+
+    # Suggested cd target: walk the highest-scoring directories and take the
+    # first one that's a real cluster (2+ files) narrower than the full match
+    # set — skips shallow directories that just aggregate everything beneath them.
+    total_files = len(file_hit_count)
+    cd_target = None
+    for d in sorted(dir_score, key=lambda d: -dir_score[d]):
+        if 2 <= dir_files[d] < total_files:
+            cd_target = d
+            break
+    if cd_target is None:
+        cd_target = max(dir_score, key=lambda d: dir_score[d])
+
+    parts_out.append(
+        f"\n## Suggested scope\n"
+        f"  set_scope(\"{cd_target}\")   (CLI: mimir scope --set {cd_target})\n"
+        f"  ({dir_files[cd_target]} of {total_files} matched files live here — hard-narrows every "
+        f"tool call to this folder until reset_scope(), no reindex needed)"
+    )
+
+    return "\n".join(parts_out)
 
 
 @mcp.tool()
@@ -3951,6 +4110,8 @@ def find_callers(symbol_name: str, max_results: int = 20) -> str:
         path_pairs = [(WORKSPACE_ROOT / rel, rel) for rel, _, _ in _PATH_STRINGS]
     else:
         path_pairs = [(p, str(p.relative_to(WORKSPACE_ROOT))) for p in _iter_source_files()]
+    if _ACTIVE_SCOPE:
+        path_pairs = [(p, r) for p, r in path_pairs if _in_scope(r)]
 
     priority   = [(p, r) for p, r in path_pairs if r in priority_rels]
     remainder  = [(p, r) for p, r in path_pairs if r not in priority_rels]
@@ -4503,6 +4664,76 @@ def set_focus(entries: str, persist: bool = True) -> str:
 
 
 @mcp.tool()
+def set_scope(path: str) -> str:
+    """Hard-narrow every search tool (scope_task, scope_area, scope_hint,
+    verify_symbol_existence, find_callers) to only files under one directory —
+    the same effect as `cd`-ing into a sub-project before running mimir, but
+    without losing the whole-repo index or paying a reindex cost.
+
+    WHEN TO USE: in a large monorepo (multiple apps/services under one root),
+    once scope_area or a first scope_task pass tells you which sub-project a
+    task lives in, call set_scope on that directory so every subsequent call
+    in this session only sees that sub-project. Persists until reset_scope()
+    is called — it survives across separate CLI invocations and MCP calls,
+    unlike a per-call scope_task `focus=` override.
+
+    Unlike set_focus (a soft ranking bias — the rest of the repo still shows
+    up, just lower-scored), this is a hard filter: files outside the scoped
+    directory are excluded from results entirely. The two are independent and
+    can be combined (set_focus re-ranks within whatever set_scope allows through).
+
+    Args:
+        path: workspace-relative directory path, e.g. "src/carps-web". Must
+              exist under the workspace root and contain at least one
+              indexed source file.
+
+    Returns confirmation with the number of files now in scope, or an error
+    if the path doesn't exist or contains no source files.
+    """
+    global _ACTIVE_SCOPE
+    norm = path.strip().strip("/")
+    if not norm or norm == "." :
+        return "Error: pass a non-empty subdirectory path, e.g. set_scope(\"src/web\")."
+    if norm.startswith("..") or Path(norm).is_absolute():
+        return "Error: path must be a relative subdirectory inside the workspace, not '..' or absolute."
+    target = WORKSPACE_ROOT / norm
+    if not target.is_dir():
+        return f"Error: '{norm}' does not exist under the workspace root ({WORKSPACE_ROOT})."
+
+    prefix = norm + "/"
+    rels = (str(p.relative_to(WORKSPACE_ROOT)) for p in _iter_source_files())
+    count = sum(1 for r in rels if r == norm or r.startswith(prefix))
+    if count == 0:
+        return f"Error: no source files found under '{norm}' — nothing would match. Scope not changed."
+
+    try:
+        (WORKSPACE_ROOT / ".mimir-scope").write_text(norm + "\n", encoding="utf-8")
+    except OSError as e:
+        return f"Error saving scope: {e}"
+    _ACTIVE_SCOPE = norm
+    return f"Scope set: {norm} ({count} files). Call reset_scope() to search the full repo again."
+
+
+@mcp.tool()
+def reset_scope() -> str:
+    """Clear an active hard scope set by set_scope(), restoring full-repo search.
+
+    Deletes .mimir-scope and takes effect immediately — no restart needed.
+    """
+    global _ACTIVE_SCOPE
+    p = WORKSPACE_ROOT / ".mimir-scope"
+    try:
+        if p.exists():
+            p.unlink()
+    except OSError as e:
+        return f"Error clearing scope: {e}"
+    was, _ACTIVE_SCOPE = _ACTIVE_SCOPE, None
+    if was is None:
+        return "No active scope to clear — already searching the full repo."
+    return f"Scope cleared (was '{was}'). Now searching the full repo."
+
+
+@mcp.tool()
 def get_status() -> str:
     """Report the current state of the mimir index for this workspace.
 
@@ -4603,11 +4834,12 @@ def get_status() -> str:
             if _FILE_WATCHER_ACTIVE
             else "file_watcher:       off  (pip install watchdog to enable)"
         )
-        rev_line = (
-            f"reverse_imports:    {rev_count:,} files mapped"
-            if rev_count > 0
-            else "reverse_imports:    building..."
-        )
+        if rev_count > 0:
+            rev_line = f"reverse_imports:    {rev_count:,} files mapped"
+        elif _WARMUP_COMPLETE:
+            rev_line = "reverse_imports:    not loaded this run  (built on demand by scope_task, or by the MCP server)"
+        else:
+            rev_line = "reverse_imports:    building..."
 
         if _FOCUS_WEIGHTS:
             focus_entries = "  ".join(
@@ -4628,6 +4860,16 @@ def get_status() -> str:
         else:
             sem_line = "semantic_search:    building (FTS5 index pending)"
 
+        if _ACTIVE_SCOPE:
+            scope_line = (
+                f"active_scope:       {_ACTIVE_SCOPE}  (hard filter — call reset_scope() to search the full repo again)"
+            )
+        else:
+            scope_line = (
+                "active_scope:       none  (searching entire repo)\n"
+                "  → call set_scope(\"path/to/subproject\") to hard-narrow a large monorepo"
+            )
+
         lines = [
             f"workspace:          {WORKSPACE_ROOT}",
             f"source_files:       {total_files}",
@@ -4640,6 +4882,8 @@ def get_status() -> str:
             f"sandbox:            {'on' if SANDBOX_ENABLED else 'off'}",
             watcher_line,
             rev_line,
+            "",
+            scope_line,
             "",
             focus_line,
             "",
@@ -4927,22 +5171,34 @@ TERMINAL COMMANDS
   mimir hint   "<rough terms>"  Cheap first pass: discover what the codebase calls
                                 things before writing a scope/AI prompt
   mimir scope  "<task>"    Find files relevant to a plain-English task description
+  mimir area   "<task>"    Directory tree of where a task's matches cluster —
+                            useful in a monorepo to find which sub-project to scope into
+  mimir scope --set <path>  Hard-narrow every command to one directory until reset
+                            (same effect as cd, but no reindex — keeps the whole-repo
+                            index warm and just filters results)
+  mimir scope --reset       Clear an active scope, search the whole repo again
   mimir find   <Symbol>    Locate a symbol definition across the workspace
   mimir callers <Symbol>   Find every call site and usage of a symbol
-  mimir status             Show index state, file count, and active exclusions
+  mimir status             Show index state, file count, active scope, and exclusions
   mimir --help             Show this help
 
 EXAMPLES
   mimir hint  "quiet zone notification volume"
   mimir scope "change how jobs are retried on failure"
+  mimir area  "SignalR notifications"
+  mimir scope --set src/carps-web
   mimir find   JobScheduler
   mimir callers authenticate
+  mimir scope --reset
   mimir status
 
 MCP TOOLS (available to Claude Code and GitHub Copilot)
   get_status               Index state, file count, ignore patterns, domain aliases — call first
   get_architecture         High-level workspace map: directories, files, top-level symbols
   scope_task               Find relevant files from a task description
+  scope_area               Directory-tree view of where a task's matches cluster (monorepos)
+  set_scope                Hard-narrow every tool to one directory until reset_scope()
+  reset_scope              Clear an active scope, search the whole repo again
   get_file_structure       Compact symbol map of a single file (classes, methods, line nos)
   get_symbol               Full source of ONE named symbol — efficient middle ground
   get_directory_structure  Symbol maps for every file under a directory
@@ -4981,14 +5237,42 @@ AI client launches. You never need to run this manually.
 
 
 def _cli_run(subcommand: str, arg: str) -> None:
-    """Run a single tool query, print the result, and exit."""
+    """Run a single tool query, print the result, and exit.
+
+    Each CLI invocation is a fresh process — nothing persists in memory between
+    runs except what's on disk (_DISK_CACHE). _load_disk_cache() restores the
+    blueprint cache and symbol/FTS tables from the last warm run almost
+    instantly. Only run the expensive parts of _warm_cache() that a given
+    subcommand actually needs, and only do a full rebuild when the disk cache
+    isn't warm yet (first run, or repo changed enough to invalidate it).
+    """
+    global _WARMUP_COMPLETE
     _load_disk_cache()
-    _warm_cache()   # synchronous — small wait for full accuracy on first run
+    if not _FTS_READY:
+        print(f"[mimir] no warm index found — building one ({len(_iter_source_files())} files, "
+              f"first run only)...", file=sys.stderr, flush=True)
+        _warm_cache()
+    else:
+        if subcommand in ("scope", "area"):
+            # scope_task/scope_area's ranking needs these in-memory structures;
+            # they aren't persisted to disk so they must be rebuilt every
+            # process even when the symbol/FTS tables on disk are already warm.
+            print("[mimir] loading rankings...", file=sys.stderr, flush=True)
+            _build_token_df()
+            _build_path_strings()
+            _build_reverse_imports()
+        # status/hint/find/callers read straight off the disk-backed symbol
+        # and FTS tables loaded above — no further warmup needed. Either way,
+        # everything this invocation needs is ready: mark warmup complete so
+        # get_status doesn't report "in progress" for a run that's already done.
+        _WARMUP_COMPLETE = True
 
     if subcommand == "hint":
         print(scope_hint(arg))
     elif subcommand == "scope":
         print(scope_task(arg))
+    elif subcommand == "area":
+        print(scope_area(arg))
     elif subcommand == "find":
         print(verify_symbol_existence(arg))
     elif subcommand == "callers":
@@ -5006,11 +5290,34 @@ def main() -> None:
     Without arguments: starts the MCP stdio server (used by AI clients).
     With a subcommand:  runs a single query and prints the result.
     """
+    try:
+        _main()
+    except KeyboardInterrupt:
+        print("\n[mimir] cancelled", file=sys.stderr)
+        sys.exit(130)
+
+
+def _main() -> None:
     args = sys.argv[1:]
+
+    # `mimir scope --set <path>` / `mimir scope --reset` are scope-state
+    # management, distinct from `mimir scope "<task>"` (ranking query) — the
+    # leading "--" makes them unambiguous since a real task description never
+    # starts with it. Handled before the generic dispatch below.
+    if args[:1] == ["scope"] and len(args) > 1 and args[1] in ("--set", "--reset"):
+        if args[1] == "--reset":
+            print(reset_scope())
+        else:
+            if len(args) < 3:
+                print("Usage: mimir scope --set <path>")
+                sys.exit(1)
+            print(set_scope(" ".join(args[2:])))
+        return
 
     _CLI_ARG_HINT = {
         "hint": "rough terms",
         "scope": "task description",
+        "area": "task description",
         "find": "SymbolName",
         "callers": "SymbolName",
     }

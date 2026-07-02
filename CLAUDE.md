@@ -47,13 +47,15 @@ Everything lives in `mimir.py`. There is no package structure. Key sections in o
 3. **Structure extraction** — `_extract_tree_sitter()` (preferred) and `_extract_regex()` (fallback). Both return the same dense line format `L{lineno}  {indent}{signature}`. Tree-sitter blueprints additionally end with a `#strings` section listing exception/log message literals (`_literal_row`) so error text from tickets is searchable. `_build_blueprint()` orchestrates cache → tree-sitter → regex.
 4. **Warm-up** — `_warm_cache()` runs at startup: walks all source files, builds blueprints, populates `_SYMBOL_INDEX`, builds the token document-frequency cache (`_build_token_df`, backs IDF ranking + length norm), builds the FTS5 table, `_REVERSE_IMPORTS` map, and `_ARCHITECTURE_MAP`, then starts the file watcher (`watchdog`).
 5. **File watcher** — `_start_file_watcher()` invalidates `_CACHE` and `_REVERSE_IMPORTS` entries on file change/create/delete events within the workspace.
-6. **MCP tools** (20 total):
-   - `get_status` — index health, file count, exclusion patterns, domain aliases, active focus weights
-   - `set_focus` — save per-prefix score multipliers to `.mimir-focus`; takes effect immediately; `persist=False` for session-only weights
+6. **MCP tools** (23 total):
+   - `get_status` — index health, file count, exclusion patterns, domain aliases, active focus weights, active scope
+   - `set_focus` — save per-prefix score *multipliers* to `.mimir-focus` (soft ranking bias — out-of-focus files still appear, just lower-scored); takes effect immediately; `persist=False` for session-only weights
+   - `set_scope` / `reset_scope` — hard-narrow every search tool to one directory via `.mimir-scope` (files outside are excluded entirely, not just down-weighted); persists until `reset_scope()`. Distinct from `set_focus`: scope filters the result set, focus re-ranks within whatever scope allows through — the two compose. Filtering happens at the read layer (`_in_scope()`, checked in `_symbol_hits`/`_symbol_hits_multi`, the end of `_score_task_files`, and `find_callers`'s `path_pairs`), not the index layer — the full-repo index stays warm, so setting/resetting scope is instant, no reindex.
    - `get_architecture` — high-level directory/symbol map of the whole workspace
    - `get_changed_files` — blueprints of files changed vs a git base branch
    - `scope_hint` — cheap symbol lookup that returns what the codebase calls things + suggested query
-   - `scope_task` — ranked files + suggested `get_symbol` calls for a plain-English task description; BM25-style scoring (capped TF × IDF × doc-length norm) over the exact-token symbol index, plus compound-bigram search ("Unavailable Types" → `UnavailableType`); accepts optional `focus="prefix:weight"` for a per-call weight override that does not modify `.mimir-focus`
+   - `scope_task` — ranked files + suggested `get_symbol` calls for a plain-English task description; BM25-style scoring (capped TF × IDF × doc-length norm) over the exact-token symbol index, plus compound-bigram search ("Unavailable Types" → `UnavailableType`); accepts optional `focus="prefix:weight"` for a per-call weight override that does not modify `.mimir-focus`. Its scoring core lives in `_score_task_files()`, shared with `scope_area`/`get_context`.
+   - `scope_area` — like `scope_task` but rolls matches up into an indented directory tree instead of a flat file list, for finding which sub-project a task lives in in a large monorepo; suggests a `set_scope(...)` call for the highest-concentration folder
    - `semantic_search` — FTS5 BM25 over decomposed identifier sub-tokens, RRF-fused with symbol-index hits; for when you know the concept but not the code name
    - `get_context` — one-shot: ranked files + blueprints + top symbol bodies for a task description; replaces the scope_task → get_file_structure → get_symbol chain in a single call
    - `get_symbol` — full body of one named function/class/method
@@ -68,7 +70,8 @@ Everything lives in `mimir.py`. There is no package structure. Key sections in o
    - `add_ignore` — append a pattern to `.mimirignore` and reload immediately
    - `audit_index_health` — reports bloated files and over-saturated search terms in the index
    - `execute_local_sandbox` — run python/bash snippets with timeout + process-group kill
-7. **Entry point** — `main()` prints a status banner to stderr, then calls `mcp.run()`.
+7. **CLI** (`mimir <subcommand>`, see `_cli_run`/`_main`) — thin wrappers around the same tool functions for terminal use outside an AI client: `hint`, `scope "<task>"`, `scope --set <path>` / `scope --reset` (state management for `set_scope`/`reset_scope`, disambiguated from the task-string form by the leading `--`), `area "<task>"`, `find <Symbol>`, `callers <Symbol>`, `status`. Each invocation is a fresh process — `_load_disk_cache()` restores blueprints/symbol/FTS tables from the on-disk SQLite cache almost instantly; `.mimir-focus`/`.mimir-scope`/`.mimirignore`/`.mimiraliases`/`.mimirnotes` are re-read at module import every run. Only `scope`/`area` rebuild the in-memory-only ranking structures (`_build_token_df`, `_build_path_strings`, `_build_reverse_imports`) each run, since those aren't disk-cached.
+8. **Entry point** — `main()` prints a status banner to stderr, then calls `mcp.run()`.
 
 ## Adding language support
 

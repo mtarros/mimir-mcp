@@ -93,7 +93,7 @@ def workspace(tmp_path):
 
 class TestToolRegistration:
     async def test_all_tools_listed(self, workspace):
-        """All 20 tools must be registered — any missing tool fails silently in production."""
+        """All 23 tools must be registered — any missing tool fails silently in production."""
         async with Client(_make_transport(workspace)) as client:
             tools = await client.list_tools()
             names = {t.name for t in tools}
@@ -101,9 +101,12 @@ class TestToolRegistration:
             "get_file_structure",
             "verify_symbol_existence",
             "scope_task",
+            "scope_area",
             "scope_hint",
             "get_context",
             "set_focus",
+            "set_scope",
+            "reset_scope",
             "get_imports",
             "get_dependents",
             "find_callers",
@@ -837,6 +840,69 @@ class TestSetFocusPersist:
         assert (workspace / ".mimir-focus").exists(), (
             ".mimir-focus must be written when persist=True"
         )
+
+
+class TestSetScope:
+    async def test_set_scope_hard_filters_scope_task(self, dual_workspace):
+        async with Client(_make_transport(dual_workspace)) as client:
+            set_r = await client.call_tool("set_scope", {"path": "backend"})
+            task_r = await client.call_tool("scope_task", {"task": "authenticate user"})
+        set_text = _text(set_r)
+        task_text = _text(task_r)
+        assert "EXCEPTION" not in set_text
+        assert "Scope set" in set_text and "backend" in set_text
+        assert "frontend" not in task_text, f"frontend leaked into scoped results:\n{task_text}"
+        assert "backend" in task_text
+
+    async def test_set_scope_hard_filters_verify_symbol_existence(self, dual_workspace):
+        async with Client(_make_transport(dual_workspace)) as client:
+            await client.call_tool("set_scope", {"path": "backend"})
+            in_scope = await client.call_tool(
+                "verify_symbol_existence", {"symbol_name": "BackendAuthService"}
+            )
+            out_of_scope = await client.call_tool(
+                "verify_symbol_existence", {"symbol_name": "FrontendAuthService"}
+            )
+        assert "FOUND" in _text(in_scope) and "NOT FOUND" not in _text(in_scope)
+        assert "NOT FOUND" in _text(out_of_scope), (
+            f"Expected out-of-scope symbol to be filtered out:\n{_text(out_of_scope)}"
+        )
+
+    async def test_set_scope_hard_filters_find_callers(self, dual_workspace):
+        async with Client(_make_transport(dual_workspace)) as client:
+            await client.call_tool("set_scope", {"path": "backend"})
+            r = await client.call_tool("find_callers", {"symbol_name": "authenticate_user"})
+        text = _text(r)
+        assert "frontend" not in text, f"frontend leaked into scoped find_callers:\n{text}"
+
+    async def test_reset_scope_restores_full_repo(self, dual_workspace):
+        async with Client(_make_transport(dual_workspace)) as client:
+            await client.call_tool("set_scope", {"path": "backend"})
+            reset_r = await client.call_tool("reset_scope", {})
+            after_r = await client.call_tool(
+                "verify_symbol_existence", {"symbol_name": "FrontendAuthService"}
+            )
+        assert "cleared" in _text(reset_r).lower()
+        assert "FOUND" in _text(after_r) and "NOT FOUND" not in _text(after_r)
+
+    async def test_reset_scope_with_nothing_set_is_a_noop(self, dual_workspace):
+        async with Client(_make_transport(dual_workspace)) as client:
+            r = await client.call_tool("reset_scope", {})
+        assert "No active scope" in _text(r)
+
+    async def test_set_scope_rejects_nonexistent_path(self, dual_workspace):
+        async with Client(_make_transport(dual_workspace)) as client:
+            r = await client.call_tool("set_scope", {"path": "does/not/exist"})
+        text = _text(r)
+        assert "Error" in text
+        assert not (dual_workspace / ".mimir-scope").exists()
+
+    async def test_set_scope_persists_to_file(self, dual_workspace):
+        async with Client(_make_transport(dual_workspace)) as client:
+            await client.call_tool("set_scope", {"path": "backend"})
+        scope_file = dual_workspace / ".mimir-scope"
+        assert scope_file.exists()
+        assert scope_file.read_text().strip() == "backend"
 
 
 @pytest.mark.asyncio
