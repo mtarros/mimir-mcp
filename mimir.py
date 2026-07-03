@@ -116,6 +116,11 @@ BLACKLIST_DIRS = {
     "Pods", ".dart_tool", "target", "out", "coverage", ".cache",
 }
 
+# Filenames that are pure framework routing convention (Next.js App Router,
+# Nuxt, etc.) and carry no naming signal of their own — the meaningful name
+# for these files always lives in the parent directory instead.
+_GENERIC_ROUTE_STEMS = frozenset({"page", "index", "route", "layout"})
+
 def _load_mimirignore() -> list[str]:
     """Read glob patterns from .mimirignore in the workspace root (gitignore-style)."""
     p = WORKSPACE_ROOT / ".mimirignore"
@@ -3264,9 +3269,21 @@ def _score_task_files(task: str, focus: str = "") -> tuple[dict[str, float], lis
                     for src_path in _iter_source_files()
                 )
             for rel, stem_lc, dir_lc in path_source:
-                score = sum((3 if kw in stem_lc else (1 if kw in dir_lc else 0))
-                            * _path_idf[kw]
-                            for kw in path_kws)
+                if stem_lc in _GENERIC_ROUTE_STEMS:
+                    # Framework route-convention filenames (Next.js/Nuxt "page.tsx",
+                    # "index.ts", "route.ts", "layout.tsx") carry no signal of their
+                    # own — the meaningful name lives in the parent directory. Promote
+                    # a match there to the same 3x weight a real filename-stem match
+                    # gets, so e.g. "translator" reaching app/translator/page.tsx scores
+                    # like a stem hit instead of being capped at the weaker dir-match 1x.
+                    last_seg = dir_lc.rsplit('/', 1)[-1]
+                    score = sum((3 if kw in last_seg else (1 if kw in dir_lc else 0))
+                                * _path_idf[kw]
+                                for kw in path_kws)
+                else:
+                    score = sum((3 if kw in stem_lc else (1 if kw in dir_lc else 0))
+                                * _path_idf[kw]
+                                for kw in path_kws)
                 if score > 0:
                     file_hit_count[rel] = file_hit_count.get(rel, 0.0) + score
                     # Path keyword matches count as primary for diversity tracking
