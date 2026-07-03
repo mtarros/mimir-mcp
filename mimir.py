@@ -53,7 +53,18 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from typing import Iterable, Optional
 
-from fastmcp import FastMCP
+# fastmcp (and its transitive mcp-sdk/pydantic deps) is ~150-250ms of import
+# time — pure MCP-protocol overhead a one-shot CLI invocation (`mimir status`,
+# `mimir hint ...`) never touches. Deferred to main()'s server-start branch;
+# tool functions below register with a local no-op `_tool` collector instead
+# of `@mcp.tool()` so none of them need fastmcp imported to be defined.
+_TOOLS: list = []
+
+
+def _tool(fn):
+    _TOOLS.append(fn)
+    return fn
+
 
 # --------------------------------------------------------------------------- #
 # Optional tree-sitter. We import lazily and degrade gracefully. If anything in
@@ -2845,11 +2856,15 @@ def _resolve_import(specifier: str, source_file: Path) -> tuple[str, str]:
 
 # --------------------------------------------------------------------------- #
 # MCP server + tools
+#
+# Functions below are decorated with @_tool (a plain list-collector, see top
+# of file) instead of @mcp.tool() — the real FastMCP instance is created and
+# these get registered onto it only in main()'s server-start branch, so a CLI
+# invocation never imports fastmcp at all.
 # --------------------------------------------------------------------------- #
-mcp = FastMCP("mimir")
 
 
-@mcp.tool()
+@_tool
 def get_file_structure(path: str) -> str:
     """Return a compact structural blueprint of ONE source file: only classes,
     functions, methods, structs, and their signatures - all bodies, loops, and
@@ -2890,7 +2905,7 @@ def get_file_structure(path: str) -> str:
     return blueprint
 
 
-@mcp.tool()
+@_tool
 def verify_symbol_existence(symbol_name: str, max_results: int = 25) -> str:
     """Confirm whether a symbol (class / function / method / struct / etc.) is
     actually DEFINED anywhere in the workspace, and report exactly where, with
@@ -2926,7 +2941,7 @@ def verify_symbol_existence(symbol_name: str, max_results: int = 25) -> str:
     return out
 
 
-@mcp.tool()
+@_tool
 def scope_hint(terms: str) -> str:
     """Cheap first-pass symbol lookup — returns what actually exists and suggests a
     focused scope_task query.  Call this when you have rough keywords but are unsure
@@ -3339,7 +3354,7 @@ def _score_task_files(task: str, focus: str = "") -> tuple[dict[str, float], lis
     return file_hit_count, keywords, all_hits, expanded, _used_fts
 
 
-@mcp.tool()
+@_tool
 def scope_task(task: str, max_files: int = 5, include_blueprints: bool = False, focus: str = "") -> str:
     """Map a plain-English task description to the specific files and symbols it
     touches — before reading any raw file contents.
@@ -3465,7 +3480,7 @@ def scope_task(task: str, max_files: int = 5, include_blueprints: bool = False, 
     return "\n".join(parts)
 
 
-@mcp.tool()
+@_tool
 def scope_area(task: str, max_depth: int = 4, focus: str = "") -> str:
     """Like scope_task, but rolls matches up into a directory tree instead of a
     flat file list — shows WHERE in a large monorepo a task's matches cluster,
@@ -3571,7 +3586,7 @@ def scope_area(task: str, max_depth: int = 4, focus: str = "") -> str:
     return "\n".join(parts_out)
 
 
-@mcp.tool()
+@_tool
 def get_context(task: str, max_files: int = 3, focus: str = "") -> str:
     """One-shot context loader: ranked files + blueprints + key symbol bodies.
 
@@ -3700,7 +3715,7 @@ def _fts_search(
             return []
 
 
-@mcp.tool()
+@_tool
 def semantic_search(query: str, max_results: int = 10, focus: str = "") -> str:
     """Search the workspace by MEANING rather than exact symbol names.
 
@@ -3875,7 +3890,7 @@ def semantic_search(query: str, max_results: int = 10, focus: str = "") -> str:
         return f"Error in semantic_search: {type(e).__name__}: {e}"
 
 
-@mcp.tool()
+@_tool
 def get_imports(path: str) -> str:
     """List every import in a source file and resolve workspace-local ones to actual paths.
 
@@ -3947,7 +3962,7 @@ def get_imports(path: str) -> str:
     return "\n".join(parts)
 
 
-@mcp.tool()
+@_tool
 def get_dependents(path: str) -> str:
     """Find all workspace files that directly import the given file.
 
@@ -3994,7 +4009,7 @@ def get_dependents(path: str) -> str:
     return "\n".join(lines)
 
 
-@mcp.tool()
+@_tool
 def get_symbol(path: str, symbol_name: str) -> str:
     """Return the complete source code of ONE named symbol (function, class, or method)
     — bodies included.
@@ -4032,7 +4047,7 @@ def get_symbol(path: str, symbol_name: str) -> str:
     return f"# {path}  symbol={symbol_name}  ({line_count} lines)\n\n{body}"
 
 
-@mcp.tool()
+@_tool
 def get_changed_files(base: str = "main") -> str:
     """Return structural blueprints of every source file changed vs a git base branch.
 
@@ -4133,7 +4148,7 @@ def get_changed_files(base: str = "main") -> str:
         return f"Error: {e}"
 
 
-@mcp.tool()
+@_tool
 def get_architecture() -> str:
     """Return a high-level map of the entire workspace: directories, files, and
     their top-level symbols. One compact overview instead of dozens of
@@ -4152,7 +4167,7 @@ def get_architecture() -> str:
     return _build_architecture_map()
 
 
-@mcp.tool()
+@_tool
 def find_callers(symbol_name: str, max_results: int = 20) -> str:
     """Find every call site and usage of a symbol across the workspace.
 
@@ -4273,7 +4288,7 @@ def find_callers(symbol_name: str, max_results: int = 20) -> str:
     return '\n'.join(lines)
 
 
-@mcp.tool()
+@_tool
 def get_directory_structure(dir_path: str, max_files: int = 10) -> str:
     """Get structural blueprints for every source file under a directory.
 
@@ -4342,7 +4357,7 @@ def get_directory_structure(dir_path: str, max_files: int = 10) -> str:
     return "\n".join(parts)
 
 
-@mcp.tool()
+@_tool
 def record_alias(domain_term: str, code_name: str) -> str:
     """Record a domain/feature name → code name mapping so future scope_task
     calls find the right files even when described in non-technical language.
@@ -4433,7 +4448,7 @@ def record_alias(domain_term: str, code_name: str) -> str:
     return f"Saved: '{domain}' → {', '.join(existing[domain])}  (.mimiraliases updated)"
 
 
-@mcp.tool()
+@_tool
 def record_note(path_prefix: str, note: str) -> str:
     """Attach a free-text contextual note to files/paths matching a prefix, so
     future scope_task/get_file_structure/get_directory_structure calls surface
@@ -4506,7 +4521,7 @@ def record_note(path_prefix: str, note: str) -> str:
     return f"Saved note for '{prefix}': {text}  (.mimirnotes updated)"
 
 
-@mcp.tool()
+@_tool
 def add_ignore(pattern: str, reason: str = "") -> str:
     """Add a gitignore-style pattern to .mimirignore to exclude noisy files from the index.
 
@@ -4577,7 +4592,7 @@ def add_ignore(pattern: str, reason: str = "") -> str:
     return f"Added to .mimirignore: {pattern}{suffix}{evicted_note}"
 
 
-@mcp.tool()
+@_tool
 def audit_index_health(max_findings: int = 5) -> str:
     """Proactively scan the current index for noise that will degrade search
     quality, and suggest add_ignore patterns to fix it — before you stumble
@@ -4673,7 +4688,7 @@ def audit_index_health(max_findings: int = 5) -> str:
         return f"Error in audit_index_health: {type(e).__name__}: {e}"
 
 
-@mcp.tool()
+@_tool
 def set_focus(entries: str, persist: bool = True) -> str:
     """Set (or clear) per-project score weights so scope_task biases results toward
     the projects you're actively working in and away from those you're not.
@@ -4747,7 +4762,7 @@ def set_focus(entries: str, persist: bool = True) -> str:
         return f"Error saving focus: {e}"
 
 
-@mcp.tool()
+@_tool
 def set_scope(path: str) -> str:
     """Hard-narrow every search tool (scope_task, scope_area, scope_hint,
     verify_symbol_existence, find_callers) to only files under one directory —
@@ -4798,7 +4813,7 @@ def set_scope(path: str) -> str:
     return f"Scope set: {norm} ({count} files). Call reset_scope() to search the full repo again."
 
 
-@mcp.tool()
+@_tool
 def reset_scope() -> str:
     """Clear an active hard scope set by set_scope(), restoring full-repo search.
 
@@ -4817,7 +4832,7 @@ def reset_scope() -> str:
     return f"Scope cleared (was '{was}'). Now searching the full repo."
 
 
-@mcp.tool()
+@_tool
 def get_status() -> str:
     """Report the current state of the mimir index for this workspace.
 
@@ -4982,7 +4997,7 @@ def get_status() -> str:
         return f"EXCEPTION in get_status: {e}"
 
 
-@mcp.tool()
+@_tool
 def execute_local_sandbox(language: str, code: str, timeout_seconds: int = 10) -> str:
     """Run a SHORT python or bash snippet locally and return its combined output.
     Intended for quick verification - run a test, check a value, list files,
@@ -5423,7 +5438,14 @@ def _main() -> None:
         print(_CLI_HELP)
         return
 
-    # No subcommand — start as MCP server
+    # No subcommand — start as MCP server. fastmcp is imported here, not at
+    # module level, so CLI subcommands (handled above, already returned by
+    # this point) never pay its ~150-250ms import cost.
+    from fastmcp import FastMCP
+    mcp = FastMCP("mimir")
+    for fn in _TOOLS:
+        mcp.tool()(fn)
+
     disk_loaded = _load_disk_cache()
     total_files = len(_iter_source_files())
 
