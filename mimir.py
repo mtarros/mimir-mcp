@@ -839,7 +839,10 @@ def _iter_source_files() -> list[Path]:
         return _FILE_LIST
     result: list[Path] = []
     for root, dirs, files in os.walk(WORKSPACE_ROOT):
-        dirs[:] = [d for d in dirs if d not in BLACKLIST_DIRS]
+        dirs[:] = [
+            d for d in dirs
+            if d not in BLACKLIST_DIRS and not (Path(root, d) / "pyvenv.cfg").exists()
+        ]
         for name in files:
             if Path(name).suffix not in EXT_LANG:
                 continue
