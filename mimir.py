@@ -406,6 +406,19 @@ def _init_disk_cache() -> "Optional[object]":
             )
         except Exception:
             pass  # FTS5 unavailable in this SQLite build; semantic_search degrades gracefully
+        # Reverse-import edges (src file -> resolved workspace target it imports).
+        # Independent of blueprint_version — built from raw source text, not
+        # blueprints — so it isn't touched by the version_changed invalidation
+        # below. A 'reverse_imports_built' meta flag (set after a successful
+        # full _build_reverse_imports()) distinguishes "never built" from
+        # "built, but this repo has zero cross-file workspace imports".
+        db.execute(
+            "CREATE TABLE IF NOT EXISTS reverse_imports"
+            " (src TEXT NOT NULL, target TEXT NOT NULL, PRIMARY KEY (src, target))"
+        )
+        db.execute(
+            "CREATE INDEX IF NOT EXISTS idx_revimp_target ON reverse_imports (target)"
+        )
         # Invalidate all cached blueprints when the format version changes.
         if version_changed:
             db.execute("DELETE FROM blueprints")
@@ -508,6 +521,7 @@ def _load_disk_cache() -> int:
             _SEMANTIC_READY = True
     except Exception:
         pass
+    _load_reverse_imports_from_disk()  # cheap (few thousand rows at most) — no-op if never built
     return loaded
 
 
@@ -882,6 +896,54 @@ def _build_reverse_imports() -> None:
     _REVERSE_IMPORTS = {k: sorted(v) for k, v in rev.items()}
     _REVERSE_IMPORTS_FWD = fwd
 
+    if _DISK_CACHE is not None:
+        try:
+            _DISK_CACHE.execute("DELETE FROM reverse_imports")
+            rows = [(src, target) for src, targets in fwd.items() for target in targets]
+            if rows:
+                _DISK_CACHE.executemany(
+                    "INSERT OR IGNORE INTO reverse_imports VALUES (?,?)", rows
+                )
+            _DISK_CACHE.execute(
+                "INSERT OR REPLACE INTO meta VALUES ('reverse_imports_built', '1')"
+            )
+            _DISK_CACHE.commit()
+        except Exception:
+            pass
+
+
+def _load_reverse_imports_from_disk() -> bool:
+    """Restore _REVERSE_IMPORTS/_REVERSE_IMPORTS_FWD from the disk cache if a
+    previous full _build_reverse_imports() persisted them.
+
+    Avoids re-reading the first 8KB of every JS/TS/Python/Java/Kotlin file in
+    the workspace on every CLI invocation of `scope`/`area` — the same class
+    of fix already applied to the blueprint/symbol/FTS tables. Returns False
+    (caller should fall back to a full _build_reverse_imports()) if nothing
+    was ever persisted; the 'reverse_imports_built' meta flag distinguishes
+    that from "built, but this repo has zero cross-file workspace imports".
+    """
+    global _REVERSE_IMPORTS, _REVERSE_IMPORTS_FWD
+    if _DISK_CACHE is None:
+        return False
+    try:
+        flag = _DISK_CACHE.execute(
+            "SELECT value FROM meta WHERE key='reverse_imports_built'"
+        ).fetchone()
+        if not flag:
+            return False
+        rows = _DISK_CACHE.execute("SELECT src, target FROM reverse_imports").fetchall()
+    except Exception:
+        return False
+    fwd: dict[str, set[str]] = {}
+    rev: dict[str, set[str]] = {}
+    for src, target in rows:
+        fwd.setdefault(src, set()).add(target)
+        rev.setdefault(target, set()).add(src)
+    _REVERSE_IMPORTS_FWD = fwd
+    _REVERSE_IMPORTS = {k: sorted(v) for k, v in rev.items()}
+    return True
+
 
 def _update_reverse_imports_for_file(path: Path, deleted: bool) -> None:
     """Incrementally update _REVERSE_IMPORTS for a single changed/deleted file.
@@ -912,15 +974,18 @@ def _update_reverse_imports_for_file(path: Path, deleted: bool) -> None:
                     _REVERSE_IMPORTS.pop(target, None)
 
     if deleted:
+        _sync_reverse_imports_disk(rel_src, None)
         return
 
     try:
         raw = path.read_bytes()
         text = raw[:_IMPORT_READ_BYTES].decode('utf-8', 'replace') if len(raw) > _IMPORT_READ_BYTES else raw.decode('utf-8', 'replace')
     except OSError:
+        _sync_reverse_imports_disk(rel_src, None)
         return
     entries = _parse_import_entries(path, text)
     if not entries:
+        _sync_reverse_imports_disk(rel_src, None)
         return
     new_targets: set[str] = set()
     for spec, _ in entries:
@@ -936,6 +1001,25 @@ def _update_reverse_imports_for_file(path: Path, deleted: bool) -> None:
                 importers.sort()
     if new_targets:
         _REVERSE_IMPORTS_FWD[rel_src] = new_targets
+    _sync_reverse_imports_disk(rel_src, new_targets)
+
+
+def _sync_reverse_imports_disk(rel_src: str, targets: "Optional[set[str]]") -> None:
+    """Mirror one file's reverse-import edges into the disk cache after an
+    incremental update, so a later CLI process picks up the change via
+    _load_reverse_imports_from_disk() instead of a stale full-repo rebuild."""
+    if _DISK_CACHE is None:
+        return
+    try:
+        _DISK_CACHE.execute("DELETE FROM reverse_imports WHERE src=?", (rel_src,))
+        if targets:
+            _DISK_CACHE.executemany(
+                "INSERT OR IGNORE INTO reverse_imports VALUES (?,?)",
+                [(rel_src, t) for t in targets],
+            )
+        _DISK_CACHE.commit()
+    except Exception:
+        pass
 
 
 # ---------------------------------------------------------------------------
@@ -5254,13 +5338,18 @@ def _cli_run(subcommand: str, arg: str) -> None:
         _warm_cache()
     else:
         if subcommand in ("scope", "area"):
-            # scope_task/scope_area's ranking needs these in-memory structures;
-            # they aren't persisted to disk so they must be rebuilt every
-            # process even when the symbol/FTS tables on disk are already warm.
+            # scope_task/scope_area's ranking needs these in-memory structures.
+            # _build_token_df/_build_path_strings aren't disk-persisted so they
+            # rebuild every process regardless (cheap — SQL query + blueprint
+            # scan). _REVERSE_IMPORTS IS disk-persisted (reverse_imports table)
+            # once a previous full _warm_cache() has run — try that first to
+            # avoid re-reading the first 8KB of every JS/TS/Python/Java/Kotlin
+            # file in the workspace on every single CLI invocation.
             print("[mimir] loading rankings...", file=sys.stderr, flush=True)
             _build_token_df()
             _build_path_strings()
-            _build_reverse_imports()
+            if not _load_reverse_imports_from_disk():
+                _build_reverse_imports()
         # status/hint/find/callers read straight off the disk-backed symbol
         # and FTS tables loaded above — no further warmup needed. Either way,
         # everything this invocation needs is ready: mark warmup complete so
