@@ -2909,7 +2909,7 @@ def get_file_structure(path: str) -> str:
 
 
 @_tool
-def verify_symbol_existence(symbol_name: str, max_results: int = 25) -> str:
+def verify_symbol_existence(symbol_name: str, max_results: int = 25, path: str = "") -> str:
     """Confirm whether a symbol (class / function / method / struct / etc.) is
     actually DEFINED anywhere in the workspace, and report exactly where, with
     its signature.
@@ -2924,6 +2924,9 @@ def verify_symbol_existence(symbol_name: str, max_results: int = 25) -> str:
                      (e.g. "signalr" finds a symbol actually named "SignalR"),
                      but results show the symbol's real casing as defined.
         max_results: cap on matches returned (default 25).
+        path: optional workspace-relative path (or path suffix) to restrict
+              results to one file, e.g. "src/services/auth.py". Leave blank to
+              search the whole workspace.
 
     Returns 'FOUND' lines with file:line and signature (in the codebase's
     actual casing), or a clear 'NOT FOUND'.
@@ -2931,12 +2934,20 @@ def verify_symbol_existence(symbol_name: str, max_results: int = 25) -> str:
     name = symbol_name.strip()
     if not name or not re.match(r"^\w[\w]*$", name):
         return "Error: pass a single bare identifier, e.g. 'createSession' (no parens, no dots)."
+    target = path.strip().replace('\\', '/').lstrip('/')
     try:
-        raw_hits = _symbol_hits(name, max_results)
+        # Over-fetch before filtering so a match in the target file isn't
+        # dropped by the global cap when other files also define the name.
+        scan_cap = max(max_results, 200) if target else max_results
+        raw_hits = _symbol_hits(name, scan_cap)
     except Exception as e:
         return f"Error during symbol scan: {type(e).__name__}: {e}."
+    if target:
+        raw_hits = [h for h in raw_hits if h[0].replace('\\', '/').endswith(target)]
+    raw_hits = raw_hits[:max_results]
     if not raw_hits:
-        return (f"NOT FOUND: no definition of '{name}' in the workspace. "
+        scope_msg = f" in '{target}'" if target else " in the workspace"
+        return (f"NOT FOUND: no definition of '{name}'{scope_msg}. "
                 f"It may be undefined, external, or spelled differently.")
     out = "\n".join(f"FOUND  {r}:{l}  ->  {s}" for r, l, s in raw_hits)
     if len(raw_hits) >= max_results:
@@ -4030,7 +4041,10 @@ def get_symbol(path: str, symbol_name: str) -> str:
         symbol_name: exact name of the function, class, or method (e.g. "authenticate")
 
     Returns the full source of the symbol with its original indentation, including
-    docstrings, decorators on the definition line, and the complete body.
+    docstrings, decorators on the definition line, and the complete body. Each
+    line is prefixed with its real line number in the file (e.g. "L42  ..."),
+    matching get_file_structure's blueprint format, so the output can be used
+    directly as an edit anchor without a follow-up grep.
     """
     try:
         resolved = _resolve_in_workspace(path)
@@ -4047,7 +4061,24 @@ def get_symbol(path: str, symbol_name: str) -> str:
             f"Available symbols in this file:\n{blueprint}"
         )
     line_count = body.count('\n') + 1
-    return f"# {path}  symbol={symbol_name}  ({line_count} lines)\n\n{body}"
+    start_line = None
+    try:
+        full_text = resolved.read_bytes().decode('utf-8', 'replace')
+        offset = full_text.find(body)
+        if offset != -1:
+            start_line = full_text.count('\n', 0, offset) + 1
+    except OSError:
+        pass
+    if start_line is not None:
+        numbered = "\n".join(
+            f"L{start_line + i}  {line}"
+            for i, line in enumerate(body.splitlines())
+        )
+        header = f"# {path}  symbol={symbol_name}  ({line_count} lines, starting at L{start_line})"
+    else:
+        numbered = body
+        header = f"# {path}  symbol={symbol_name}  ({line_count} lines)"
+    return f"{header}\n\n{numbered}"
 
 
 @_tool
