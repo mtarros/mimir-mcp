@@ -5225,7 +5225,9 @@ def get_status() -> str:
       SQL index; symbol_index=building means they fall back to a slower linear
       scan and may miss recently added symbols
     - blueprints_cached shows how many files are already parsed
-    - ignored_patterns lists active .mimirignore rules
+    - ignored_patterns reports how many .mimirignore rules are active (not
+      the rules themselves — a file missing from search results is worth
+      checking against .mimirignore directly)
 
     If the index is still building, you can proceed — tools still work, just
     slower. For large repos (8000+ files) the index typically builds in <60s.
@@ -5260,54 +5262,39 @@ def get_status() -> str:
             else "in progress — wait ~30s then call get_status again before using scope_task"
         )
 
+        # Presence/count only, not the actual patterns/mappings/notes: this
+        # tool is called at the start of every session and its output stays
+        # in context for the rest of it, so it's re-paying full detail every
+        # time is pure token bloat. Usage instructions for these tools live
+        # in their own docstrings; get_status only needs to answer "is
+        # anything active" for a quick readiness check (e.g. "why isn't this
+        # file showing up" -> check ignored_patterns first).
         ignore_path = WORKSPACE_ROOT / ".mimirignore"
         if _MIMIRIGNORE_PATTERNS:
-            ignore_section = (
-                f"ignored_patterns ({len(_MIMIRIGNORE_PATTERNS)} active):\n"
-                + "\n".join(f"  {p}" for p in _MIMIRIGNORE_PATTERNS)
-            )
+            ignore_section = f"ignored_patterns:   {len(_MIMIRIGNORE_PATTERNS)} active"
         elif ignore_path.exists():
-            ignore_section = "ignored_patterns: .mimirignore exists but contains no active patterns"
+            ignore_section = "ignored_patterns:   .mimirignore exists but contains no active patterns"
         else:
-            ignore_section = (
-                "ignored_patterns: none  (.mimirignore not found)\n"
-                "  → create .mimirignore in the workspace root to exclude noisy directories\n"
-                "    e.g. '**/obj/**', '**/bin/**', '**/*.generated.cs', '**/vendor/**'"
-            )
+            ignore_section = "ignored_patterns:   none  (.mimirignore not found)"
 
         alias_path = WORKSPACE_ROOT / ".mimiraliases"
         if _MIMIRALIASES:
-            alias_section = (
-                f"domain_aliases ({len(_MIMIRALIASES)} active):\n"
-                + "\n".join(f"  {d} → {', '.join(codes)}" for d, codes in _MIMIRALIASES.items())
-            )
+            alias_section = f"domain_aliases:     {len(_MIMIRALIASES)} active"
         elif alias_path.exists():
-            alias_section = "domain_aliases: .mimiraliases exists but contains no active mappings"
+            alias_section = "domain_aliases:     .mimiraliases exists but contains no active mappings"
         else:
-            alias_section = (
-                "domain_aliases: none  (.mimiraliases not found)\n"
-                "  → call record_alias(domain_term, code_name) when you discover a\n"
-                "    feature name maps to a different code name in the codebase"
-            )
+            alias_section = "domain_aliases:     none  (.mimiraliases not found)"
 
         notes_path = WORKSPACE_ROOT / ".mimirnotes"
         if _MIMIRNOTES:
             total_notes = sum(len(v) for v in _MIMIRNOTES.values())
             notes_section = (
-                f"context_notes ({len(_MIMIRNOTES)} prefix(es), {total_notes} note(s)):\n"
-                + "\n".join(f"  {p}  ({len(v)} note{'s' if len(v) != 1 else ''})"
-                            for p, v in _MIMIRNOTES.items())
-                + "\n  → seen in get_file_structure / get_directory_structure / scope_task output"
+                f"context_notes:      {len(_MIMIRNOTES)} prefix(es), {total_notes} note(s)"
             )
         elif notes_path.exists():
-            notes_section = "context_notes: .mimirnotes exists but contains no active notes"
+            notes_section = "context_notes:      .mimirnotes exists but contains no active notes"
         else:
-            notes_section = (
-                "context_notes: none  (.mimirnotes not found)\n"
-                "  → call record_note(path_prefix, note) to attach context to a path\n"
-                "    (e.g. non-obvious architecture, gotchas — different from record_alias,\n"
-                "    which is for search-vocabulary synonyms)"
-            )
+            notes_section = "context_notes:      none  (.mimirnotes not found)"
 
         rev_count = len(_REVERSE_IMPORTS)
         watcher_line = (
@@ -5326,15 +5313,9 @@ def get_status() -> str:
             focus_entries = "  ".join(
                 f"'{k}' ×{v:.1f}" for k, v in _FOCUS_WEIGHTS.items()
             )
-            focus_line = (
-                f"project_focus:      {focus_entries}\n"
-                f"  → call set_focus(\"\") to clear, or set_focus(\"prefix:weight, ...\") to change"
-            )
+            focus_line = f"project_focus:      {focus_entries}"
         else:
-            focus_line = (
-                "project_focus:      none\n"
-                "  → call set_focus(\"Prefix:3, OtherPrefix:0.3\") to bias scoring by sub-project"
-            )
+            focus_line = "project_focus:      none"
 
         if _SEMANTIC_READY:
             sem_line = "semantic_search:    warm (FTS5+RRF)"
@@ -5342,14 +5323,9 @@ def get_status() -> str:
             sem_line = "semantic_search:    building (FTS5 index pending)"
 
         if _ACTIVE_SCOPE:
-            scope_line = (
-                f"active_scope:       {_ACTIVE_SCOPE}  (hard filter — call reset_scope() to search the full repo again)"
-            )
+            scope_line = f"active_scope:       {_ACTIVE_SCOPE}"
         else:
-            scope_line = (
-                "active_scope:       none  (searching entire repo)\n"
-                "  → call set_scope(\"path/to/subproject\") to hard-narrow a large monorepo"
-            )
+            scope_line = "active_scope:       none  (searching entire repo)"
 
         lines = [
             f"workspace:          {WORKSPACE_ROOT}",
@@ -5363,15 +5339,10 @@ def get_status() -> str:
             f"sandbox:            {'on' if SANDBOX_ENABLED else 'off'}",
             watcher_line,
             rev_line,
-            "",
             scope_line,
-            "",
             focus_line,
-            "",
             ignore_section,
-            "",
             alias_section,
-            "",
             notes_section,
         ]
         return "\n".join(lines)
