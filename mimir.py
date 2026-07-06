@@ -74,10 +74,13 @@ def _tool(fn):
 TREE_SITTER_OK = False
 _TS_PARSER_LOCAL = threading.local()  # thread-local: .cache = {lang: parser}
 try:
-    from tree_sitter_language_pack import get_parser as _ts_get_parser  # type: ignore
+    from tree_sitter_language_pack import get_parser as _ts_get_parser, get_language as _ts_get_language  # type: ignore
+    import tree_sitter as _tree_sitter  # type: ignore
     TREE_SITTER_OK = True
 except Exception:  # noqa: BLE001 - we genuinely want to swallow everything here
     _ts_get_parser = None  # type: ignore
+    _ts_get_language = None  # type: ignore
+    _tree_sitter = None  # type: ignore
 
 
 def _get_ts_parser(ts_lang: str) -> object:
@@ -251,10 +254,14 @@ _ACTIVE_SCOPE: "Optional[str]" = _load_scope()
 
 
 def _in_scope(rel: str) -> bool:
-    """True if a workspace-relative posix path is inside the active hard
-    scope, or if no scope is set (everything is in scope)."""
+    """True if a workspace-relative path is inside the active hard scope, or
+    if no scope is set (everything is in scope). `rel` may use either '/' or
+    the native OS separator (Windows callers pass str(Path) results, which
+    are backslash-separated) — normalized to '/' before comparing against
+    _ACTIVE_SCOPE, which is always stored posix-style."""
     if not _ACTIVE_SCOPE:
         return True
+    rel = rel.replace("\\", "/")
     return rel == _ACTIVE_SCOPE or rel.startswith(_ACTIVE_SCOPE + "/")
 
 
@@ -271,12 +278,13 @@ def _parse_focus_str(raw: str) -> dict[str, float]:
             continue
         if ":" in part:
             prefix, _, wraw = part.rpartition(":")
+            key = prefix.strip().replace("\\", "/").lower()
             try:
-                result[prefix.strip().lower()] = float(wraw.strip())
+                result[key] = float(wraw.strip())
             except ValueError:
-                result[prefix.strip().lower()] = 3.0
+                result[key] = 3.0
         else:
-            result[part.lower()] = 3.0
+            result[part.replace("\\", "/").lower()] = 3.0
     return result
 
 
@@ -490,14 +498,6 @@ _PATH_STRINGS_TS: float = 0.0
 # large repos). Falls back to the Python scan silently when unavailable.
 _RG_BIN: str | None = shutil.which("rg")
 
-# Optional ast-grep accelerator for find_callers. Text/regex search can't tell
-# `def foo` or a comment/docstring mentioning "foo" from an actual call to foo();
-# ast-grep matches structural AST patterns (`foo($$$)`, `$X.foo($$$)`) so it only
-# returns genuine call sites. Falls back to the rg/regex scan for languages
-# ast-grep doesn't support, or entirely when the binary isn't on PATH.
-_AST_GREP_BIN: str | None = shutil.which("ast-grep")
-# Languages present in EXT_LANG that ast-grep's CLI does not recognize via --lang.
-_AST_GREP_UNSUPPORTED_LANGS = frozenset({"objc", "vue"})
 
 # Document-frequency cache backing IDF-weighted ranking (BM25 IDF).
 # Built once at warmup from the symbols table; only Zipf-head tokens
@@ -1808,7 +1808,7 @@ def _notes_for_path(rel_path: str, weights: dict[str, list[str]] | None = None) 
     source = weights if weights is not None else _MIMIRNOTES
     if not source:
         return []
-    rel_lc = rel_path.lower()
+    rel_lc = rel_path.replace("\\", "/").lower()
     matched = [(p, n) for p in sorted(source, key=len, reverse=True)
                if p in rel_lc for n in source[p]]
     if not matched:
@@ -2063,7 +2063,7 @@ def _git_recency_scores() -> dict[str, int]:
         out = subprocess.check_output(
             ["git", "log", "--format=", "--name-only", "-n", "40"],
             cwd=str(WORKSPACE_ROOT), text=True, timeout=3,
-            stderr=subprocess.DEVNULL,
+            stdin=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
         )
         seen: dict[str, int] = {}
         rank = 40
@@ -2519,7 +2519,7 @@ def _build_path_strings() -> None:
         rel = str(src_path.relative_to(WORKSPACE_ROOT))
         stem_lc = src_path.stem.lower()
         rel_dir = src_path.parent.relative_to(WORKSPACE_ROOT)
-        dir_lc = str(rel_dir).lower()
+        dir_lc = str(rel_dir).replace("\\", "/").lower()
         result.append((rel, stem_lc, dir_lc))
         tokens = _path_component_tokens(src_path.stem) | _path_component_tokens(str(rel_dir))
         for tok in tokens:
@@ -3362,7 +3362,7 @@ def _score_task_files(task: str, focus: str = "") -> tuple[dict[str, float], lis
             key=lambda kv: -len(kv[0])
         )
         for rel in list(file_hit_count):
-            rel_lc = rel.lower()
+            rel_lc = rel.replace("\\", "/").lower()
             for prefix_lc, multiplier in _sorted_focus:
                 if prefix_lc in rel_lc:
                     file_hit_count[rel] *= multiplier
@@ -3899,7 +3899,7 @@ def semantic_search(query: str, max_results: int = 10, focus: str = "") -> str:
                 key=lambda kv: -len(kv[0]),
             )
             for rel in list(file_scores):
-                rel_lc = rel.lower()
+                rel_lc = rel.replace("\\", "/").lower()
                 for prefix_lc, multiplier in _sorted_focus:
                     if prefix_lc in rel_lc:
                         file_scores[rel] *= multiplier
@@ -4130,6 +4130,7 @@ def get_changed_files(base: str = "main") -> str:
             return subprocess.run(
                 ["git", "-C", str(WORKSPACE_ROOT)] + list(args),
                 capture_output=True, text=True, timeout=10,
+                stdin=subprocess.DEVNULL,
             )
 
         # Committed changes on this branch vs base
@@ -4227,17 +4228,240 @@ def get_architecture() -> str:
     return _build_architecture_map()
 
 
+# --------------------------------------------------------------------------- #
+# find_callers: in-process tree-sitter Query engine.
+#
+# tree_sitter_language_pack.get_parser() (used everywhere else in this file
+# for blueprint extraction) returns nodes with a method-based API (.kind(),
+# .child_count()) that is NOT compatible with tree_sitter.Query/QueryCursor,
+# which require the standard tree_sitter.Node (property-based: .type,
+# .children). So this section builds its own parser via
+# tree_sitter.Parser(get_language(lang)) instead of reusing _get_ts_parser.
+#
+# Design: one query per language, built once and cached, that captures every
+# identifier-like leaf kind actually present in that language's grammar
+# (probed individually since referencing an unknown kind raises QueryError).
+# The expensive O(all-AST-nodes) traversal + kind filtering happens natively
+# in the query engine; Python only touches the resulting (much smaller) list
+# of identifier occurrences, filtering by text equality and walking a short
+# ancestor chain to exclude a definition's own name.
+#
+# A fixed-pattern structural matcher (enumerating "callable name" shapes like
+# foo(...), x.foo(...)) has a systemic blind spot: it can never match the
+# symbol as the object before a dot (Foo.StaticMember), a generic type
+# argument (Get<Foo>()), or a bare reference through `this`/`self`
+# (this.Foo()) - all real, common call sites an impact-analysis tool needs
+# to find. Scanning every identifier-kind leaf instead (this approach) finds
+# all of those, verified on a 7000+ file C# monorepo, while resolving via
+# the query engine (not a hand-rolled Python recursion) so it doesn't
+# regress on the rare case of very common symbol names matching hundreds of
+# files.
+# --------------------------------------------------------------------------- #
+_CS_PARAM_LIST_KINDS = {
+    "parameters", "parameter_list", "formal_parameters", "function_value_parameters",
+    "value_parameters",
+}
+_CS_CANDIDATE_IDENTIFIER_KINDS = (
+    "identifier", "property_identifier", "field_identifier", "type_identifier",
+    "simple_identifier", "package_identifier", "shorthand_property_identifier",
+    "constant",
+)
+_CS_IMPORT_LIKE_EXACT = {"using_directive", "use_declaration", "use_list"}
+
+_CS_STD_PARSER_LOCAL = threading.local()  # thread-local: .cache = {lang: Parser}
+_CS_LANGUAGE_CACHE: dict[str, object] = {}
+_CS_QUERY_CACHE: dict[str, object] = {}  # value is a Query, or None if unbuildable
+
+
+def _cs_get_language(lang: str):
+    if lang not in _CS_LANGUAGE_CACHE:
+        _CS_LANGUAGE_CACHE[lang] = _ts_get_language(lang)  # type: ignore[misc]
+    return _CS_LANGUAGE_CACHE[lang]
+
+
+def _cs_get_parser(lang: str):
+    """Thread-local standard tree_sitter.Parser (parsers are not thread-safe)."""
+    cache = _CS_STD_PARSER_LOCAL.__dict__.setdefault('cache', {})
+    if lang not in cache:
+        cache[lang] = _tree_sitter.Parser(_cs_get_language(lang))  # type: ignore[misc]
+    return cache[lang]
+
+
+def _cs_identifier_query(lang: str):
+    """Build (once, cached) a query matching every identifier-like leaf kind
+    that actually exists in this language's grammar."""
+    if lang in _CS_QUERY_CACHE:
+        return _CS_QUERY_CACHE[lang]
+    language = _cs_get_language(lang)
+    valid = []
+    for kind in _CS_CANDIDATE_IDENTIFIER_KINDS:
+        try:
+            _tree_sitter.Query(language, f"({kind}) @id")
+            valid.append(kind)
+        except Exception:
+            continue
+    query = None
+    if valid:
+        pattern = "[" + " ".join(f"({k})" for k in valid) + "] @id"
+        query = _tree_sitter.Query(language, pattern)
+    _CS_QUERY_CACHE[lang] = query
+    return query
+
+
+def _cs_is_def_node(node) -> bool:
+    """Same classification as _is_def_node, adapted to the standard
+    tree_sitter.Node property API instead of the method-based one."""
+    parent = node.parent
+    if parent is None:
+        return False
+    t = node.type
+    if t in DEF_EXCLUDE:
+        return False
+    if t in ("lexical_declaration", "variable_declaration"):
+        for child in node.children:
+            if child.type == "variable_declarator":
+                for gc in child.children:
+                    if gc.type in _FN_NODE_KINDS:
+                        return True
+        return False
+    if t.endswith(DEF_SUFFIXES):
+        return True
+    if t in DEF_EXACT and node.is_named and len(node.children) > 0:
+        return True
+    return False
+
+
+def _cs_def_name_span(node):
+    """BFS for tree-sitter's semantic 'name' field, not descending into
+    body-like children. Handles the vast majority of grammars precisely -
+    including when a typed return value precedes the actual name (Java/C#)."""
+    queue = [node]
+    head = 0
+    while head < len(queue):
+        n = queue[head]
+        head += 1
+        name_node = n.child_by_field_name("name")
+        if name_node is not None:
+            return (name_node.start_byte, name_node.end_byte)
+        for child in n.children:
+            k = child.type
+            if k in BODY_TYPES or k.endswith("_body"):
+                continue
+            queue.append(child)
+    return None
+
+
+def _cs_def_name_span_tier2(node):
+    """Fallback for grammars with no 'name' field annotation (Kotlin) or
+    where the name is nested in a declarator wrapper (C/C++): take the last
+    identifier-like direct child before any parameter-list/body boundary,
+    recursing into non-leaf wrapper children if nothing is found here."""
+    last = None
+    for child in node.children:
+        k = child.type
+        if k in BODY_TYPES or k.endswith("_body") or k in _CS_PARAM_LIST_KINDS:
+            break
+        if len(child.children) == 0 and (k.endswith("identifier") or k == "constant"):
+            last = child
+    if last is not None:
+        return (last.start_byte, last.end_byte)
+    for child in node.children:
+        k = child.type
+        if k in BODY_TYPES or k.endswith("_body"):
+            continue
+        if len(child.children) > 0:
+            result = _cs_def_name_span_tier2(child)
+            if result is not None:
+                return result
+    return None
+
+
+def _cs_is_inside_import(node) -> bool:
+    n = node.parent
+    depth = 0
+    while n is not None and depth < 8:
+        k = n.type
+        if "import" in k or k in _CS_IMPORT_LIKE_EXACT:
+            return True
+        if k in BODY_TYPES:
+            return False
+        n = n.parent
+        depth += 1
+    return False
+
+
+def _cs_find_call_sites(lang: str, raw: bytes, symbol_name: str) -> list[tuple[int, int]]:
+    """Return (start_byte, end_byte) spans where symbol_name appears as a
+    genuine code identifier reference - not the definition's own name, not
+    inside an import/using statement."""
+    parser = _cs_get_parser(lang)
+    tree = parser.parse(raw)
+    root = tree.root_node
+    query = _cs_identifier_query(lang)
+    if query is None:
+        return []
+
+    cursor = _tree_sitter.QueryCursor(query)
+    caps = cursor.captures(root)
+    candidates = caps.get("id", [])
+
+    needle = symbol_name.encode("utf-8")
+    results = []
+    # Keyed by byte-range, not id(ancestor): tree-sitter's Python bindings
+    # mint a fresh wrapper object on every .parent/.children access, so id()
+    # is not stable - a GC'd wrapper's address can be reused by a later,
+    # unrelated node and silently alias onto a stale cache entry.
+    excluded_cache: dict[tuple[int, int], object] = {}
+
+    for node in candidates:
+        start, end = node.start_byte, node.end_byte
+        if raw[start:end] != needle:
+            continue
+        if _cs_is_inside_import(node):
+            continue
+        # Walk up looking for an enclosing definition node whose "name" is
+        # exactly this candidate - e.g. Go nests the name two levels up
+        # (type_declaration -> type_spec -> type_identifier), not as a
+        # direct parent. Stop early at a body boundary: once inside a
+        # function/class body, this can only be a real usage.
+        is_def_name = False
+        ancestor = node.parent
+        depth = 0
+        while ancestor is not None and depth < 6:
+            k = ancestor.type
+            if k in BODY_TYPES or k.endswith("_body"):
+                break
+            key = (ancestor.start_byte, ancestor.end_byte)
+            if key in excluded_cache:
+                span = excluded_cache[key]
+            else:
+                span = None
+                if _cs_is_def_node(ancestor):
+                    span = _cs_def_name_span(ancestor) or _cs_def_name_span_tier2(ancestor)
+                excluded_cache[key] = span
+            if span == (start, end):
+                is_def_name = True
+                break
+            ancestor = ancestor.parent
+            depth += 1
+        if not is_def_name:
+            results.append((start, end))
+    return results
+
+
 @_tool
 def find_callers(symbol_name: str, max_results: int = 20) -> str:
     """Find every call site of a symbol across the workspace.
 
-    Uses ast-grep (when its binary is on PATH) to match actual call-expression
-    AST nodes — `foo(...)` / `x.foo(...)` — so it returns genuine call sites
-    only, not `def foo` lines, comments, docstrings, or string literals that
-    merely mention the name as text. Falls back to a ripgrep/regex text scan
-    for languages ast-grep's CLI doesn't support, or entirely when the binary
-    isn't installed — that fallback matches the identifier as a whole word
-    anywhere in the file, including non-call text.
+    Uses an in-process tree-sitter query (when the grammar loads cleanly) to
+    match every identifier reference to the symbol — calls (`foo(...)`,
+    `x.foo(...)`), bare/delegate references (`x.foo`, `this.foo`), and type
+    references (`Foo.Member`, `Get<Foo>()`) — while excluding the
+    definition's own name, comments, docstrings, and import/using
+    statements. Falls back to a ripgrep/regex text scan for a language whose
+    grammar isn't available, or entirely when tree-sitter isn't installed —
+    that fallback matches the identifier as a whole word anywhere in the
+    file, including non-reference text.
 
     Unlike verify_symbol_existence (which searches only definition blueprints),
     this searches implementation code to find where the symbol is called.
@@ -4266,12 +4490,12 @@ def find_callers(symbol_name: str, max_results: int = 20) -> str:
 
     # Whole-repo textual prefilter: a single `rg -l` pass (near-free even on
     # 10k+ files) tells us which files even *mention* the symbol at all, so
-    # ast-grep only has to parse that handful of files instead of walking and
-    # tree-sitter-parsing every file of a given language in the repo. Without
-    # this, a multi-language monorepo pays a full-tree ast-grep walk per
-    # (language, pattern) combination even when the symbol appears nowhere in
-    # most of those languages. candidate_rels is None when rg is unavailable
-    # or fails — callers below then fall back to scanning everything.
+    # the tree-sitter pass below only has to parse that handful of files
+    # instead of every file of a given language in the repo. Without this, a
+    # multi-language monorepo pays a full-tree parse per language even when
+    # the symbol appears nowhere in most of those languages. candidate_rels
+    # is None when rg is unavailable or fails — callers below then fall back
+    # to scanning everything.
     candidate_rels: set[str] | None = None
     if _RG_BIN:
         try:
@@ -4279,9 +4503,17 @@ def find_callers(symbol_name: str, max_results: int = 20) -> str:
                 [_RG_BIN, "-l", "--no-heading", "--no-ignore", "--word-regexp",
                  "--", symbol_name, str(WORKSPACE_ROOT)],
                 capture_output=True, timeout=15,
+                stdin=subprocess.DEVNULL,
             )
             if proc.returncode in (0, 1):
                 ws_str = str(WORKSPACE_ROOT).replace("\\", "/")
+                # rg's output is forward-slash even on Windows, but
+                # indexed_rels (built from Path.relative_to) is native-
+                # separator - normalize both sides for the lookup, keeping
+                # the ORIGINAL native-separator rel for candidate_rels so
+                # every downstream comparison against indexed_rels/path_pairs
+                # still lines up.
+                indexed_rels_fwd = {r.replace("\\", "/"): r for r in indexed_rels}
                 candidate_rels = set()
                 for raw_line in proc.stdout.splitlines():
                     decoded = raw_line.decode('utf-8', 'replace').replace("\\", "/")
@@ -4289,13 +4521,14 @@ def find_callers(symbol_name: str, max_results: int = 20) -> str:
                         rel = decoded[len(ws_str):].lstrip("/")
                     else:
                         rel = decoded
-                    if rel in indexed_rels:
-                        candidate_rels.add(rel)
+                    native_rel = indexed_rels_fwd.get(rel)
+                    if native_rel is not None:
+                        candidate_rels.add(native_rel)
         except Exception:
             candidate_rels = None
 
     # The symbol doesn't appear as a whole word anywhere in the indexed
-    # workspace — no amount of ast-grep/text scanning will find a call site.
+    # workspace — no amount of tree-sitter/text scanning will find a call site.
     if candidate_rels is not None and not candidate_rels:
         return f"No usages of '{symbol_name}' found in the workspace."
 
@@ -4303,78 +4536,64 @@ def find_callers(symbol_name: str, max_results: int = 20) -> str:
         (p, r) for p, r in path_pairs if r in candidate_rels
     ]
 
-    # Split into files ast-grep can structurally parse vs everything else
-    # (unmapped extension, or a language ast-grep's CLI doesn't recognize).
-    # When the binary isn't installed, every file falls back to text scanning.
-    ast_lang_files: dict[str, list[str]] = {}
+    # Split into files this in-process tree-sitter pass can structurally
+    # parse vs everything else (unmapped extension, or a language whose
+    # grammar tree-sitter-language-pack doesn't ship / fails to load).
+    # _cs_identifier_query results are cached per language, so this is only
+    # ever a real probe once per language per process.
+    cs_lang_files: dict[str, list[tuple[Path, str]]] = {}
     text_scan_pairs: list[tuple[Path, str]] = []
-    if _AST_GREP_BIN:
+    if TREE_SITTER_OK:
         for path, rel in scan_pairs:
             lang = EXT_LANG.get(path.suffix, (None, None))[0]
-            if lang and lang not in _AST_GREP_UNSUPPORTED_LANGS:
-                ast_lang_files.setdefault(lang, []).append(rel)
+            query_ok = False
+            if lang:
+                try:
+                    query_ok = _cs_identifier_query(lang) is not None
+                except Exception:
+                    query_ok = False
+            if query_ok:
+                cs_lang_files.setdefault(lang, []).append((path, rel))
             else:
                 text_scan_pairs.append((path, rel))
     else:
         text_scan_pairs = scan_pairs
 
-    # ast-grep pass: one subprocess per (language, pattern), targeted only at
-    # the files the rg prefilter flagged (or the whole language corpus if the
-    # prefilter didn't run) — so cost scales with textual hits, not repo size.
-    #
-    # Five patterns, not two: plain call and method-call patterns alone miss
-    # two common real-usage shapes — generic method calls (`x.Foo<T>(...)`,
-    # a distinct AST node from a plain call in C#/Java/Kotlin/TS/Rust) and
-    # method-group/delegate references passed without parens (`x.Foo` used
-    # as a callback/Action, common in C# DI/EF config code). Verified against
-    # a large C# monorepo: without the last two patterns, a symbol passed as
-    # a bare delegate reference in 180 places came back as "no usages found"
-    # — a dangerous false negative for a rename/impact-analysis tool.
-    if ast_lang_files:
-        import json as _json
+    # In-process tree-sitter pass: parse each candidate file once and query
+    # for every identifier reference to symbol_name in one native pass,
+    # excluding the definition's own name (see _cs_find_call_sites). Cost
+    # scales with textual hits (from the rg prefilter above), not repo size.
+    if cs_lang_files:
         seen: set[tuple[str, int]] = set()
-        for lang in sorted(ast_lang_files):
-            targets = ast_lang_files[lang] if candidate_rels is not None else ["."]
-            call_patterns = (
-                f"{symbol_name}($$$)",
-                f"$X.{symbol_name}($$$)",
-                f"$X.{symbol_name}<$T>($$$)",
-                f"{symbol_name}<$T>($$$)",
-                f"$X.{symbol_name}",
-            )
-            for pattern in call_patterns:
+        for lang in sorted(cs_lang_files):
+            for path, rel in cs_lang_files[lang]:
                 if len(results) >= cutoff:
                     break
                 try:
-                    proc = subprocess.run(
-                        [_AST_GREP_BIN, "run", "--pattern", pattern, "--lang", lang,
-                         "--json", *targets],
-                        cwd=WORKSPACE_ROOT, capture_output=True, timeout=15,
-                    )
-                    matches = _json.loads(proc.stdout or b"[]")
+                    raw = path.read_bytes()
+                    spans = _cs_find_call_sites(lang, raw, symbol_name)
                 except Exception:
                     continue
-                for m in matches:
+                for start, end in spans:
                     if len(results) >= cutoff:
                         break
-                    rel = str(m.get("file", "")).replace("\\", "/")
-                    if rel not in indexed_rels:
-                        continue
-                    lineno = m.get("range", {}).get("start", {}).get("line")
-                    if lineno is None:
-                        continue
-                    lineno += 1  # ast-grep line numbers are 0-indexed
+                    lineno = raw.count(b"\n", 0, start) + 1
                     key = (rel, lineno)
                     if key in seen:
                         continue
                     seen.add(key)
-                    snippet_src = (m.get("lines") or m.get("text") or "").splitlines()
-                    snippet = snippet_src[0].strip()[:120] if snippet_src else ""
+                    line_start = raw.rfind(b"\n", 0, start) + 1
+                    line_end = raw.find(b"\n", start)
+                    if line_end == -1:
+                        line_end = len(raw)
+                    snippet = raw[line_start:line_end].decode("utf-8", "replace").strip()[:120]
                     results.append((rel, lineno, snippet))
+            if len(results) >= cutoff:
+                break
 
-    # Text-scan fallback: files ast-grep can't parse, plus (when the binary is
-    # missing entirely) every file the prefilter flagged (or the whole
-    # workspace if the prefilter didn't run either).
+    # Text-scan fallback: files the tree-sitter pass can't parse, plus (when
+    # tree-sitter is missing entirely) every file the prefilter flagged (or
+    # the whole workspace if the prefilter didn't run either).
     if text_scan_pairs and len(results) < cutoff:
         needle = symbol_name.encode('utf-8')
         word_re = re.compile(rf'(?<!\w){re.escape(symbol_name)}(?!\w)')
@@ -4406,6 +4625,7 @@ def find_callers(symbol_name: str, max_results: int = 20) -> str:
                     [_RG_BIN, "-n", "--no-heading", "--no-ignore", "--word-regexp",
                      "--", symbol_name, str(WORKSPACE_ROOT)],
                     capture_output=True, timeout=15,
+                    stdin=subprocess.DEVNULL,
                 )
                 if proc.returncode in (0, 1):
                     ws_str = str(WORKSPACE_ROOT).replace("\\", "/")
@@ -4641,7 +4861,7 @@ def record_note(path_prefix: str, note: str) -> str:
     Returns a confirmation showing the saved note, or "Already recorded" if
     this exact (prefix, note) pair already exists.
     """
-    prefix = path_prefix.strip().lower()
+    prefix = path_prefix.strip().replace("\\", "/").lower()
     if "=" in prefix:
         return "Error: path_prefix must not contain '='."
     text = " ".join(note.split())  # flatten multi-line input to one line
@@ -4952,7 +5172,7 @@ def set_scope(path: str) -> str:
     if the path doesn't exist or contains no source files.
     """
     global _ACTIVE_SCOPE
-    norm = path.strip().strip("/")
+    norm = path.strip().replace("\\", "/").strip("/")
     if not norm or norm == "." :
         return "Error: pass a non-empty subdirectory path, e.g. set_scope(\"src/web\")."
     if norm.startswith("..") or Path(norm).is_absolute():
@@ -4962,7 +5182,7 @@ def set_scope(path: str) -> str:
         return f"Error: '{norm}' does not exist under the workspace root ({WORKSPACE_ROOT})."
 
     prefix = norm + "/"
-    rels = (str(p.relative_to(WORKSPACE_ROOT)) for p in _iter_source_files())
+    rels = (str(p.relative_to(WORKSPACE_ROOT)).replace("\\", "/") for p in _iter_source_files())
     count = sum(1 for r in rels if r == norm or r.startswith(prefix))
     if count == 0:
         return f"Error: no source files found under '{norm}' — nothing would match. Scope not changed."
@@ -5205,7 +5425,13 @@ def execute_local_sandbox(language: str, code: str, timeout_seconds: int = 10) -
 
         # start_new_session=True puts the child in its own process group (POSIX)
         # so we can kill the entire group - not just the shell - on timeout.
+        # stdin=DEVNULL: the snippet never needs input, and leaving stdin
+        # unredirected would inherit the server's own stdin — which under the
+        # real MCP stdio transport is the live JSON-RPC pipe from the client,
+        # not a normal terminal/pipe. Windows in particular can hang the child
+        # (or communicate()'s wait for it) on an inherited handle like that.
         popen_kwargs = dict(
+            stdin=subprocess.DEVNULL,
             stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
             cwd=str(WORKSPACE_ROOT), text=True,
         )

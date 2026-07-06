@@ -38,6 +38,17 @@ MCP_WORKSPACE_ROOT=/path/to/repo mimir   # point at a specific repo
 | `MCP_ENABLE_SANDBOX` | `1` | Enable `execute_local_sandbox` tool |
 | `MCP_SANDBOX_TIMEOUT` | `10` | Hard ceiling (seconds) for sandbox runs |
 
+## Testing
+
+```bash
+pip install pytest pytest-asyncio   # not in pyproject deps; install separately
+pytest                               # full suite
+pytest tests/test_tools.py           # one file
+pytest tests/test_tools.py -k get_symbol   # one test by name
+```
+
+`tests/conftest.py` points `MCP_WORKSPACE_ROOT` at a fresh temp dir before `mimir` is imported, so tests never touch the real workspace cache. `test_smoke.py` spawns a real `mimir` subprocess per test (~1-2s each) — expect it to dominate wall-clock time vs the rest of the suite.
+
 ## Architecture
 
 Everything lives in `mimir.py`. There is no package structure. Key sections in order:
@@ -47,7 +58,7 @@ Everything lives in `mimir.py`. There is no package structure. Key sections in o
 3. **Structure extraction** — `_extract_tree_sitter()` (preferred) and `_extract_regex()` (fallback). Both return the same dense line format `L{lineno}  {indent}{signature}`. Tree-sitter blueprints additionally end with a `#strings` section listing exception/log message literals (`_literal_row`) so error text from tickets is searchable. `_build_blueprint()` orchestrates cache → tree-sitter → regex.
 4. **Warm-up** — `_warm_cache()` runs at startup: walks all source files, builds blueprints, populates `_SYMBOL_INDEX`, builds the token document-frequency cache (`_build_token_df`, backs IDF ranking + length norm), builds the FTS5 table, `_REVERSE_IMPORTS` map, and `_ARCHITECTURE_MAP`, then starts the file watcher (`watchdog`).
 5. **File watcher** — `_start_file_watcher()` invalidates `_CACHE` and `_REVERSE_IMPORTS` entries on file change/create/delete events within the workspace.
-6. **MCP tools** (23 total):
+6. **MCP tools** (23 total, registered via `@_tool` — a plain list-collector — rather than `@mcp.tool()` directly; `main()`'s server-start branch loops over the collected list and registers each onto the real `FastMCP` instance, so a bare CLI invocation never imports `fastmcp`):
    - `get_status` — index health, file count, exclusion patterns, domain aliases, active focus weights, active scope
    - `set_focus` — save per-prefix score *multipliers* to `.mimir-focus` (soft ranking bias — out-of-focus files still appear, just lower-scored); takes effect immediately; `persist=False` for session-only weights
    - `set_scope` / `reset_scope` — hard-narrow every search tool to one directory via `.mimir-scope` (files outside are excluded entirely, not just down-weighted); persists until `reset_scope()`. Distinct from `set_focus`: scope filters the result set, focus re-ranks within whatever scope allows through — the two compose. Filtering happens at the read layer (`_in_scope()`, checked in `_symbol_hits`/`_symbol_hits_multi`, the end of `_score_task_files`, and `find_callers`'s `path_pairs`), not the index layer — the full-repo index stays warm, so setting/resetting scope is instant, no reindex.
@@ -63,7 +74,7 @@ Everything lives in `mimir.py`. There is no package structure. Key sections in o
    - `get_directory_structure` — blueprints for all source files under a directory
    - `get_imports` — resolved import map for one file; `[workspace?]` entries auto-suggest definition file via symbol index; for C#/Kotlin/Swift unresolved namespace imports, the tool now auto-resolves by type name
    - `verify_symbol_existence` — search the symbol index for a definition
-   - `find_callers` — text search for every call/usage site of a symbol; auto-uses ripgrep (`rg`) if on PATH for ~10× speedup on large repos
+   - `find_callers` — finds every call/usage site of a symbol; primary path is an in-process tree-sitter `Query`/`QueryCursor` pass (`_cs_find_call_sites`) that matches every identifier-kind leaf equal to the symbol and excludes only the definition's own name and import/using statements, so it catches call sites a fixed-pattern matcher would miss (bare `this.foo`/`x.foo` references, the symbol as a generic type argument, or as the object before a dot) since it doesn't need the symbol to be in a specific "callable" position; falls back to ripgrep (`rg`)/plain text-scan for a language whose grammar isn't available or when tree-sitter isn't installed. Note: this pass uses `tree_sitter.Parser(get_language(lang))` directly rather than `_get_ts_parser()` — `tree_sitter_language_pack.get_parser()`'s nodes use a different, `Query`-incompatible method-based API (`.kind()`, `.child_count()`) vs the standard property-based `tree_sitter.Node` (`.type`, `.children`) that `Query`/`QueryCursor` require
    - `get_dependents` — reverse import index: which files import a given file
    - `record_alias` — save a domain-term → code-name mapping for `scope_task` expansion
    - `record_note` — attach a free-text contextual note to a path prefix; surfaced as prose in `get_file_structure`/`get_directory_structure`/`scope_task`, never used for ranking
