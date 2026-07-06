@@ -4,21 +4,40 @@ set -e
 
 REPO="git+https://github.com/mtarros/mimir-mcp.git"
 
-# Install pipx if missing
+# Find a Python with a working pip module. Don't assume bare `pip` is on
+# PATH — modern macOS ships python3/pip3 but often no bare pip/python at all.
+PYTHON=""
+for candidate in python3 python; do
+    if command -v "$candidate" &>/dev/null && "$candidate" -m pip --version &>/dev/null; then
+        PYTHON="$candidate"
+        break
+    fi
+done
+
+if [ -z "$PYTHON" ]; then
+    echo "ERROR: no Python with a working pip module found on PATH."
+    echo "  Install Python 3.10+ (e.g. 'brew install python' on macOS, or your"
+    echo "  distro's package manager on Linux), then re-run this script."
+    exit 1
+fi
+
+# Install pipx if missing. Invoke it via `$PYTHON -m pipx` (not the bare
+# `pipx` command) throughout — right after installing, pipx's own script may
+# not be on PATH yet in this shell, only after ensurepath + a terminal restart.
 if ! command -v pipx &>/dev/null; then
     echo "pipx not found — installing..."
-    pip install --quiet pipx
-    pipx ensurepath
+    "$PYTHON" -m pip install --quiet --user pipx
+    "$PYTHON" -m pipx ensurepath
     echo "pipx installed. You may need to restart your terminal for PATH changes."
 fi
 
 # Install or upgrade mimir
-if pipx list | grep -q "mimir-mcp"; then
+if "$PYTHON" -m pipx list | grep -q "mimir-mcp"; then
     echo "Updating mimir..."
-    pipx install --force "$REPO"
+    "$PYTHON" -m pipx install --force "$REPO"
 else
     echo "Installing mimir..."
-    pipx install "$REPO"
+    "$PYTHON" -m pipx install "$REPO"
 fi
 
 # Install ripgrep (optional — makes find_callers ~10x faster on large repos)
