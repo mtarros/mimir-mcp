@@ -490,6 +490,15 @@ _PATH_STRINGS_TS: float = 0.0
 # large repos). Falls back to the Python scan silently when unavailable.
 _RG_BIN: str | None = shutil.which("rg")
 
+# Optional ast-grep accelerator for find_callers. Text/regex search can't tell
+# `def foo` or a comment/docstring mentioning "foo" from an actual call to foo();
+# ast-grep matches structural AST patterns (`foo($$$)`, `$X.foo($$$)`) so it only
+# returns genuine call sites. Falls back to the rg/regex scan for languages
+# ast-grep doesn't support, or entirely when the binary isn't on PATH.
+_AST_GREP_BIN: str | None = shutil.which("ast-grep")
+# Languages present in EXT_LANG that ast-grep's CLI does not recognize via --lang.
+_AST_GREP_UNSUPPORTED_LANGS = frozenset({"objc", "vue"})
+
 # Document-frequency cache backing IDF-weighted ranking (BM25 IDF).
 # Built once at warmup from the symbols table; only Zipf-head tokens
 # (df >= floor) are stored so memory stays bounded on 60k-file repos —
@@ -4220,11 +4229,18 @@ def get_architecture() -> str:
 
 @_tool
 def find_callers(symbol_name: str, max_results: int = 20) -> str:
-    """Find every call site and usage of a symbol across the workspace.
+    """Find every call site of a symbol across the workspace.
+
+    Uses ast-grep (when its binary is on PATH) to match actual call-expression
+    AST nodes — `foo(...)` / `x.foo(...)` — so it returns genuine call sites
+    only, not `def foo` lines, comments, docstrings, or string literals that
+    merely mention the name as text. Falls back to a ripgrep/regex text scan
+    for languages ast-grep's CLI doesn't support, or entirely when the binary
+    isn't installed — that fallback matches the identifier as a whole word
+    anywhere in the file, including non-call text.
 
     Unlike verify_symbol_existence (which searches only definition blueprints),
-    this searches raw source text to find where the symbol is called, passed,
-    or referenced in implementation code.
+    this searches implementation code to find where the symbol is called.
 
     WHEN TO USE: after verify_symbol_existence tells you WHERE something is
     defined, use find_callers to trace WHO calls it — for impact analysis,
@@ -4239,22 +4255,6 @@ def find_callers(symbol_name: str, max_results: int = 20) -> str:
 
     cutoff = max_results * 4
     results: list[tuple[str, int, str]] = []
-    needle = symbol_name.encode('utf-8')
-    word_re = re.compile(rf'(?<!\w){re.escape(symbol_name)}(?!\w)')
-
-    # FTS5 prefilter: files where the symbol appears in any signature are already
-    # indexed and can be identified in ~1ms without reading disk.
-    priority_rels: set[str] = set()
-    if _FTS_READY and _DISK_CACHE is not None:
-        try:
-            fts_rows = _DISK_CACHE.execute(
-                "SELECT DISTINCT file FROM symbol_fts"
-                " WHERE symbol_fts MATCH ? LIMIT 1000",
-                (f'"{symbol_name}"',),
-            ).fetchall()
-            priority_rels = {row[0] for row in fts_rows}
-        except Exception:
-            pass
 
     if _PATH_STRINGS:
         path_pairs = [(WORKSPACE_ROOT / rel, rel) for rel, _, _ in _PATH_STRINGS]
@@ -4262,39 +4262,146 @@ def find_callers(symbol_name: str, max_results: int = 20) -> str:
         path_pairs = [(p, str(p.relative_to(WORKSPACE_ROOT))) for p in _iter_source_files()]
     if _ACTIVE_SCOPE:
         path_pairs = [(p, r) for p, r in path_pairs if _in_scope(r)]
+    indexed_rels = {r for _, r in path_pairs}
 
-    priority   = [(p, r) for p, r in path_pairs if r in priority_rels]
-    remainder  = [(p, r) for p, r in path_pairs if r not in priority_rels]
-
-    def _scan(path: Path, rel: str) -> None:
-        if len(results) >= cutoff:
-            return
+    # Whole-repo textual prefilter: a single `rg -l` pass (near-free even on
+    # 10k+ files) tells us which files even *mention* the symbol at all, so
+    # ast-grep only has to parse that handful of files instead of walking and
+    # tree-sitter-parsing every file of a given language in the repo. Without
+    # this, a multi-language monorepo pays a full-tree ast-grep walk per
+    # (language, pattern) combination even when the symbol appears nowhere in
+    # most of those languages. candidate_rels is None when rg is unavailable
+    # or fails — callers below then fall back to scanning everything.
+    candidate_rels: set[str] | None = None
+    if _RG_BIN:
         try:
-            raw = path.read_bytes()
-        except OSError:
-            return
-        if needle not in raw:
-            return
-        for i, line in enumerate(raw.decode('utf-8', 'replace').splitlines(), 1):
-            if word_re.search(line):
-                results.append((rel, i, line.strip()[:120]))
+            proc = subprocess.run(
+                [_RG_BIN, "-l", "--no-heading", "--no-ignore", "--word-regexp",
+                 "--", symbol_name, str(WORKSPACE_ROOT)],
+                capture_output=True, timeout=15,
+            )
+            if proc.returncode in (0, 1):
+                ws_str = str(WORKSPACE_ROOT).replace("\\", "/")
+                candidate_rels = set()
+                for raw_line in proc.stdout.splitlines():
+                    decoded = raw_line.decode('utf-8', 'replace').replace("\\", "/")
+                    if decoded.startswith(ws_str):
+                        rel = decoded[len(ws_str):].lstrip("/")
+                    else:
+                        rel = decoded
+                    if rel in indexed_rels:
+                        candidate_rels.add(rel)
+        except Exception:
+            candidate_rels = None
 
-    # Always Python-scan priority files (few, already in memory via FTS).
-    for path, rel in priority:
-        _scan(path, rel)
+    # The symbol doesn't appear as a whole word anywhere in the indexed
+    # workspace — no amount of ast-grep/text scanning will find a call site.
+    if candidate_rels is not None and not candidate_rels:
+        return f"No usages of '{symbol_name}' found in the workspace."
 
-    # For remainder: always use ripgrep when available — its parallel SIMD scan beats
-    # sequential Python reads regardless of whether FTS found priority files first.
-    # Priority files are already scanned above; rg handles the long tail.
-    if len(results) < cutoff:
-        if _RG_BIN:
+    scan_pairs = path_pairs if candidate_rels is None else [
+        (p, r) for p, r in path_pairs if r in candidate_rels
+    ]
+
+    # Split into files ast-grep can structurally parse vs everything else
+    # (unmapped extension, or a language ast-grep's CLI doesn't recognize).
+    # When the binary isn't installed, every file falls back to text scanning.
+    ast_lang_files: dict[str, list[str]] = {}
+    text_scan_pairs: list[tuple[Path, str]] = []
+    if _AST_GREP_BIN:
+        for path, rel in scan_pairs:
+            lang = EXT_LANG.get(path.suffix, (None, None))[0]
+            if lang and lang not in _AST_GREP_UNSUPPORTED_LANGS:
+                ast_lang_files.setdefault(lang, []).append(rel)
+            else:
+                text_scan_pairs.append((path, rel))
+    else:
+        text_scan_pairs = scan_pairs
+
+    # ast-grep pass: one subprocess per (language, pattern), targeted only at
+    # the files the rg prefilter flagged (or the whole language corpus if the
+    # prefilter didn't run) — so cost scales with textual hits, not repo size.
+    #
+    # Five patterns, not two: plain call and method-call patterns alone miss
+    # two common real-usage shapes — generic method calls (`x.Foo<T>(...)`,
+    # a distinct AST node from a plain call in C#/Java/Kotlin/TS/Rust) and
+    # method-group/delegate references passed without parens (`x.Foo` used
+    # as a callback/Action, common in C# DI/EF config code). Verified against
+    # a large C# monorepo: without the last two patterns, a symbol passed as
+    # a bare delegate reference in 180 places came back as "no usages found"
+    # — a dangerous false negative for a rename/impact-analysis tool.
+    if ast_lang_files:
+        import json as _json
+        seen: set[tuple[str, int]] = set()
+        for lang in sorted(ast_lang_files):
+            targets = ast_lang_files[lang] if candidate_rels is not None else ["."]
+            call_patterns = (
+                f"{symbol_name}($$$)",
+                f"$X.{symbol_name}($$$)",
+                f"$X.{symbol_name}<$T>($$$)",
+                f"{symbol_name}<$T>($$$)",
+                f"$X.{symbol_name}",
+            )
+            for pattern in call_patterns:
+                if len(results) >= cutoff:
+                    break
+                try:
+                    proc = subprocess.run(
+                        [_AST_GREP_BIN, "run", "--pattern", pattern, "--lang", lang,
+                         "--json", *targets],
+                        cwd=WORKSPACE_ROOT, capture_output=True, timeout=15,
+                    )
+                    matches = _json.loads(proc.stdout or b"[]")
+                except Exception:
+                    continue
+                for m in matches:
+                    if len(results) >= cutoff:
+                        break
+                    rel = str(m.get("file", "")).replace("\\", "/")
+                    if rel not in indexed_rels:
+                        continue
+                    lineno = m.get("range", {}).get("start", {}).get("line")
+                    if lineno is None:
+                        continue
+                    lineno += 1  # ast-grep line numbers are 0-indexed
+                    key = (rel, lineno)
+                    if key in seen:
+                        continue
+                    seen.add(key)
+                    snippet_src = (m.get("lines") or m.get("text") or "").splitlines()
+                    snippet = snippet_src[0].strip()[:120] if snippet_src else ""
+                    results.append((rel, lineno, snippet))
+
+    # Text-scan fallback: files ast-grep can't parse, plus (when the binary is
+    # missing entirely) every file the prefilter flagged (or the whole
+    # workspace if the prefilter didn't run either).
+    if text_scan_pairs and len(results) < cutoff:
+        needle = symbol_name.encode('utf-8')
+        word_re = re.compile(rf'(?<!\w){re.escape(symbol_name)}(?!\w)')
+
+        def _scan(path: Path, rel: str) -> None:
+            if len(results) >= cutoff:
+                return
+            try:
+                raw = path.read_bytes()
+            except OSError:
+                return
+            if needle not in raw:
+                return
+            for i, line in enumerate(raw.decode('utf-8', 'replace').splitlines(), 1):
+                if word_re.search(line):
+                    results.append((rel, i, line.strip()[:120]))
+
+        if _RG_BIN and candidate_rels is None:
             # rg -n: emit path:line:content directly for every match — avoids
             # reopening and re-splitting every matched file in Python (rg -l
             # would only give filenames, requiring a second Python read pass).
             # --no-ignore: search same files as mimir (don't skip .gitignored files).
-            # Post-filter by mimir's indexed file set to avoid unindexed files.
+            # Post-filter to just the files this fallback is responsible for.
+            # Only needed when the prefilter above didn't already run (it
+            # already covers this ground when candidate_rels is known).
             try:
-                indexed_rels: set[str] = {r for _, r in path_pairs}
+                text_scan_rels = {r for _, r in text_scan_pairs}
                 proc = subprocess.run(
                     [_RG_BIN, "-n", "--no-heading", "--no-ignore", "--word-regexp",
                      "--", symbol_name, str(WORKSPACE_ROOT)],
@@ -4312,17 +4419,21 @@ def find_callers(symbol_name: str, max_results: int = 20) -> str:
                             rel = path_text[len(ws_str):].lstrip("/")
                         else:
                             rel = path_text
-                        if rel not in indexed_rels or not lineno_text.isdigit():
+                        if rel not in text_scan_rels or not lineno_text.isdigit():
                             continue
                         results.append((rel, int(lineno_text), content.strip()[:120]))
             except Exception:
-                # rg failed — fall back to Python scan of remainder
-                for path, rel in remainder:
+                # rg failed — fall back to Python scan
+                for path, rel in text_scan_pairs:
                     if len(results) >= cutoff:
                         break
                     _scan(path, rel)
         else:
-            for path, rel in remainder:
+            # Either candidate_rels already narrowed text_scan_pairs down to
+            # the handful of files known to contain the symbol (prefilter
+            # ran), or rg isn't installed at all — either way a direct
+            # Python read of just these files is cheap.
+            for path, rel in text_scan_pairs:
                 if len(results) >= cutoff:
                     break
                 _scan(path, rel)
