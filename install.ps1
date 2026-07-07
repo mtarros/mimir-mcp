@@ -110,5 +110,12 @@ if (Get-Command rg -ErrorAction SilentlyContinue) {
 }
 
 Write-Host ""
-Write-Host "Done. Run this in any project to add config files:"
-Write-Host "  mimir-setup"
+Write-Host "Done. Next, connect mimir to your AI client - pick whichever applies:"
+Write-Host ""
+Write-Host "  User-scope (recommended - no files added to any repo, works everywhere):"
+Write-Host "    .\connect-claude.ps1     # Claude Code"
+Write-Host "    .\connect-copilot.ps1    # GitHub Copilot in VS Code"
+Write-Host ""
+Write-Host "  Per-project (adds .mcp.json / .vscode/mcp.json / CLAUDE.md etc. to the"
+Write-Host "  repo - only if you want these committed and shared with a team):"
+Write-Host "    mimir-setup"

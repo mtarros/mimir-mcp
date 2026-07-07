@@ -62,5 +62,12 @@ else
 fi
 
 echo ""
-echo "Done. Run this in any project to add config files:"
-echo "  mimir-setup"
+echo "Done. Next, connect mimir to your AI client — pick whichever applies:"
+echo ""
+echo "  User-scope (recommended — no files added to any repo, works everywhere):"
+echo "    ./connect-claude.sh     # Claude Code"
+echo "    ./connect-copilot.sh    # GitHub Copilot in VS Code"
+echo ""
+echo "  Per-project (adds .mcp.json / .vscode/mcp.json / CLAUDE.md etc. to the"
+echo "  repo — only if you want these committed and shared with a team):"
+echo "    mimir-setup"

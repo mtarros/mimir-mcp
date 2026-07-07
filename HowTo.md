@@ -45,7 +45,27 @@ Changes to `mimir.py` take effect immediately without reinstalling.
 
 > **Requires:** Python 3.10+ and [pipx](https://pipx.pypa.io). Install pipx with `pip install pipx` if you don't have it.
 
-### After installing — set up a project
+### After installing — connect mimir to your AI client
+
+Two ways to do this, pick whichever fits:
+
+**User scope (recommended)** — registers mimir once per machine, works in every
+project, adds no files to any repo (nothing to `.gitignore`, nothing to
+accidentally commit at work):
+
+```bash
+./connect-claude.sh     # Claude Code
+./connect-copilot.sh    # GitHub Copilot in VS Code
+```
+
+(`connect-claude.ps1` / `connect-copilot.ps1` on Windows.) Each script checks
+for the client's CLI (`claude` / `code`) and for `mimir` on PATH before
+registering, and only touches that one client's config — run either, both, or
+neither depending on what you use.
+
+**Per-project (`mimir-setup`)** — use this instead if you want the config
+committed and shared with a team, or need Copilot in VS Code without the
+`code` CLI available:
 
 Run this once in the root of any project you want to use mimir with:
 
