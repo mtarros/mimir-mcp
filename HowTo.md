@@ -62,7 +62,7 @@ your user profile instead of this repo — nothing touches the project at all:
 
 ```bash
 mimir-setup claude --global         # registers with Claude Code (user scope) + ~/.claude/CLAUDE.md
-mimir-setup copilot-cli --global    # registers with Copilot CLI (~/.copilot/mcp-config.json) — no global instructions file, so that part is skipped
+mimir-setup copilot-cli --global    # registers with Copilot CLI (~/.copilot/mcp-config.json) + $HOME/.copilot/copilot-instructions.md
 ```
 
 **Ready to share with a team on this project** — drop `--global`. Registers at
@@ -71,12 +71,12 @@ PROJECT scope and writes the instructions into the repo, meant to be committed:
 ```bash
 cd /path/to/your-project
 mimir-setup             # .mcp.json + CLAUDE.md (defaults to claude)
-mimir-setup copilot-cli # copilot-instructions.md (MCP registration is always ~/.copilot/mcp-config.json — Copilot CLI has no project scope)
+mimir-setup copilot-cli # .github/copilot-instructions.md (MCP registration is always ~/.copilot/mcp-config.json — Copilot CLI has no project scope)
 ```
 
 | Mode | MCP registration | Instructions | .mimirignore |
 |---|---|---|---|
-| `--global` | user scope (every project) | `~/.claude/CLAUDE.md`, or (copilot-cli) none | skipped — inherently project-specific |
+| `--global` | user scope (every project) | `~/.claude/CLAUDE.md`, or `$HOME/.copilot/copilot-instructions.md` | skipped — inherently project-specific |
 | default (no `--global`) | project scope for claude (committed `.mcp.json`); always `~/.copilot/mcp-config.json` for copilot-cli, which has no project scope | `CLAUDE.md` or `.github/copilot-instructions.md` | starter file created |
 
 The two scopes don't conflict — global instructions/registration apply
@@ -208,7 +208,7 @@ Manage it interactively instead with `/mcp add` inside a `copilot` session, or c
 
 ### Giving Copilot CLI persistent instructions (manual setup)
 
-`mimir-setup copilot-cli` creates `.github/copilot-instructions.md` in the current project, which Copilot CLI reads automatically. If you prefer to create it manually:
+`mimir-setup copilot-cli` creates `.github/copilot-instructions.md` in the current project (or `mimir-setup copilot-cli --global` for `$HOME/.copilot/copilot-instructions.md`, applied to every project), both of which Copilot CLI reads automatically. If you prefer to create either manually:
 
 ```markdown
 ## Code exploration — use mimir tools

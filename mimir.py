@@ -5556,12 +5556,13 @@ def setup() -> None:
 
     --global: registers mimir at USER scope instead (available in every
     project on this machine, nothing in any repo) and writes the instructions
-    to your user profile instead (~/.claude/CLAUDE.md for claude; copilot-cli
-    has no known global-instructions surface, so that part is skipped).
-    Skips .mimirignore, which is inherently project-specific. Use this while
-    mimir is still your personal tool — drop --global later, in a given
-    project, once you're ready to make it a shared team setup there; the two
-    scopes layer without conflict.
+    to your user profile instead — ~/.claude/CLAUDE.md for claude,
+    $HOME/.copilot/copilot-instructions.md for copilot-cli (confirmed in
+    GitHub's docs; overridable via COPILOT_CUSTOM_INSTRUCTIONS_DIRS). Skips
+    .mimirignore, which is inherently project-specific. Use this while mimir
+    is still your personal tool — drop --global later, in a given project,
+    once you're ready to make it a shared team setup there; the two scopes
+    layer without conflict.
 
     Registration falls back to a printed warning (never aborts the rest of
     setup) if a required CLI isn't on PATH, a subprocess call fails, or an
@@ -5619,16 +5620,19 @@ def setup() -> None:
             action = "updated" if claude_md.exists() else "created"
             print(f"{action}  {claude_md}  (mimir section appended)")
 
-    if arg == "copilot-cli" and is_global:
-        # No verified user/global instructions surface for Copilot CLI —
-        # only per-repo .github/copilot-instructions.md is confirmed. Skip
-        # rather than write a file it wouldn't read.
-        print("skipped  instructions  (no global instructions file for Copilot CLI — "
-              "run mimir-setup copilot-cli in a project for .github/copilot-instructions.md)")
-    elif arg == "copilot-cli":
-        github_dir = cwd / ".github"
-        github_dir.mkdir(exist_ok=True)
-        copilot_instructions = github_dir / "copilot-instructions.md"
+    if arg == "copilot-cli":
+        # Global personal instructions: $HOME/.copilot/copilot-instructions.md
+        # (confirmed in GitHub's docs, overridable via COPILOT_CUSTOM_INSTRUCTIONS_DIRS).
+        # Project scope: .github/copilot-instructions.md, same file/convention
+        # as GitHub Copilot everywhere else.
+        if is_global:
+            copilot_home = Path(os.environ.get("COPILOT_HOME", Path.home() / ".copilot"))
+            copilot_home.mkdir(parents=True, exist_ok=True)
+            copilot_instructions = copilot_home / "copilot-instructions.md"
+        else:
+            github_dir = cwd / ".github"
+            github_dir.mkdir(exist_ok=True)
+            copilot_instructions = github_dir / "copilot-instructions.md"
         if copilot_instructions.exists() and mimir_marker in copilot_instructions.read_text(encoding="utf-8"):
             print(f"skipped  {copilot_instructions}  (mimir section already present)")
         else:
@@ -5660,8 +5664,7 @@ def setup() -> None:
     if is_global:
         print("skipped  .mimirignore  (project-specific — run mimir-setup again without --global in a project to add it)")
         client_name = {"claude": "Claude Code", "copilot-cli": "Copilot CLI"}[arg]
-        print(f"\nDone. Restart {client_name} to pick up the global registration"
-              + ("" if arg == "copilot-cli" else " and instructions") + ".")
+        print(f"\nDone. Restart {client_name} to pick up the global registration and instructions.")
         return
 
     mimirignore = cwd / ".mimirignore"
