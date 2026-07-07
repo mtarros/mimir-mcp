@@ -11,6 +11,5 @@ from pathlib import Path
 # Must be set before mimir is first imported (module-level globals read it).
 _tmp = tempfile.mkdtemp(prefix="mimir_test_")
 os.environ.setdefault("MCP_WORKSPACE_ROOT", _tmp)
-os.environ["MCP_ENABLE_SANDBOX"] = "0"
 
 sys.path.insert(0, str(Path(__file__).parent.parent))

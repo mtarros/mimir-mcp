@@ -36,11 +36,10 @@ def _text(result) -> str:
     return result.content[0].text
 
 
-def _make_transport(workspace: Path, sandbox: bool = False) -> StdioTransport:
+def _make_transport(workspace: Path) -> StdioTransport:
     env = {
         **os.environ,
         "MCP_WORKSPACE_ROOT": str(workspace),
-        "MCP_ENABLE_SANDBOX": "1" if sandbox else "0",
     }
     return StdioTransport(
         command=sys.executable,
@@ -93,7 +92,7 @@ def workspace(tmp_path):
 
 class TestToolRegistration:
     async def test_all_tools_listed(self, workspace):
-        """All 22 tools must be registered — any missing tool fails silently in production."""
+        """All 19 tools must be registered — any missing tool fails silently in production."""
         async with Client(_make_transport(workspace)) as client:
             tools = await client.list_tools()
             names = {t.name for t in tools}
@@ -105,7 +104,6 @@ class TestToolRegistration:
             "scope_hint",
             "set_focus",
             "set_scope",
-            "reset_scope",
             "get_imports",
             "get_dependents",
             "find_callers",
@@ -114,12 +112,10 @@ class TestToolRegistration:
             "record_alias",
             "record_note",
             "add_ignore",
-            "execute_local_sandbox",
             "get_symbol",
             "get_changed_files",
             "get_architecture",
             "semantic_search",
-            "audit_index_health",
         }
         assert expected == names, f"Tool mismatch. Extra: {names - expected}, Missing: {expected - names}"
 
@@ -711,44 +707,6 @@ class TestGetArchitectureWire:
 
 
 # ---------------------------------------------------------------------------
-# execute_local_sandbox
-# ---------------------------------------------------------------------------
-
-class TestSandboxWire:
-    async def test_python_snippet_executes(self, workspace):
-        async with Client(_make_transport(workspace, sandbox=True)) as client:
-            r = await client.call_tool(
-                "execute_local_sandbox",
-                {"language": "python", "code": "print('smoke_ok')"},
-            )
-        text = _text(r)
-        assert "smoke_ok" in text
-        assert "EXCEPTION" not in text
-
-    async def test_sandbox_disabled_returns_error(self, workspace):
-        """When MCP_ENABLE_SANDBOX=0, tool must return a clear error, not crash."""
-        async with Client(_make_transport(workspace, sandbox=False)) as client:
-            r = await client.call_tool(
-                "execute_local_sandbox",
-                {"language": "python", "code": "print('should not run')"},
-            )
-        text = _text(r)
-        assert "disabled" in text.lower() or "Error" in text
-        assert "EXCEPTION" not in text
-
-    async def test_python_runtime_error_captured(self, workspace):
-        """A crashing snippet must be caught and returned as output, never propagated."""
-        async with Client(_make_transport(workspace, sandbox=True)) as client:
-            r = await client.call_tool(
-                "execute_local_sandbox",
-                {"language": "python", "code": "raise ValueError('boom')"},
-            )
-        text = _text(r)
-        assert "EXCEPTION" not in text
-        assert "ValueError" in text or "boom" in text or "error" in text.lower()
-
-
-# ---------------------------------------------------------------------------
 # Per-call focus parameter and set_focus persist flag
 # ---------------------------------------------------------------------------
 
@@ -874,19 +832,19 @@ class TestSetScope:
         text = _text(r)
         assert "frontend" not in text, f"frontend leaked into scoped find_callers:\n{text}"
 
-    async def test_reset_scope_restores_full_repo(self, dual_workspace):
+    async def test_set_scope_empty_clears_and_restores_full_repo(self, dual_workspace):
         async with Client(_make_transport(dual_workspace)) as client:
             await client.call_tool("set_scope", {"path": "backend"})
-            reset_r = await client.call_tool("reset_scope", {})
+            reset_r = await client.call_tool("set_scope", {"path": ""})
             after_r = await client.call_tool(
                 "verify_symbol_existence", {"symbol_name": "FrontendAuthService"}
             )
         assert "cleared" in _text(reset_r).lower()
         assert "FOUND" in _text(after_r) and "NOT FOUND" not in _text(after_r)
 
-    async def test_reset_scope_with_nothing_set_is_a_noop(self, dual_workspace):
+    async def test_set_scope_empty_with_nothing_set_is_a_noop(self, dual_workspace):
         async with Client(_make_transport(dual_workspace)) as client:
-            r = await client.call_tool("reset_scope", {})
+            r = await client.call_tool("set_scope", {"path": ""})
         assert "No active scope" in _text(r)
 
     async def test_set_scope_rejects_nonexistent_path(self, dual_workspace):

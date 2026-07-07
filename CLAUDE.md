@@ -35,8 +35,6 @@ MCP_WORKSPACE_ROOT=/path/to/repo mimir   # point at a specific repo
 |---|---|---|
 | `MCP_WORKSPACE_ROOT` | `os.getcwd()` | Repo root the server maps |
 | `MCP_MAX_FILE_BYTES` | `2000000` | Skip files larger than this |
-| `MCP_ENABLE_SANDBOX` | `1` | Enable `execute_local_sandbox` tool |
-| `MCP_SANDBOX_TIMEOUT` | `10` | Hard ceiling (seconds) for sandbox runs |
 
 ## Testing
 
@@ -58,10 +56,10 @@ Everything lives in `mimir.py`. There is no package structure. Key sections in o
 3. **Structure extraction** — `_extract_tree_sitter()` (preferred) and `_extract_regex()` (fallback). Both return the same dense line format `L{lineno}  {indent}{signature}`. Tree-sitter blueprints additionally end with a `#strings` section listing exception/log message literals (`_literal_row`) so error text from tickets is searchable. `_build_blueprint()` orchestrates cache → tree-sitter → regex.
 4. **Warm-up** — `_warm_cache()` runs at startup: walks all source files, builds blueprints, populates `_SYMBOL_INDEX`, builds the token document-frequency cache (`_build_token_df`, backs IDF ranking + length norm), builds the FTS5 table, `_REVERSE_IMPORTS` map, and `_ARCHITECTURE_MAP`, then starts the file watcher (`watchdog`).
 5. **File watcher** — `_start_file_watcher()` invalidates `_CACHE` and `_REVERSE_IMPORTS` entries on file change/create/delete events within the workspace.
-6. **MCP tools** (22 total, registered via `@_tool` — a plain list-collector — rather than `@mcp.tool()` directly; `main()`'s server-start branch loops over the collected list and registers each onto the real `FastMCP` instance, so a bare CLI invocation never imports `fastmcp`):
+6. **MCP tools** (19 total, registered via `@_tool` — a plain list-collector — rather than `@mcp.tool()` directly; `main()`'s server-start branch loops over the collected list and registers each onto the real `FastMCP` instance, so a bare CLI invocation never imports `fastmcp`). Every registered tool's schema is transmitted to the AI client on every turn, so tools are deliberately few and docstrings deliberately lean — human diagnostics belong in the CLI, not the MCP surface:
    - `get_status` — index health, file count, exclusion patterns, domain aliases, active focus weights, active scope
    - `set_focus` — save per-prefix score *multipliers* to `.mimir-focus` (soft ranking bias — out-of-focus files still appear, just lower-scored); takes effect immediately; `persist=False` for session-only weights
-   - `set_scope` / `reset_scope` — hard-narrow every search tool to one directory via `.mimir-scope` (files outside are excluded entirely, not just down-weighted); persists until `reset_scope()`. Distinct from `set_focus`: scope filters the result set, focus re-ranks within whatever scope allows through — the two compose. Filtering happens at the read layer (`_in_scope()`, checked in `_symbol_hits`/`_symbol_hits_multi`, the end of `_score_task_files`, and `find_callers`'s `path_pairs`), not the index layer — the full-repo index stays warm, so setting/resetting scope is instant, no reindex.
+   - `set_scope` — hard-narrow every search tool to one directory via `.mimir-scope` (files outside are excluded entirely, not just down-weighted); persists until cleared with `set_scope("")` (mirrors `set_focus("")`). Distinct from `set_focus`: scope filters the result set, focus re-ranks within whatever scope allows through — the two compose. Filtering happens at the read layer (`_in_scope()`, checked in `_symbol_hits`/`_symbol_hits_multi`, the end of `_score_task_files`, and `find_callers`'s `path_pairs`), not the index layer — the full-repo index stays warm, so setting/resetting scope is instant, no reindex.
    - `get_architecture` — high-level directory/symbol map of the whole workspace
    - `get_changed_files` — blueprints of files changed vs a git base branch
    - `scope_hint` — cheap symbol lookup that returns what the codebase calls things + suggested query
@@ -78,9 +76,7 @@ Everything lives in `mimir.py`. There is no package structure. Key sections in o
    - `record_alias` — save a domain-term → code-name mapping for `scope_task` expansion
    - `record_note` — attach a free-text contextual note to a path prefix; surfaced as prose in `get_file_structure`/`get_directory_structure`/`scope_task`, never used for ranking
    - `add_ignore` — append a pattern to `.mimirignore` and reload immediately
-   - `audit_index_health` — reports bloated files and over-saturated search terms in the index
-   - `execute_local_sandbox` — run python/bash snippets with timeout + process-group kill
-7. **CLI** (`mimir <subcommand>`, see `_cli_run`/`_main`) — thin wrappers around the same tool functions for terminal use outside an AI client: `hint`, `scope "<task>"`, `scope --set <path>` / `scope --reset` (state management for `set_scope`/`reset_scope`, disambiguated from the task-string form by the leading `--`), `area "<task>"`, `find <Symbol>`, `callers <Symbol>`, `status`. Each invocation is a fresh process — `_load_disk_cache()` restores blueprints/symbol/FTS tables from the on-disk SQLite cache almost instantly; `.mimir-focus`/`.mimir-scope`/`.mimirignore`/`.mimiraliases`/`.mimirnotes` are re-read at module import every run. Only `scope`/`area` rebuild the in-memory-only ranking structures (`_build_token_df`, `_build_path_strings`, `_build_reverse_imports`) each run, since those aren't disk-cached.
+7. **CLI** (`mimir <subcommand>`, see `_cli_run`/`_main`) — thin wrappers around the same tool functions for terminal use outside an AI client: `hint`, `scope "<task>"`, `scope --set <path>` / `scope --reset` (state management for `set_scope`, disambiguated from the task-string form by the leading `--`), `area "<task>"`, `find <Symbol>`, `callers <Symbol>`, `status`, `audit` (index-health diagnostic — CLI-only on purpose, it's a human tuning aid for `.mimirignore`, not an agent tool). Each invocation is a fresh process — `_load_disk_cache()` restores blueprints/symbol/FTS tables from the on-disk SQLite cache almost instantly; `.mimir-focus`/`.mimir-scope`/`.mimirignore`/`.mimiraliases`/`.mimirnotes` are re-read at module import every run. Only `scope`/`area` rebuild the in-memory-only ranking structures (`_build_token_df`, `_build_path_strings`, `_build_reverse_imports`) each run, since those aren't disk-cached.
 8. **Entry point** — `main()` prints a status banner to stderr, then calls `mcp.run()`.
 
 ## Adding language support
@@ -92,4 +88,4 @@ Add an entry to `EXT_LANG` mapping file extension → `(tree_sitter_language_nam
 - **stdout is sacred** — every tool catches all exceptions and returns a string; nothing may raise out of a tool handler.
 - **stderr for diagnostics** — startup banner and any debug output go to `sys.stderr`, never `sys.stdout`.
 - **Memory bounded** — the `_CACHE` FIFO eviction and `MAX_FILE_BYTES` guard are load-bearing for large repos; don't break them.
-- Python snippet sandbox uses `-I` (isolated mode) to ignore user site-packages; bash snippets have no equivalent isolation — note this in tool doc changes.
+- **Lean MCP surface** — every registered tool's schema costs tokens on every agent turn; new tools need strong evidence of agent (not human) value, and human diagnostics go in the CLI instead.

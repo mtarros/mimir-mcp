@@ -108,6 +108,7 @@ mimir scope  "change how jobs are retried on failure"   # find relevant files
 mimir find   JobScheduler                              # locate a symbol definition
 mimir callers authenticate                             # find every call site
 mimir status                                           # check index state + exclusions
+mimir audit                                            # scan the index for noise, get .mimirignore suggestions
 ```
 
 These are the same tools Claude uses — you can explore a codebase, verify a symbol exists, or trace call chains without opening a chat session. `mimir hint` is worth running yourself before writing an AI prompt from a vague ticket: it shows you the actual symbol/class names the codebase uses for the terms you typed, so you can spot right away if your search vocabulary doesn't overlap the code's (e.g. business/support language like "quiet zone" that has no lexical match anywhere) before spending a prompt on it.
@@ -274,12 +275,10 @@ Same mimir install, same tools, no conflicts.
 |---|---|---|
 | `MCP_WORKSPACE_ROOT` | current directory | Root of the repo mimir maps |
 | `MCP_MAX_FILE_BYTES` | `2000000` | Skip files larger than this |
-| `MCP_ENABLE_SANDBOX` | `1` | Enable `execute_local_sandbox` (`0` to disable) |
-| `MCP_SANDBOX_TIMEOUT` | `10` | Max seconds a sandbox snippet can run |
 
 ### Windows note
 
-All tools work on Windows. The one exception: `execute_local_sandbox` with `language="bash"` requires bash (WSL or Git Bash). Python snippets work fine without it.
+All tools work on Windows.
 
 ---
 
@@ -301,7 +300,6 @@ warmup:             complete
 tree_sitter:        on
 file_watcher:       on (changes invalidate cache instantly)
 reverse_imports:    1,204 files mapped
-sandbox:            on
 
 project_focus:      'incontrol.carps.mobile' ×3.0  'incontrol.carps.keypad' ×0.3
   → call set_focus("") to clear, or set_focus("prefix:weight, ...") to change
@@ -678,19 +676,6 @@ The AI is instructed to always tell you what it is adding and why before calling
 ```
 
 Run `mimir status` to confirm which patterns are active.
-
----
-
-### 16. `execute_local_sandbox` — run a quick snippet
-
-Runs a Python or bash snippet locally with a timeout, captures output, and returns it.
-
-**Example use cases:**
-- Run a test to verify a fix
-- List files matching a pattern
-- Check a computed value
-
-Not for long-running jobs. Not a security sandbox — code runs as your user.
 
 ---
 

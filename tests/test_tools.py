@@ -781,6 +781,27 @@ class TestCliDispatch:
     def test_help_text_documents_hint(self):
         assert "mimir hint" in mimir._CLI_HELP
 
+    def test_audit_subcommand_calls_audit_index_health(self, monkeypatch, capsys):
+        monkeypatch.setattr(mimir, "_load_disk_cache", lambda: None)
+        monkeypatch.setattr(mimir, "_warm_cache", lambda: None)
+        monkeypatch.setattr(mimir, "audit_index_health", lambda: "AUDIT OUTPUT")
+
+        mimir._cli_run("audit", "")
+
+        assert "AUDIT OUTPUT" in capsys.readouterr().out
+
+    def test_main_routes_audit_without_arg(self, monkeypatch):
+        seen = {}
+        monkeypatch.setattr(mimir.sys, "argv", ["mimir", "audit"])
+        monkeypatch.setattr(mimir, "_cli_run", lambda sub, arg: seen.update(sub=sub, arg=arg))
+
+        mimir.main()
+
+        assert seen == {"sub": "audit", "arg": ""}
+
+    def test_help_text_documents_audit(self):
+        assert "mimir audit" in mimir._CLI_HELP
+
 
 # ---------------------------------------------------------------------------
 # _notes_for_path — display helper for record_note

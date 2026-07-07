@@ -29,9 +29,6 @@ Dependencies:
 Environment variables:
     MCP_WORKSPACE_ROOT   Absolute path to the repo root. Default: current dir.
     MCP_MAX_FILE_BYTES   Skip files larger than this. Default: 2_000_000.
-    MCP_ENABLE_SANDBOX   "1" to allow execute_local_sandbox, "0" to disable.
-                         Default: "1".
-    MCP_SANDBOX_TIMEOUT  Hard ceiling (seconds) for sandbox runs. Default: 10.
 """
 
 from __future__ import annotations
@@ -43,9 +40,7 @@ import os
 import re
 import shutil
 import sys
-import signal
 import subprocess
-import tempfile
 import threading
 import time
 from collections import OrderedDict
@@ -107,8 +102,6 @@ except Exception:
 # --------------------------------------------------------------------------- #
 WORKSPACE_ROOT = Path(os.environ.get("MCP_WORKSPACE_ROOT", os.getcwd())).resolve()
 MAX_FILE_BYTES = int(os.environ.get("MCP_MAX_FILE_BYTES", "2000000"))
-SANDBOX_ENABLED = os.environ.get("MCP_ENABLE_SANDBOX", "1") == "1"
-SANDBOX_TIMEOUT_CEIL = int(os.environ.get("MCP_SANDBOX_TIMEOUT", "10"))
 
 # Directories that are never worth parsing. Matched against any path segment, so
 # "node_modules" anywhere in the tree is skipped. This is the single biggest
@@ -240,8 +233,8 @@ def _load_scope() -> "Optional[str]":
 
     Unlike .mimir-focus (a soft ranking bias — the rest of the repo still
     shows up, just lower-scored), an active scope is a hard filter: every
-    search tool excludes files outside it entirely until reset_scope() is
-    called. The two are independent and can be combined.
+    search tool excludes files outside it entirely until cleared with
+    set_scope(""). The two are independent and can be combined.
     """
     p = WORKSPACE_ROOT / ".mimir-scope"
     if not p.exists():
@@ -3620,7 +3613,7 @@ def scope_area(task: str, max_depth: int = 4, focus: str = "") -> str:
         f"\n## Suggested scope\n"
         f"  set_scope(\"{cd_target}\")   (CLI: mimir scope --set {cd_target})\n"
         f"  ({dir_files[cd_target]} of {total_files} matched files live here — hard-narrows every "
-        f"tool call to this folder until reset_scope(), no reindex needed)"
+        f"tool call to this folder until set_scope(\"\"), no reindex needed)"
     )
 
     return "\n".join(parts_out)
@@ -4914,11 +4907,14 @@ def add_ignore(pattern: str, reason: str = "") -> str:
     return f"Added to .mimirignore: {pattern}{suffix}{evicted_note}"
 
 
-@_tool
 def audit_index_health(max_findings: int = 5) -> str:
     """Proactively scan the current index for noise that will degrade search
     quality, and suggest add_ignore patterns to fix it — before you stumble
     into the noise via a bad scope_task/semantic_search result.
+
+    CLI-only (`mimir audit`), deliberately not an MCP tool: it's a human
+    diagnostic for tuning .mimirignore, and every registered tool's schema
+    costs tokens on every agent turn.
 
     WHEN TO USE: the first call when connecting to an unfamiliar or very large
     repo, especially a monorepo — run this before scope_task/semantic_search
@@ -5094,8 +5090,8 @@ def set_scope(path: str) -> str:
     WHEN TO USE: in a large monorepo (multiple apps/services under one root),
     once scope_area or a first scope_task pass tells you which sub-project a
     task lives in, call set_scope on that directory so every subsequent call
-    in this session only sees that sub-project. Persists until reset_scope()
-    is called — it survives across separate CLI invocations and MCP calls,
+    in this session only sees that sub-project. Persists until cleared with
+    set_scope("") — it survives across separate CLI invocations and MCP calls,
     unlike a per-call scope_task `focus=` override.
 
     Unlike set_focus (a soft ranking bias — the rest of the repo still shows
@@ -5113,8 +5109,18 @@ def set_scope(path: str) -> str:
     """
     global _ACTIVE_SCOPE
     norm = path.strip().replace("\\", "/").strip("/")
-    if not norm or norm == "." :
-        return "Error: pass a non-empty subdirectory path, e.g. set_scope(\"src/web\")."
+    if not norm or norm == ".":
+        # Empty path clears an active scope — same convention as set_focus("").
+        p = WORKSPACE_ROOT / ".mimir-scope"
+        try:
+            if p.exists():
+                p.unlink()
+        except OSError as e:
+            return f"Error clearing scope: {e}"
+        was, _ACTIVE_SCOPE = _ACTIVE_SCOPE, None
+        if was is None:
+            return "No active scope to clear — already searching the full repo."
+        return f"Scope cleared (was '{was}'). Now searching the full repo."
     if norm.startswith("..") or Path(norm).is_absolute():
         return "Error: path must be a relative subdirectory inside the workspace, not '..' or absolute."
     target = WORKSPACE_ROOT / norm
@@ -5132,26 +5138,7 @@ def set_scope(path: str) -> str:
     except OSError as e:
         return f"Error saving scope: {e}"
     _ACTIVE_SCOPE = norm
-    return f"Scope set: {norm} ({count} files). Call reset_scope() to search the full repo again."
-
-
-@_tool
-def reset_scope() -> str:
-    """Clear an active hard scope set by set_scope(), restoring full-repo search.
-
-    Deletes .mimir-scope and takes effect immediately — no restart needed.
-    """
-    global _ACTIVE_SCOPE
-    p = WORKSPACE_ROOT / ".mimir-scope"
-    try:
-        if p.exists():
-            p.unlink()
-    except OSError as e:
-        return f"Error clearing scope: {e}"
-    was, _ACTIVE_SCOPE = _ACTIVE_SCOPE, None
-    if was is None:
-        return "No active scope to clear — already searching the full repo."
-    return f"Scope cleared (was '{was}'). Now searching the full repo."
+    return f"Scope set: {norm} ({count} files). Call set_scope(\"\") to search the full repo again."
 
 
 @_tool
@@ -5276,7 +5263,6 @@ def get_status() -> str:
             sem_line,
             f"warmup:             {warmup_state}",
             f"tree_sitter:        {'on' if TREE_SITTER_OK else 'off (regex fallback)'}",
-            f"sandbox:            {'on' if SANDBOX_ENABLED else 'off'}",
             watcher_line,
             rev_line,
             scope_line,
@@ -5288,108 +5274,6 @@ def get_status() -> str:
         return "\n".join(lines)
     except Exception as e:
         return f"EXCEPTION in get_status: {e}"
-
-
-@_tool
-def execute_local_sandbox(language: str, code: str, timeout_seconds: int = 10) -> str:
-    """Run a SHORT python or bash snippet locally and return its combined output.
-    Intended for quick verification - run a test, check a value, list files,
-    confirm a build command - not for long-running jobs.
-
-    RESOURCE LIMITS (the safety this actually provides):
-      - hard timeout (default 10s, ceiling enforced by the server);
-      - the whole process group is killed on timeout, so hung children die too;
-      - stdout/stderr is captured and truncated so it can't flood your context;
-      - the working directory is pinned to the workspace root.
-
-    NOT a security boundary: code runs as your user with your full permissions
-    and network access. Only run snippets you would be willing to run yourself.
-
-    Args:
-        language: "python" or "bash".
-        code: the snippet to execute.
-        timeout_seconds: wall-clock limit; capped at the server's ceiling.
-    """
-    if not SANDBOX_ENABLED:
-        return "Error: execute_local_sandbox is disabled (set MCP_ENABLE_SANDBOX=1 to allow it)."
-
-    lang = language.strip().lower()
-    if lang not in ("python", "bash"):
-        return "Error: language must be 'python' or 'bash'."
-    if lang == "bash" and os.name != "posix":
-        return "Error: bash sandbox is not available on Windows. Use language='python' instead."
-    if not code.strip():
-        return "Error: no code provided."
-
-    timeout = max(1, min(int(timeout_seconds or SANDBOX_TIMEOUT_CEIL), SANDBOX_TIMEOUT_CEIL))
-
-    # Write to a temp file so multi-line snippets and quoting behave predictably.
-    suffix = ".py" if lang == "python" else ".sh"
-    tmp = tempfile.NamedTemporaryFile("w", suffix=suffix, delete=False, encoding="utf-8")
-    try:
-        tmp.write(code)
-        tmp.close()
-        if lang == "python":
-            cmd = [sys.executable, "-I", tmp.name]  # -I = isolated, ignore env/site
-        else:
-            cmd = ["bash", tmp.name]
-
-        # start_new_session=True puts the child in its own process group (POSIX)
-        # so we can kill the entire group - not just the shell - on timeout.
-        # stdin=DEVNULL: the snippet never needs input, and leaving stdin
-        # unredirected would inherit the server's own stdin — which under the
-        # real MCP stdio transport is the live JSON-RPC pipe from the client,
-        # not a normal terminal/pipe. Windows in particular can hang the child
-        # (or communicate()'s wait for it) on an inherited handle like that.
-        popen_kwargs = dict(
-            stdin=subprocess.DEVNULL,
-            stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-            cwd=str(WORKSPACE_ROOT), text=True,
-        )
-        if os.name == "posix":
-            popen_kwargs["start_new_session"] = True
-        else:
-            popen_kwargs["creationflags"] = subprocess.CREATE_NEW_PROCESS_GROUP  # type: ignore[attr-defined]
-
-        proc = subprocess.Popen(cmd, **popen_kwargs)
-        try:
-            out, _ = proc.communicate(timeout=timeout)
-            rc = proc.returncode
-        except subprocess.TimeoutExpired:
-            _kill_group(proc)
-            out, _ = proc.communicate()
-            return (f"Error: snippet exceeded the {timeout}s limit and was killed "
-                    f"(process group terminated).\n--- partial output ---\n{_clip(out)}")
-        status = "ok" if rc == 0 else f"exit={rc}"
-        return f"[{lang} · {status}]\n{_clip(out) or '(no output)'}"
-    except Exception as e:  # never break the stream
-        return f"Error executing snippet: {type(e).__name__}: {e}."
-    finally:
-        try:
-            os.unlink(tmp.name)
-        except OSError:
-            pass
-
-
-def _kill_group(proc: subprocess.Popen) -> None:
-    """Kill the child's entire process group so orphaned children don't linger."""
-    try:
-        if os.name == "posix":
-            os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
-        else:
-            proc.send_signal(signal.CTRL_BREAK_EVENT)  # type: ignore[attr-defined]
-            proc.kill()
-    except (ProcessLookupError, OSError):
-        pass
-
-
-def _clip(text: str, limit: int = 6000) -> str:
-    """Truncate output so a runaway print loop can't blow up the context."""
-    if text is None:
-        return ""
-    if len(text) <= limit:
-        return text
-    return text[:limit] + f"\n... (truncated, {len(text) - limit:,} more chars)"
 
 
 # --------------------------------------------------------------------------- #
@@ -5720,6 +5604,8 @@ TERMINAL COMMANDS
   mimir find   <Symbol>    Locate a symbol definition across the workspace
   mimir callers <Symbol>   Find every call site and usage of a symbol
   mimir status             Show index state, file count, active scope, and exclusions
+  mimir audit              Scan the index for noise (bloated files, over-saturated
+                            terms) and suggest .mimirignore patterns to fix it
   mimir --help             Show this help
 
 EXAMPLES
@@ -5737,8 +5623,7 @@ MCP TOOLS (available to Claude Code and GitHub Copilot)
   get_architecture         High-level workspace map: directories, files, top-level symbols
   scope_task               Find relevant files from a task description
   scope_area               Directory-tree view of where a task's matches cluster (monorepos)
-  set_scope                Hard-narrow every tool to one directory until reset_scope()
-  reset_scope              Clear an active scope, search the whole repo again
+  set_scope                Hard-narrow every tool to one directory; set_scope("") clears
   get_file_structure       Compact symbol map of a single file (classes, methods, line nos)
   get_symbol               Full source of ONE named symbol — efficient middle ground
   get_directory_structure  Symbol maps for every file under a directory
@@ -5749,7 +5634,6 @@ MCP TOOLS (available to Claude Code and GitHub Copilot)
   find_callers             Find every call site and usage of a symbol
   record_alias             Save a domain/feature name → code name mapping for future searches
   add_ignore               Add a glob pattern to .mimirignore to exclude noisy files
-  execute_local_sandbox    Run a Python or bash snippet with a timeout
 
 EXCLUDING FILES
   mimir-setup creates a starter .mimirignore covering common noise (build output,
@@ -5768,8 +5652,6 @@ DOMAIN ALIASES
 ENVIRONMENT VARIABLES
   MCP_WORKSPACE_ROOT       Root of the repo mimir maps (default: current dir)
   MCP_MAX_FILE_BYTES       Skip files larger than this in bytes (default: 2000000)
-  MCP_ENABLE_SANDBOX       Set to 0 to disable execute_local_sandbox (default: 1)
-  MCP_SANDBOX_TIMEOUT      Max seconds a sandbox snippet can run (default: 10)
 
 Without arguments, mimir starts as an MCP server on stdio — this is what your
 AI client launches. You never need to run this manually.
@@ -5824,6 +5706,8 @@ def _cli_run(subcommand: str, arg: str) -> None:
         print(find_callers(arg))
     elif subcommand == "status":
         print(get_status())
+    elif subcommand == "audit":
+        print(audit_index_health())
     else:
         print(f"Unknown subcommand '{subcommand}'. Run `mimir` with no arguments for help.")
         sys.exit(1)
@@ -5851,7 +5735,7 @@ def _main() -> None:
     # starts with it. Handled before the generic dispatch below.
     if args[:1] == ["scope"] and len(args) > 1 and args[1] in ("--set", "--reset"):
         if args[1] == "--reset":
-            print(reset_scope())
+            print(set_scope(""))
         else:
             if len(args) < 3:
                 print("Usage: mimir scope --set <path>")
@@ -5866,10 +5750,10 @@ def _main() -> None:
         "find": "SymbolName",
         "callers": "SymbolName",
     }
-    if args and args[0] in (*_CLI_ARG_HINT, "status"):
+    if args and args[0] in (*_CLI_ARG_HINT, "status", "audit"):
         subcommand = args[0]
         arg = " ".join(args[1:]) if len(args) > 1 else ""
-        if subcommand != "status" and not arg:
+        if subcommand not in ("status", "audit") and not arg:
             print(f"Usage: mimir {subcommand} <{_CLI_ARG_HINT[subcommand]}>")
             sys.exit(1)
         _cli_run(subcommand, arg)
@@ -5894,8 +5778,7 @@ def _main() -> None:
     fts_status = f"symbol_index={'warm' if _FTS_READY else 'building'}"
     print(
         f"[mimir] root={WORKSPACE_ROOT} "
-        f"tree_sitter={'on' if TREE_SITTER_OK else 'off (regex fallback)'} "
-        f"sandbox={'on' if SANDBOX_ENABLED else 'off'}  {disk_status}  {fts_status}",
+        f"tree_sitter={'on' if TREE_SITTER_OK else 'off (regex fallback)'}  {disk_status}  {fts_status}",
         file=sys.stderr,
     )
     import threading
