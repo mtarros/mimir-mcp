@@ -64,6 +64,40 @@ class TestIdfWeight:
 
 
 # ---------------------------------------------------------------------------
+# _idf_weight_in_scope — a term globally rare (real high IDF) but ubiquitous
+# WITHIN the active hard scope (e.g. a sub-project's own name) must still be
+# treated as non-discriminating once scoped. Real case: "keypad" hits only
+# 344/8043 files repo-wide on Carps (idf_weight ~0.8, comfortably "rare"),
+# but is in nearly every filename once scoped into .../Keypad.
+# ---------------------------------------------------------------------------
+
+class TestIdfWeightInScope:
+    @pytest.fixture(autouse=True)
+    def df_cache(self, monkeypatch):
+        # "keypad" mirrors the real Carps numbers: rare enough repo-wide to
+        # look like a meaningful keyword (idf > 0.25) absent scope context.
+        _install_df(monkeypatch, {"keypad": 344}, n=8043)
+
+    def test_no_active_scope_falls_back_to_plain_idf(self, monkeypatch):
+        monkeypatch.setattr(mimir, "_ACTIVE_SCOPE", None)
+        assert mimir._idf_weight_in_scope("keypad") == mimir._idf_weight("keypad")
+        assert mimir._idf_weight_in_scope("keypad") > 0.25   # confirms the setup is realistic
+
+    def test_scope_matching_keyword_forced_to_floor(self, monkeypatch):
+        monkeypatch.setattr(mimir, "_ACTIVE_SCOPE", "src/carps-mobile/InControl.Carps.Keypad")
+        assert mimir._idf_weight_in_scope("keypad") == 0.05
+
+    def test_non_matching_keyword_unaffected_by_scope(self, monkeypatch):
+        monkeypatch.setattr(mimir, "_ACTIVE_SCOPE", "src/carps-mobile/InControl.Carps.Keypad")
+        # "provider" isn't part of the scope path, so scoping shouldn't touch it.
+        assert mimir._idf_weight_in_scope("provider") == mimir._idf_weight("provider")
+
+    def test_case_insensitive_scope_match(self, monkeypatch):
+        monkeypatch.setattr(mimir, "_ACTIVE_SCOPE", "src/Carps-Mobile/InControl.Carps.KEYPAD")
+        assert mimir._idf_weight_in_scope("keypad") == 0.05
+
+
+# ---------------------------------------------------------------------------
 # _build_token_df
 # ---------------------------------------------------------------------------
 

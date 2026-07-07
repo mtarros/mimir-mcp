@@ -743,6 +743,58 @@ class TestFocusWildcard:
 
 
 # ---------------------------------------------------------------------------
+# _path_in_scope / _in_scope — hard scope matching, incl. Foo/Foo.Core siblings
+# ---------------------------------------------------------------------------
+
+class TestPathInScope:
+    """Real-world case that motivated this: set_scope(".../InControl.Carps.Keypad")
+    must also cover InControl.Carps.Keypad.Core — a sibling project, not a
+    child directory — since that's where the codebase actually put the
+    reusable abstraction the ticket needed."""
+
+    def test_exact_and_child_match_unchanged(self):
+        assert mimir._path_in_scope("src/Foo", "src/Foo") is True
+        assert mimir._path_in_scope("src/Foo/bar.cs", "src/Foo") is True
+        assert mimir._path_in_scope("src/Other/bar.cs", "src/Foo") is False
+
+    def test_dotted_sibling_matches(self):
+        assert mimir._path_in_scope("src/Foo.Core/bar.cs", "src/Foo") is True
+        assert mimir._path_in_scope("src/Foo.Core", "src/Foo") is True
+
+    def test_dash_and_underscore_sibling_matches(self):
+        assert mimir._path_in_scope("src/Foo-Tests/bar.cs", "src/Foo") is True
+        assert mimir._path_in_scope("src/Foo_Shared/bar.cs", "src/Foo") is True
+
+    def test_alnum_continuation_not_a_sibling(self):
+        # "FooBar" is a different project name, not "Foo" + a conventional
+        # separator — must not match just because it starts with "Foo".
+        assert mimir._path_in_scope("src/FooBar/bar.cs", "src/Foo") is False
+        assert mimir._path_in_scope("src/Foo2/bar.cs", "src/Foo") is False
+
+    def test_sibling_must_share_parent_dir(self):
+        # Same leaf name one level down a different parent — not a sibling.
+        assert mimir._path_in_scope("other/src/Foo.Core/bar.cs", "src/Foo") is False
+
+    def test_carps_keypad_core_real_case(self):
+        scope = "src/carps-mobile/InControl.Carps.Keypad"
+        assert mimir._path_in_scope(
+            "src/carps-mobile/InControl.Carps.Keypad.Core/Icons/IconCatalog.cs", scope
+        ) is True
+        assert mimir._path_in_scope(
+            "src/carps-mobile/InControl.Carps.Mobile/App.cs", scope
+        ) is False
+
+    def test_in_scope_reads_active_global(self, monkeypatch):
+        monkeypatch.setattr(mimir, "_ACTIVE_SCOPE", "src/Foo")
+        assert mimir._in_scope("src/Foo.Core/bar.cs") is True
+        assert mimir._in_scope("src/Other/bar.cs") is False
+
+    def test_in_scope_no_active_scope_matches_everything(self, monkeypatch):
+        monkeypatch.setattr(mimir, "_ACTIVE_SCOPE", None)
+        assert mimir._in_scope("anything/at/all.cs") is True
+
+
+# ---------------------------------------------------------------------------
 # CLI dispatch — mimir <subcommand> <arg>
 # ---------------------------------------------------------------------------
 

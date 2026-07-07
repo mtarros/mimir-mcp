@@ -246,16 +246,44 @@ def _load_scope() -> "Optional[str]":
 _ACTIVE_SCOPE: "Optional[str]" = _load_scope()
 
 
+def _path_in_scope(rel: str, scope: str) -> bool:
+    """Core scope-membership check, parameterized on the scope value so both
+    _in_scope (reads the active global) and set_scope (validates a candidate
+    scope before committing it, so the reported file count is accurate) share
+    one implementation. `rel` must already be '/'-normalized.
+
+    Matches sibling "Foo.Core"/"Foo-Tests"/"Foo_Shared"-style projects at the
+    same directory level as a scope ending in "Foo" — the common .NET/
+    monorepo convention of splitting a project into Foo + Foo.Core. Verified
+    on Carps: `InControl.Carps.Keypad` and `InControl.Carps.Keypad.Core` are
+    siblings, not parent/child, so a plain prefix check misses the second one
+    entirely — set_scope(".../Keypad") would silently exclude the very file
+    (IconCatalog.cs, in Keypad.Core) holding the reusable abstraction.
+    Requires a non-alphanumeric separator immediately after the scope's last
+    path segment, so "Keypad" doesn't also swallow an unrelated
+    "KeypadSomethingElse" sibling.
+    """
+    if rel == scope or rel.startswith(scope + "/"):
+        return True
+    parent, _, leaf = scope.rpartition("/")
+    scope_dir_prefix = f"{parent}/" if parent else ""
+    if leaf and rel.startswith(scope_dir_prefix):
+        sibling_seg = rel[len(scope_dir_prefix):].split("/", 1)[0]
+        if sibling_seg != leaf and sibling_seg.startswith(leaf) and not sibling_seg[len(leaf)].isalnum():
+            return True
+    return False
+
+
 def _in_scope(rel: str) -> bool:
     """True if a workspace-relative path is inside the active hard scope, or
     if no scope is set (everything is in scope). `rel` may use either '/' or
     the native OS separator (Windows callers pass str(Path) results, which
     are backslash-separated) — normalized to '/' before comparing against
-    _ACTIVE_SCOPE, which is always stored posix-style."""
+    _ACTIVE_SCOPE, which is always stored posix-style. See _path_in_scope for
+    the sibling-project matching rule."""
     if not _ACTIVE_SCOPE:
         return True
-    rel = rel.replace("\\", "/")
-    return rel == _ACTIVE_SCOPE or rel.startswith(_ACTIVE_SCOPE + "/")
+    return _path_in_scope(rel.replace("\\", "/"), _ACTIVE_SCOPE)
 
 
 def _parse_focus_str(raw: str) -> dict[str, float]:
@@ -2648,6 +2676,30 @@ def _idf_weight(kw: str) -> float:
     return 0.05 if w < 0.05 else (2.0 if w > 2.0 else w)
 
 
+def _idf_weight_in_scope(kw: str) -> float:
+    """_idf_weight, but a keyword that's a substring of the active hard scope's
+    path is forced to the ubiquitous-term floor regardless of its GLOBAL
+    document frequency.
+
+    Why: a sub-project's own name (e.g. "keypad") is typically rare across
+    the WHOLE repo — verified on Carps: "keypad" hits only 344 of 8,043
+    indexed files, giving it idf_weight ~0.8, comfortably above the 0.25
+    "ubiquitous" cutoff used everywhere else in this file. But once
+    set_scope has narrowed the search to that sub-project, every remaining
+    file is already inside it, so a hit on the sub-project's own name
+    matches nearly everything in scope and discriminates nothing — the
+    exact failure mode real-world scope-narrowed queries hit (matches on
+    the active scope's own name outranking/burying the files that actually
+    differ). Same substring-match convention as .mimir-focus/.mimir-scope
+    (not token-boundary-aware) — consistent with the rest of this file, and
+    the cost of a coincidental short-substring false match is a keyword
+    losing IDF weight it wasn't discriminating with anyway once in scope.
+    """
+    if _ACTIVE_SCOPE and kw.lower() in _ACTIVE_SCOPE.lower():
+        return 0.05
+    return _idf_weight(kw)
+
+
 def _df_note_change() -> None:
     """Track index churn; refresh the DF cache on a daemon thread when stale.
 
@@ -3196,7 +3248,7 @@ def _score_task_files(task: str, focus: str = "") -> tuple[dict[str, float], lis
     # a mid-tier cap here was tried and cost a real ticket its #1 rank.
     # Pre-warmup, _idf_weight returns 1.0 for everything, so every keyword
     # gets the deep cap — identical to the prior uniform-40 behavior.
-    _kw_caps = {kw: (10 if _idf_weight(kw) < 0.25 else 40) for kw in valid_kws + _sub_kws}
+    _kw_caps = {kw: (10 if _idf_weight_in_scope(kw) < 0.25 else 40) for kw in valid_kws + _sub_kws}
     try:
         multi_hits = _symbol_hits_multi(valid_kws + _sub_kws, max_per_kw=_kw_caps)
     except Exception:
@@ -3233,7 +3285,7 @@ def _score_task_files(task: str, focus: str = "") -> tuple[dict[str, float], lis
     # their own (usually low) IDF on top — the correct double discount.
     # Document-length normalization then divides down god-files (DbContext,
     # generated registries) that weakly match everything.
-    idf_w = {kw: _idf_weight(kw) for kw in valid_kws + _sub_kws}
+    idf_w = {kw: _idf_weight_in_scope(kw) for kw in valid_kws + _sub_kws}
     for rel, kws in _file_kw_scores.items():
         raw = sum(s * idf_w[kw] for kw, s in kws.items())
         file_hit_count[rel] = raw * _doc_len_norm(rel)
@@ -3256,7 +3308,7 @@ def _score_task_files(task: str, focus: str = "") -> tuple[dict[str, float], lis
     if path_kws:
         # IDF-scaled with a 0.3 floor: a filename-stem match stays high-signal
         # even for a common word ("email" → EmailService.cs must keep working).
-        _path_idf = {kw: max(0.3, min(_idf_weight(kw), 1.0)) for kw in path_kws}
+        _path_idf = {kw: max(0.3, min(_idf_weight_in_scope(kw), 1.0)) for kw in path_kws}
         try:
             if _PATH_STRINGS and _PATH_TOKEN_INDEX:
                 # Fast path: narrow to candidates via the inverted index.
@@ -3321,7 +3373,7 @@ def _score_task_files(task: str, focus: str = "") -> tuple[dict[str, float], lis
     if _file_kw_primary:
         for rel in list(file_hit_count):
             matched = sum(1 for kw in _file_kw_primary.get(rel, ())
-                          if _idf_weight(kw) >= 0.25)
+                          if _idf_weight_in_scope(kw) >= 0.25)
             if matched > 1:
                 file_hit_count[rel] *= 1.5 ** (matched - 1)
 
@@ -3471,8 +3523,11 @@ def scope_task(task: str, max_files: int = 5, include_blueprints: bool = False, 
     # evidence of relevance — same threshold the diversity multiplier above
     # already uses. Pre-warmup _idf_weight returns 1.0 for everything, so
     # this filter is inert until the DF cache is built (identical to the old
-    # unfiltered behavior in that window).
-    low_idf = {kw for kw in {h[0] for h in relevant} if _idf_weight(kw) < 0.25}
+    # unfiltered behavior in that window). Scope-aware: a hit on the active
+    # scope's own name (e.g. "keypad" while scoped into .../Keypad) is also
+    # treated as low-signal even if it's globally rare — see
+    # _idf_weight_in_scope for why.
+    low_idf = {kw for kw in {h[0] for h in relevant} if _idf_weight_in_scope(kw) < 0.25}
 
     def _low_only(key: tuple[str, str]) -> bool:
         kws = hit_kws[key]
@@ -3812,7 +3867,7 @@ def semantic_search(query: str, max_results: int = 10, focus: str = "") -> str:
                 sym_hits = _symbol_hits_multi(valid_scope_kws, max_per_kw=8)
                 sym_scores: dict[str, float] = {}
                 for kw in valid_scope_kws:
-                    kw_idf = _idf_weight(kw)   # discount common-word hits pre-RRF
+                    kw_idf = _idf_weight_in_scope(kw)   # discount common-word hits pre-RRF
                     for rel, _line, sig in sym_hits.get(kw, []):
                         w = (3.0 if _DEF_LINE_PAT.search(sig) else 1.0) * kw_idf
                         sym_scores[rel] = sym_scores.get(rel, 0.0) + w
@@ -4960,9 +5015,8 @@ def set_scope(path: str) -> str:
     if not target.is_dir():
         return f"Error: '{norm}' does not exist under the workspace root ({WORKSPACE_ROOT})."
 
-    prefix = norm + "/"
     rels = (str(p.relative_to(WORKSPACE_ROOT)).replace("\\", "/") for p in _iter_source_files())
-    count = sum(1 for r in rels if r == norm or r.startswith(prefix))
+    count = sum(1 for r in rels if _path_in_scope(r, norm))
     if count == 0:
         return f"Error: no source files found under '{norm}' — nothing would match. Scope not changed."
 
