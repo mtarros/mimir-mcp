@@ -5455,39 +5455,67 @@ def _clip(text: str, limit: int = 6000) -> str:
 # --------------------------------------------------------------------------- #
 # Entry point
 # --------------------------------------------------------------------------- #
+def _vscode_user_prompts_dir() -> Path:
+    """VS Code's per-OS user-profile directory for global prompt/instructions
+    files (Chat: New Instructions File -> "New Instructions (User)"). Targets
+    the stable "Code" build; Insiders users can pass --global and move the
+    written file into their own "Code - Insiders" equivalent by hand."""
+    if sys.platform == "win32":
+        base = Path(os.environ.get("APPDATA", Path.home() / "AppData" / "Roaming"))
+    elif sys.platform == "darwin":
+        base = Path.home() / "Library" / "Application Support"
+    else:
+        base = Path(os.environ.get("XDG_CONFIG_HOME", Path.home() / ".config"))
+    return base / "Code" / "User" / "prompts"
+
+
 def setup() -> None:
     """Console-script entry point: drop the workflow-instruction file(s) for one
     client (CLAUDE.md or copilot-instructions.md) and a starter .mimirignore
     into the current project.
 
-    Usage: `mimir-setup [claude|copilot]` — defaults to claude when no arg is
-    given. Writes only the file(s) for the named client, so a Copilot-only
-    project doesn't get an unused CLAUDE.md and vice versa.
+    Usage: `mimir-setup [claude|copilot] [--global]` — client defaults to
+    claude when no arg is given. Writes only the file(s) for the named
+    client, so a Copilot-only project doesn't get an unused CLAUDE.md and
+    vice versa.
+
+    --global writes the instructions to your user/profile scope instead of
+    this project (~/.claude/CLAUDE.md for claude; a VS Code user "*.instructions.md"
+    file for copilot) — applies to every project on this machine, and touches
+    nothing in the current repo. Skips .mimirignore, which is inherently
+    project-specific. Use this while mimir is still your personal tool; drop
+    --global later (plain `mimir-setup [claude|copilot]`) once you're ready to
+    commit project-level instructions for a team to share.
 
     Does not write .mcp.json / .vscode/mcp.json — register mimir with your
     client at user/global scope instead (connect-claude.sh / connect-copilot.sh),
-    which needs no per-repo config file at all. Run mimir-setup per project just
-    for the instructions and ignore patterns, which are genuinely project-specific.
+    which needs no per-repo config file at all.
     """
-    import sys as _sys
-
-    arg = (_sys.argv[1].strip().lower() if len(_sys.argv) > 1 else "claude")
+    argv = sys.argv[1:]
+    is_global = "--global" in argv
+    positional = [a for a in argv if a != "--global"]
+    arg = (positional[0].strip().lower() if positional else "claude")
     if arg not in ("claude", "copilot"):
         print(f"ERROR: unknown client {arg!r} — expected 'claude' or 'copilot'.")
         return
 
     cwd = Path.cwd()
-
     mimir_marker = "## Code exploration — use mimir tools"
+    availability_line = (
+        "You have mimir MCP tools available in every project on this machine."
+        if is_global else
+        "This project has mimir MCP tools available."
+    )
 
     if arg == "claude":
-        claude_md = cwd / "CLAUDE.md"
+        claude_md = (Path.home() / ".claude" / "CLAUDE.md") if is_global else (cwd / "CLAUDE.md")
+        claude_md.parent.mkdir(parents=True, exist_ok=True)
         if claude_md.exists() and mimir_marker in claude_md.read_text(encoding="utf-8"):
             print(f"skipped  {claude_md}  (mimir section already present)")
         else:
             snippet = (
                 f"\n{mimir_marker}\n\n"
-                "This project has mimir MCP tools available. Use them before reading raw files.\n\n"
+                f"{availability_line} Use them before reading raw files.\n\n"
                 "At the start of any coding session:\n"
                 "1. Call `get_status` to check the index is ready and see active exclusions\n"
                 "2. Call `get_architecture()` for a high-level map of the whole codebase (cheap)\n"
@@ -5512,15 +5540,22 @@ def setup() -> None:
             print(f"{action}  {claude_md}  (mimir section appended)")
 
     if arg == "copilot":
-        github_dir = cwd / ".github"
-        github_dir.mkdir(exist_ok=True)
-        copilot_instructions = github_dir / "copilot-instructions.md"
+        if is_global:
+            target_dir = _vscode_user_prompts_dir()
+            target_dir.mkdir(parents=True, exist_ok=True)
+            copilot_instructions = target_dir / "mimir.instructions.md"
+            frontmatter = "---\ndescription: mimir MCP workflow\napplyTo: '**'\n---\n\n"
+        else:
+            github_dir = cwd / ".github"
+            github_dir.mkdir(exist_ok=True)
+            copilot_instructions = github_dir / "copilot-instructions.md"
+            frontmatter = ""
         if copilot_instructions.exists() and mimir_marker in copilot_instructions.read_text(encoding="utf-8"):
             print(f"skipped  {copilot_instructions}  (mimir section already present)")
         else:
             copilot_snippet = (
-                f"{mimir_marker}\n\n"
-                "This project has mimir MCP tools. Always use them before using built-in search or reading files.\n\n"
+                f"{frontmatter}{mimir_marker}\n\n"
+                f"{availability_line} Always use them before using built-in search or reading files.\n\n"
                 "Workflow for any coding session:\n"
                 "1. Call `get_status` to confirm the index is ready\n"
                 "2. Call `get_architecture()` for a high-level map of the whole codebase (one cheap call)\n"
@@ -5542,6 +5577,11 @@ def setup() -> None:
                 f.write(copilot_snippet)
             action = "updated" if copilot_instructions.exists() else "created"
             print(f"{action}  {copilot_instructions}  (mimir section appended)")
+
+    if is_global:
+        print("skipped  .mimirignore  (project-specific — run mimir-setup again without --global in a project to add it)")
+        print(f"\nDone. Restart {'Claude Code' if arg == 'claude' else 'VS Code'} to pick up the global instructions.")
+        return
 
     mimirignore = cwd / ".mimirignore"
     if mimirignore.exists():
@@ -5609,11 +5649,15 @@ def setup() -> None:
 _CLI_HELP = """\
 mimir — structural code index for Claude Code and GitHub Copilot
 
-SETUP (run once per project)
-  cd your-project
-  mimir-setup [claude|copilot]   Creates CLAUDE.md or copilot-instructions.md (default: claude),
-                                  plus .mimirignore. Register the mimir MCP server itself
-                                  with connect-claude.sh / connect-copilot.sh.
+SETUP
+  mimir-setup [claude|copilot]            Per-project: CLAUDE.md or copilot-instructions.md
+                                           (default: claude) + .mimirignore
+  mimir-setup [claude|copilot] --global   Same instructions, written to your user profile
+                                           instead — applies to every project, nothing added
+                                           to this repo (use while mimir is still personal;
+                                           drop --global later to share with a team)
+
+  Register the mimir MCP server itself with connect-claude.sh / connect-copilot.sh.
 
 TERMINAL COMMANDS
   mimir hint   "<rough terms>"  Cheap first pass: discover what the codebase calls

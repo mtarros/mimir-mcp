@@ -83,6 +83,21 @@ Writes only the file(s) for the named client, plus a starter `.mimirignore`:
 | `copilot` | `.github/copilot-instructions.md` | Tells Copilot to use mimir and not fall back to built-in search |
 | both | `.mimirignore` | Starter exclusion patterns (build output, vendor libs, generated files) |
 
+**Keeping it fully global (personal use, nothing shared yet)** — add `--global`
+to write the same instructions to your user profile instead of this repo, so
+mimir stays entirely off the project until you're ready to share it:
+
+```bash
+mimir-setup claude --global     # -> ~/.claude/CLAUDE.md (applies to every project)
+mimir-setup copilot --global    # -> a VS Code user "*.instructions.md" file (same idea)
+```
+
+Skips `.mimirignore` (that one's inherently project-specific — noise patterns
+differ per repo). When you're ready to make mimir a shared team tool on a given
+project, just run the plain per-project command above; the two don't conflict
+— global instructions apply everywhere, project instructions layer on top for
+that one repo.
+
 It does **not** create `.mcp.json` / `.vscode/mcp.json` — that's what
 `connect-claude`/`connect-copilot` are for. If you need a per-repo config file
 instead (e.g. to commit and share with a team, or for a client without a CLI
