@@ -3452,32 +3452,78 @@ def scope_task(task: str, max_files: int = 5, include_blueprints: bool = False, 
         parts.append(f"Aliases expanded: {alias_additions}\n")
     parts.append(f"Keywords searched: {', '.join(keywords)}\n")
 
-    # Deduplicated symbol hits for top files
-    relevant = [(r, l, s) for _, r, l, s in all_hits if r in top_set]
-    seen_hits: set[tuple[str, str]] = set()
-    unique = []
-    for r, l, s in relevant:
-        if (r, l) not in seen_hits:
-            seen_hits.add((r, l))
-            unique.append((r, l, s))
+    # Deduplicated symbol hits for top files — keep every keyword that hit
+    # each (rel, line), not just the first, so the low-IDF display filter
+    # below can tell whether a hit's ONLY signal is a common/ubiquitous term.
+    relevant = [(kw, r, l, s) for kw, r, l, s in all_hits if r in top_set]
+    hit_kws: dict[tuple[str, str], set[str]] = {}
+    hit_sig: dict[tuple[str, str], str] = {}
+    hit_order: list[tuple[str, str]] = []
+    for kw, r, l, s in relevant:
+        key = (r, l)
+        if key not in hit_kws:
+            hit_kws[key] = set()
+            hit_sig[key] = s
+            hit_order.append(key)
+        hit_kws[key].add(kw)
 
-    if unique:
+    # A keyword below this IDF is common enough that matching it alone isn't
+    # evidence of relevance — same threshold the diversity multiplier above
+    # already uses. Pre-warmup _idf_weight returns 1.0 for everything, so
+    # this filter is inert until the DF cache is built (identical to the old
+    # unfiltered behavior in that window).
+    low_idf = {kw for kw in {h[0] for h in relevant} if _idf_weight(kw) < 0.25}
+
+    def _low_only(key: tuple[str, str]) -> bool:
+        kws = hit_kws[key]
+        return bool(kws) and kws.issubset(low_idf)
+
+    filtered_order = [k for k in hit_order if not _low_only(k)]
+    suppressed = len(hit_order) - len(filtered_order)
+
+    fallback = False
+    if filtered_order or not hit_order:
+        display_keys = filtered_order
+    else:
+        # Every hit's only signal is a common term (a fully generic query) —
+        # show the top few unfiltered rather than returning an empty section.
+        fallback = True
+        display_keys = hit_order[:10]
+
+    _MATCHED_CAP = 20
+    if display_keys:
         parts.append("## Matched symbols\n")
-        for r, l, s in unique:
-            parts.append(f"  {r}:{l}  {s}")
+        shown = display_keys[:_MATCHED_CAP]
+        for key in shown:
+            r, l = key
+            suffix = "  [common-term match]" if fallback else ""
+            parts.append(f"  {r}:{l}  {hit_sig[key]}{suffix}")
+        capped = len(display_keys) - len(shown)
+        if capped:
+            parts.append(f"  (+{capped} more)")
+        if suppressed and not fallback:
+            sample = sorted(low_idf)[:2]
+            hint = f" — e.g. {', '.join(sample)}" if sample else ""
+            parts.append(f"  (+{suppressed} matches from ubiquitous terms hidden{hint})")
         parts.append("")
 
     parts.append("## Ranked files\n")
     for i, rel in enumerate(top_files, 1):
         n = int(round(file_hit_count[rel]))
-        parts.append(f"  {i}. {rel}  ({n} {'match' if n == 1 else 'matches'})")
+        file_kws = {kw for key in hit_order if key[0] == rel for kw in hit_kws[key]}
+        annotation = "  (matched only common terms)" if file_kws and file_kws.issubset(low_idf) else ""
+        parts.append(f"  {i}. {rel}  (score {n}){annotation}")
         for note in _notes_for_path(rel):
             parts.append(f"       {note}")
 
-    # Suggest targeted get_symbol calls for definition hits — faster than reading a whole file
+    # Suggest targeted get_symbol calls for definition hits — faster than reading a
+    # whole file. Derived from the same filtered/fallback list as Matched symbols,
+    # so low-IDF-only noise doesn't generate suggestions either.
     sym_suggestions: list[tuple[str, str]] = []
     seen_syms: set[tuple[str, str]] = set()
-    for r, l, s in unique:
+    for key in display_keys:
+        r, l = key
+        s = hit_sig[key]
         if _DEF_LINE_PAT.search(s):
             name = _symbol_name_from_sig(s)
             if name and (r, name) not in seen_syms:
@@ -3514,7 +3560,7 @@ def scope_task(task: str, max_files: int = 5, include_blueprints: bool = False, 
             except Exception as e:
                 parts.append(f"### {rel}\n  (error reading: {e})\n")
                 continue
-            parts.append(f"### {rel}  ({n} {'match' if n == 1 else 'matches'})\n{blueprint}\n")
+            parts.append(f"### {rel}  (score {n})\n{blueprint}\n")
 
     return "\n".join(parts)
 

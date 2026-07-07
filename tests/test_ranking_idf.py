@@ -150,7 +150,7 @@ def _ranked(out: str) -> list[tuple[str, float]]:
         if in_section:
             if line.startswith("##"):
                 break
-            m = re.match(r'\s*\d+\.\s+(\S+)\s+\(([\d.]+) match', line)
+            m = re.match(r'\s*\d+\.\s+(\S+)\s+\(score ([\d.]+)\)', line)
             if m:
                 files.append((m.group(1), float(m.group(2))))
     return files
@@ -282,6 +282,81 @@ class TestScopeTaskIdfRanking:
         assert seen_caps["types"] < seen_caps["unavailable"], seen_caps
         assert seen_caps["types"] == 10       # idf < 0.25 -> shallow sample
         assert seen_caps["unavailable"] == 40  # everything else -> deep sample
+
+
+# ---------------------------------------------------------------------------
+# scope_task Matched-symbols/Ranked-files display filter — hides matches
+# whose ONLY signal is a low-IDF (ubiquitous) keyword. Display-only: must
+# never change which files rank, or their scores.
+# ---------------------------------------------------------------------------
+
+class TestScopeTaskDisplayFilter:
+    @pytest.fixture(autouse=True)
+    def setup(self, monkeypatch):
+        _install_df(monkeypatch, {
+            "worker": 1998,     # ubiquitous -> idf clamps to the 0.05 floor
+            "service": 1997,    # ubiquitous
+            "rarewidget": 3,    # rare -> idf near the 2.0 ceiling
+        }, n=2000)
+        monkeypatch.setattr(mimir, "_SEMANTIC_READY", True)
+        monkeypatch.setattr(mimir, "_PATH_STRINGS", [("x/none.cs", "none", "x")])
+        monkeypatch.setattr(mimir, "_REVERSE_IMPORTS", {})
+        monkeypatch.setattr(mimir, "_git_recency_scores", lambda: {})
+        monkeypatch.setattr(mimir, "_FOCUS_WEIGHTS", {})
+        monkeypatch.setattr(mimir, "_AVG_NLINES", 0.0)
+
+    @staticmethod
+    def _mixed_hits(kws, max_per_kw=10):
+        hits = {}
+        for kw in kws:
+            k = kw.lower()
+            if k in ("worker", "service"):
+                hits[kw] = [("decoy.cs", "10", DEF_SIG.format("SomeWorkerService"))]
+            elif k == "rarewidget":
+                hits[kw] = [("target.cs", "5", DEF_SIG.format("RareWidget"))]
+        return hits
+
+    def test_low_idf_only_match_suppressed_with_summary(self, monkeypatch):
+        monkeypatch.setattr(mimir, "_symbol_hits_multi", self._mixed_hits)
+        out = mimir.scope_task("worker service rarewidget", max_files=5)
+        assert "decoy.cs:10" not in out
+        assert "ubiquitous terms hidden" in out
+        assert "target.cs:5" in out   # the rare-keyword hit still shown
+
+    def test_ranking_order_unaffected_by_display_filter(self, monkeypatch):
+        # decoy.cs's matched-symbol line is suppressed, but it must still
+        # appear (with its real score) in Ranked files — filtering is
+        # display-only and never touches file_hit_count/sorting.
+        monkeypatch.setattr(mimir, "_symbol_hits_multi", self._mixed_hits)
+        out = mimir.scope_task("worker service rarewidget", max_files=5)
+        names = [f for f, _ in _ranked(out)]
+        assert "decoy.cs" in names
+        assert "target.cs" in names
+        assert "(matched only common terms)" in out
+
+    def test_all_low_idf_query_falls_back_to_unfiltered(self, monkeypatch):
+        def fake_hits(kws, max_per_kw=10):
+            hits = {}
+            for kw in kws:
+                if kw.lower() in ("worker", "service"):
+                    hits[kw] = [("decoy.cs", "10", DEF_SIG.format("SomeWorkerService"))]
+            return hits
+
+        monkeypatch.setattr(mimir, "_symbol_hits_multi", fake_hits)
+        out = mimir.scope_task("worker service", max_files=5)
+        assert "## Matched symbols" in out
+        assert "decoy.cs:10" in out
+        assert "[common-term match]" in out
+
+    def test_pre_warmup_filter_is_inert(self, monkeypatch):
+        # Before the DF cache builds, _idf_weight returns 1.0 for everything
+        # — nothing should be suppressed regardless of vocabulary, matching
+        # legacy (pre-filter) behavior exactly.
+        monkeypatch.setattr(mimir, "_TOKEN_DF_N", 0)
+        monkeypatch.setattr(mimir, "_symbol_hits_multi", self._mixed_hits)
+        out = mimir.scope_task("worker service rarewidget", max_files=5)
+        assert "decoy.cs:10" in out
+        assert "ubiquitous terms hidden" not in out
 
 
 # ---------------------------------------------------------------------------
