@@ -47,18 +47,26 @@ Changes to `mimir.py` take effect immediately without reinstalling.
 
 ### After installing — connect mimir to your AI client
 
-`mimir-setup [claude|copilot] [--global]` does everything: registers mimir as
-an MCP server with the named client (via `claude mcp add` / `code --add-mcp`
-under the hood) and writes the workflow instructions telling the AI when and
-how to use it. Client defaults to `claude` when no arg is given.
+`mimir-setup [claude|copilot|visualstudio] [--global]` does everything:
+registers mimir as an MCP server with the named client and writes the
+workflow instructions telling the AI when and how to use it. Client defaults
+to `claude` when no arg is given (`vs` is accepted as shorthand for
+`visualstudio`).
+
+`copilot` means GitHub Copilot in **VS Code**; `visualstudio` means the full
+Windows **Visual Studio IDE** (2022 17.14+ / 2026) — they're different
+products with different global-config mechanisms, so pick the one you
+actually use. If a project is set up for both, they share one file: Visual
+Studio auto-discovers `.vscode/mcp.json` too.
 
 **Personal use, nothing shared yet** — add `--global`. Registers at USER scope
 (available in every project on this machine) and writes the instructions to
 your user profile instead of this repo — nothing touches the project at all:
 
 ```bash
-mimir-setup claude --global     # registers with Claude Code (user scope) + ~/.claude/CLAUDE.md
-mimir-setup copilot --global    # registers with Copilot (user scope) + a VS Code user instructions file
+mimir-setup claude --global         # registers with Claude Code (user scope) + ~/.claude/CLAUDE.md
+mimir-setup copilot --global        # registers with VS Code Copilot (user scope) + a VS Code user instructions file
+mimir-setup visualstudio --global   # registers with Visual Studio (%USERPROFILE%\.mcp.json) — no known global instructions file, so that part is skipped
 ```
 
 **Ready to share with a team on this project** — drop `--global`. Registers at
@@ -66,22 +74,27 @@ PROJECT scope and writes the instructions into the repo, meant to be committed:
 
 ```bash
 cd /path/to/your-project
-mimir-setup            # .mcp.json + CLAUDE.md (defaults to claude)
-mimir-setup copilot    # .vscode/mcp.json + copilot-instructions.md
+mimir-setup                  # .mcp.json + CLAUDE.md (defaults to claude)
+mimir-setup copilot          # .vscode/mcp.json + copilot-instructions.md
+mimir-setup visualstudio     # .vscode/mcp.json + copilot-instructions.md (same files as copilot)
 ```
 
 | Mode | MCP registration | Instructions | .mimirignore |
 |---|---|---|---|
-| `--global` | user scope (every project) | `~/.claude/CLAUDE.md` or a VS Code user instructions file | skipped — inherently project-specific |
+| `--global` | user scope (every project) | `~/.claude/CLAUDE.md`, a VS Code user instructions file, or (visualstudio) none | skipped — inherently project-specific |
 | default (no `--global`) | project scope (`.mcp.json` / `.vscode/mcp.json`, committed) | `CLAUDE.md` or `.github/copilot-instructions.md` | starter file created |
 
 The two scopes don't conflict — global instructions/registration apply
 everywhere, a project's own `mimir-setup` (no `--global`) layers on top for
 that one repo when you're ready to move it from personal to shared.
 
-MCP registration needs the client's own CLI (`claude` / `code`) on PATH; if
-it's missing or the command fails, `mimir-setup` prints a warning and still
-writes the instruction files — see the manual `.mcp.json` / `.vscode/mcp.json`
+`claude`/`copilot` registration goes through that client's own CLI (`claude
+mcp add` / `code --add-mcp`); `visualstudio` has no CLI for this (confirmed
+against Microsoft's docs — UI or hand-edited `mcp.json` only), so mimir-setup
+merges the JSON file directly instead, preserving any other servers already
+in it. Either way, if the CLI is missing, the command fails, or an existing
+`.mcp.json` isn't valid JSON, `mimir-setup` prints a warning and still writes
+the instruction files — see the manual `.mcp.json` / `.vscode/mcp.json`
 snippets further down as a fallback.
 
 The command is safe to re-run — it skips any file or registration that already exists, and only appends to `CLAUDE.md`/`copilot-instructions.md` if the mimir section isn't already there.
