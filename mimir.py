@@ -5469,27 +5469,85 @@ def _vscode_user_prompts_dir() -> Path:
     return base / "Code" / "User" / "prompts"
 
 
+def _register_mcp_server(arg: str, is_global: bool, cwd: Path) -> None:
+    """Register mimir as an MCP server with the named client via its own CLI
+    (claude / code). Never raises: a missing CLI or a failed subprocess call
+    prints a clear fallback message and setup() continues on to the
+    instruction files regardless, since that half of the job is independent."""
+    if arg == "claude":
+        cli = shutil.which("claude")
+        if not cli:
+            print("skipped  MCP registration  ('claude' CLI not found on PATH — "
+                  "install Claude Code, then re-run mimir-setup)")
+            return
+        scope = "user" if is_global else "project"
+        try:
+            proc = subprocess.run(
+                [cli, "mcp", "add", "mimir", "--scope", scope, "--", "mimir"],
+                capture_output=True, text=True, timeout=15, stdin=subprocess.DEVNULL,
+            )
+            out = (proc.stdout or proc.stderr or "").strip()
+            if proc.returncode == 0:
+                print(f"registered  mimir with Claude Code ({scope} scope)")
+            elif "already exists" in out.lower():
+                print(f"skipped  MCP registration  (mimir already registered at {scope} scope)")
+            else:
+                print(f"WARNING: 'claude mcp add' failed: {out or 'unknown error'}")
+        except Exception as e:
+            print(f"WARNING: could not run 'claude mcp add': {e}")
+
+    elif arg == "copilot":
+        cli = shutil.which("code")
+        if not cli:
+            print("skipped  MCP registration  ('code' CLI not found on PATH — in VS "
+                  "Code, run 'Shell Command: Install code command in PATH', then "
+                  "re-run mimir-setup)")
+            return
+        mcp_json = '{"name":"mimir","command":"mimir","env":{"MCP_WORKSPACE_ROOT":"${workspaceFolder}"}}'
+        cmd = [cli, "--add-mcp", mcp_json]
+        if not is_global:
+            cmd = [cli, "--folder-uri", str(cwd), "--add-mcp", mcp_json]
+        try:
+            proc = subprocess.run(
+                cmd, capture_output=True, text=True, timeout=15, stdin=subprocess.DEVNULL,
+            )
+            if proc.returncode == 0:
+                scope = "user profile" if is_global else "this project (.vscode/mcp.json)"
+                print(f"registered  mimir with Copilot ({scope})")
+            else:
+                out = (proc.stdout or proc.stderr or "").strip()
+                print(f"WARNING: 'code --add-mcp' failed: {out or 'unknown error'}")
+        except Exception as e:
+            print(f"WARNING: could not run 'code --add-mcp': {e}")
+
+
 def setup() -> None:
-    """Console-script entry point: drop the workflow-instruction file(s) for one
-    client (CLAUDE.md or copilot-instructions.md) and a starter .mimirignore
-    into the current project.
+    """Console-script entry point: register mimir as an MCP server with one
+    client and drop its workflow-instruction file into the current project.
 
     Usage: `mimir-setup [claude|copilot] [--global]` — client defaults to
-    claude when no arg is given. Writes only the file(s) for the named
-    client, so a Copilot-only project doesn't get an unused CLAUDE.md and
-    vice versa.
+    claude when no arg is given.
 
-    --global writes the instructions to your user/profile scope instead of
-    this project (~/.claude/CLAUDE.md for claude; a VS Code user "*.instructions.md"
-    file for copilot) — applies to every project on this machine, and touches
-    nothing in the current repo. Skips .mimirignore, which is inherently
-    project-specific. Use this while mimir is still your personal tool; drop
-    --global later (plain `mimir-setup [claude|copilot]`) once you're ready to
-    commit project-level instructions for a team to share.
+    Without --global (default): registers mimir at PROJECT scope (a committed
+    .mcp.json for claude, .vscode/mcp.json for copilot — via `claude mcp add`
+    / `code --add-mcp`) and writes CLAUDE.md or copilot-instructions.md plus a
+    starter .mimirignore into the current repo. Use this once you're ready to
+    share mimir with a team on this project — everything it creates is meant
+    to be committed.
 
-    Does not write .mcp.json / .vscode/mcp.json — register mimir with your
-    client at user/global scope instead (connect-claude.sh / connect-copilot.sh),
-    which needs no per-repo config file at all.
+    --global: registers mimir at USER scope instead (available in every
+    project on this machine, nothing in any repo) and writes the same
+    instructions to your user profile (~/.claude/CLAUDE.md for claude; a VS
+    Code user "*.instructions.md" file for copilot) instead of this project.
+    Skips .mimirignore, which is inherently project-specific. Use this while
+    mimir is still your personal tool — drop --global later, in a given
+    project, once you're ready to make it a shared team setup there; the two
+    scopes layer without conflict.
+
+    Registration falls back to a printed warning (never aborts the rest of
+    setup) if the client's own CLI (claude / code) isn't on PATH or the
+    command fails — see HowTo.md for the manual .mcp.json / .vscode/mcp.json
+    snippets in that case.
     """
     argv = sys.argv[1:]
     is_global = "--global" in argv
@@ -5500,6 +5558,7 @@ def setup() -> None:
         return
 
     cwd = Path.cwd()
+    _register_mcp_server(arg, is_global, cwd)
     mimir_marker = "## Code exploration — use mimir tools"
     availability_line = (
         "You have mimir MCP tools available in every project on this machine."
@@ -5650,14 +5709,15 @@ _CLI_HELP = """\
 mimir — structural code index for Claude Code and GitHub Copilot
 
 SETUP
-  mimir-setup [claude|copilot]            Per-project: CLAUDE.md or copilot-instructions.md
-                                           (default: claude) + .mimirignore
-  mimir-setup [claude|copilot] --global   Same instructions, written to your user profile
-                                           instead — applies to every project, nothing added
-                                           to this repo (use while mimir is still personal;
-                                           drop --global later to share with a team)
-
-  Register the mimir MCP server itself with connect-claude.sh / connect-copilot.sh.
+  mimir-setup [claude|copilot]            Registers the MCP server at PROJECT scope
+                                           (committed .mcp.json / .vscode/mcp.json) and
+                                           writes CLAUDE.md or copilot-instructions.md
+                                           (default: claude) + .mimirignore — for sharing
+                                           mimir with a team on this project
+  mimir-setup [claude|copilot] --global   Same, but at USER scope and written to your
+                                           user profile instead — applies to every project,
+                                           nothing added to this repo (use while mimir is
+                                           still your personal tool)
 
 TERMINAL COMMANDS
   mimir hint   "<rough terms>"  Cheap first pass: discover what the codebase calls

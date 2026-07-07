@@ -47,64 +47,44 @@ Changes to `mimir.py` take effect immediately without reinstalling.
 
 ### After installing — connect mimir to your AI client
 
-Two ways to do this, pick whichever fits:
+`mimir-setup [claude|copilot] [--global]` does everything: registers mimir as
+an MCP server with the named client (via `claude mcp add` / `code --add-mcp`
+under the hood) and writes the workflow instructions telling the AI when and
+how to use it. Client defaults to `claude` when no arg is given.
 
-**User scope (recommended)** — registers mimir once per machine, works in every
-project, adds no files to any repo (nothing to `.gitignore`, nothing to
-accidentally commit at work):
+**Personal use, nothing shared yet** — add `--global`. Registers at USER scope
+(available in every project on this machine) and writes the instructions to
+your user profile instead of this repo — nothing touches the project at all:
 
 ```bash
-./connect-claude.sh     # Claude Code
-./connect-copilot.sh    # GitHub Copilot in VS Code
+mimir-setup claude --global     # registers with Claude Code (user scope) + ~/.claude/CLAUDE.md
+mimir-setup copilot --global    # registers with Copilot (user scope) + a VS Code user instructions file
 ```
 
-(`connect-claude.ps1` / `connect-copilot.ps1` on Windows.) Each script checks
-for the client's CLI (`claude` / `code`) and for `mimir` on PATH before
-registering, and only touches that one client's config — run either, both, or
-neither depending on what you use.
-
-**`mimir-setup [claude|copilot]`** — the MCP server registration above is
-client-wide and identical for every project, but the *instructions telling the
-AI when and how to use mimir* are genuinely project-specific, so those still
-need a per-project step. Run this once in the root of any project you want to
-use mimir with:
+**Ready to share with a team on this project** — drop `--global`. Registers at
+PROJECT scope and writes the instructions into the repo, meant to be committed:
 
 ```bash
 cd /path/to/your-project
-mimir-setup            # defaults to claude
-mimir-setup copilot    # or explicitly for Copilot
+mimir-setup            # .mcp.json + CLAUDE.md (defaults to claude)
+mimir-setup copilot    # .vscode/mcp.json + copilot-instructions.md
 ```
 
-Writes only the file(s) for the named client, plus a starter `.mimirignore`:
+| Mode | MCP registration | Instructions | .mimirignore |
+|---|---|---|---|
+| `--global` | user scope (every project) | `~/.claude/CLAUDE.md` or a VS Code user instructions file | skipped — inherently project-specific |
+| default (no `--global`) | project scope (`.mcp.json` / `.vscode/mcp.json`, committed) | `CLAUDE.md` or `.github/copilot-instructions.md` | starter file created |
 
-| Client | File | Purpose |
-|---|---|---|
-| `claude` (default) | `CLAUDE.md` | Tells Claude Code when and how to use each tool |
-| `copilot` | `.github/copilot-instructions.md` | Tells Copilot to use mimir and not fall back to built-in search |
-| both | `.mimirignore` | Starter exclusion patterns (build output, vendor libs, generated files) |
+The two scopes don't conflict — global instructions/registration apply
+everywhere, a project's own `mimir-setup` (no `--global`) layers on top for
+that one repo when you're ready to move it from personal to shared.
 
-**Keeping it fully global (personal use, nothing shared yet)** — add `--global`
-to write the same instructions to your user profile instead of this repo, so
-mimir stays entirely off the project until you're ready to share it:
+MCP registration needs the client's own CLI (`claude` / `code`) on PATH; if
+it's missing or the command fails, `mimir-setup` prints a warning and still
+writes the instruction files — see the manual `.mcp.json` / `.vscode/mcp.json`
+snippets further down as a fallback.
 
-```bash
-mimir-setup claude --global     # -> ~/.claude/CLAUDE.md (applies to every project)
-mimir-setup copilot --global    # -> a VS Code user "*.instructions.md" file (same idea)
-```
-
-Skips `.mimirignore` (that one's inherently project-specific — noise patterns
-differ per repo). When you're ready to make mimir a shared team tool on a given
-project, just run the plain per-project command above; the two don't conflict
-— global instructions apply everywhere, project instructions layer on top for
-that one repo.
-
-It does **not** create `.mcp.json` / `.vscode/mcp.json` — that's what
-`connect-claude`/`connect-copilot` are for. If you need a per-repo config file
-instead (e.g. to commit and share with a team, or for a client without a CLI
-to register at user scope), see the manual `.mcp.json` / `.vscode/mcp.json`
-snippets further down.
-
-The command is safe to re-run — it skips any file that already exists, and only appends to `CLAUDE.md`/`copilot-instructions.md` if the mimir section isn't already there.
+The command is safe to re-run — it skips any file or registration that already exists, and only appends to `CLAUDE.md`/`copilot-instructions.md` if the mimir section isn't already there.
 
 ---
 
@@ -174,7 +154,7 @@ For any task involving existing code:
 
 ## Connecting to Claude Code (manual setup)
 
-`connect-claude.sh`/`.ps1` handles this automatically at user scope (recommended — see above). If you'd rather use a per-repo config instead, drop a `.mcp.json` file in the project root:
+`mimir-setup` handles this automatically (`--global` for user scope, no arg for project scope — see above). If you'd rather configure it by hand, drop a `.mcp.json` file in the project root:
 
 ```json
 {
@@ -195,7 +175,7 @@ Claude Code picks this up automatically when you open that folder. The `"."` res
 
 ## Connecting to GitHub Copilot (VS Code) (manual setup)
 
-`connect-copilot.sh`/`.ps1` handles this automatically at user-profile scope (recommended — see above). If you'd rather use a per-repo config instead, drop a `.vscode/mcp.json` file in the project root:
+`mimir-setup copilot` handles this automatically (`--global` for user-profile scope, no arg for project scope — see above). If you'd rather configure it by hand, drop a `.vscode/mcp.json` file in the project root:
 
 ```json
 {
