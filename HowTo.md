@@ -88,18 +88,21 @@ The two scopes don't conflict — global instructions/registration apply
 everywhere, a project's own `mimir-setup` (no `--global`) layers on top for
 that one repo when you're ready to move it from personal to shared.
 
-`claude` registration (both scopes) and `copilot --global` go through that
-client's own CLI (`claude mcp add` / `code --add-mcp`). Every other case —
-`copilot`/`visualstudio` project scope, and `visualstudio --global` — merges
-the JSON file directly instead, preserving any other servers already in it:
-`code --add-mcp`'s merge behavior with an already-populated `mcp.json` isn't
-documented anywhere and was observed in practice to silently skip adding
-mimir when other servers were already registered, so project scope no longer
-depends on it at all (and doesn't need the `code` CLI installed, either).
-`copilot --global` still uses it, for lack of a confirmed direct file path —
-if mimir doesn't show up there and you already have other user-scope servers,
-check via **MCP: Open User Configuration** in the Command Palette. Either
-way, if a required CLI is missing, a command fails, or an existing
+Every path appends/merges the mimir entry alongside whatever's already
+registered — never overwrites. `claude` (both scopes) goes through its own
+CLI (`claude mcp add`), verified to merge correctly on its own. Every other
+path — `copilot`/`visualstudio` project scope, and both's global scope —
+merges the JSON file directly instead of going through `code --add-mcp`:
+that CLI's merge behavior with an already-populated `mcp.json` isn't
+documented anywhere and was reported (and reproduced locally) to silently
+skip adding mimir when other servers were already registered, so none of
+these paths depend on it (project scope doesn't even need the `code` CLI
+installed). The one soft spot: `copilot --global`'s target path
+(`<VS Code profile dir>/mcp.json`) is inferred by analogy with
+`settings.json`/`prompts/`, not confirmed in Microsoft's docs — mimir-setup
+prints the exact path it wrote, so cross-check it against what **MCP: Open
+User Configuration** opens in the Command Palette if mimir doesn't show up.
+Either way, if a required CLI is missing, a command fails, or an existing
 `.mcp.json` isn't valid JSON, `mimir-setup` prints a warning and still writes
 the instruction files — see the manual `.mcp.json` / `.vscode/mcp.json`
 snippets further down as a fallback.
