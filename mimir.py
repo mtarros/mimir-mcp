@@ -2947,26 +2947,17 @@ def get_file_structure(path: str, max_files: int = 10) -> str:
 
 @_tool
 def verify_symbol_existence(symbol_name: str, max_results: int = 25, path: str = "") -> str:
-    """Confirm whether a symbol (class / function / method / struct / etc.) is
-    actually DEFINED anywhere in the workspace, and report exactly where, with
-    its signature.
-
-    WHEN TO USE: any time you are about to assume a function or type exists -
-    before you call it, import it, or claim in an answer that it's defined. This
-    returns ground truth from the source tree, so prefer it over guessing or
-    grepping raw files yourself.
+    """Confirm whether a symbol is actually DEFINED anywhere in the workspace,
+    and report exactly where, with its signature — ground truth from the
+    source tree, before assuming a function/type exists.
 
     Args:
-        symbol_name: the identifier to look for. Matched case-insensitively
-                     (e.g. "signalr" finds a symbol actually named "SignalR"),
-                     but results show the symbol's real casing as defined.
+        symbol_name: identifier to look for; matched case-insensitively but
+            results show real casing.
         max_results: cap on matches returned (default 25).
-        path: optional workspace-relative path (or path suffix) to restrict
-              results to one file, e.g. "src/services/auth.py". Leave blank to
-              search the whole workspace.
+        path: optional workspace-relative path/suffix to restrict to one file.
 
-    Returns 'FOUND' lines with file:line and signature (in the codebase's
-    actual casing), or a clear 'NOT FOUND'.
+    Returns 'FOUND' lines with file:line and signature, or 'NOT FOUND'.
     """
     name = symbol_name.strip()
     if not name or not re.match(r"^\w[\w]*$", name):
@@ -2994,16 +2985,12 @@ def verify_symbol_existence(symbol_name: str, max_results: int = 25, path: str =
 
 @_tool
 def scope_hint(terms: str) -> str:
-    """Cheap first-pass symbol lookup — returns what actually exists and suggests a
-    focused scope_task query.  Call this when you have rough keywords but are unsure
-    of the exact symbol names; the output tells you what the codebase calls things so
-    the follow-up scope_task query is precise instead of broad.
-
-    Returns only names, file paths, and a suggested query — no blueprints — so it
-    costs very few tokens.
+    """Cheap first-pass symbol lookup for rough/unsure keywords — returns what
+    the codebase actually calls things plus a suggested focused scope_task
+    query. No blueprints, so it costs very few tokens.
 
     Args:
-        terms: Space-or-comma-separated rough search terms, e.g. "timer refresh current jobs"
+        terms: space-or-comma-separated rough search terms.
     """
     # Extract meaningful keywords — applies the same stopword + length filtering
     # that scope_task uses, so passing a full sentence like "are you sure you want
@@ -3419,32 +3406,21 @@ def _score_task_files(task: str, focus: str = "") -> tuple[dict[str, float], lis
 
 @_tool
 def scope_task(task: str, max_files: int = 5, include_blueprints: bool = False, focus: str = "") -> str:
-    """Map a plain-English task description to the specific files and symbols it
-    touches — before reading any raw file contents.
+    """Map a plain-English task description to the specific files/symbols it
+    touches — call this FIRST on any task involving existing code, before
+    reading raw files. Then call get_file_structure on the files you need.
 
-    WHEN TO USE: call this as the FIRST step on any task that involves existing
-    code. It extracts candidate symbol names from your description, searches the
-    workspace for their definitions, and returns the ranked file list with matched
-    symbols. Then call get_file_structure on the specific files you need.
-
-    TIP: use technical/class names when known ("RectificationFilter") rather than
-    domain language ("corrective actions filter") — the symbol index matches code
-    names, not feature names.
+    TIP: use technical/class names when known ("RectificationFilter") rather
+    than domain language ("corrective actions filter") — the symbol index
+    matches code names, not feature names.
 
     Args:
-        task: plain-English description of what you want to do, e.g.
-              "add retry logic to the live tutor session handler".
+        task: plain-English description of what you want to do.
         max_files: how many files to rank and return (default 5).
-        include_blueprints: set True to include full structural blueprints inline
-                            (useful for small repos; may produce large output on
-                            large repos — prefer calling get_file_structure after).
-        focus: optional comma-separated "prefix:weight" pairs applied only for
-               this call — e.g. "src/auth:3.0,src/payments:2.0".  Does not
-               modify .mimir-focus or the session-wide weights.  Overrides any
-               persistent focus weights when non-empty.
-
-    Returns a compact context block: keywords searched, matched symbols with
-    file:line locations, and ranked files by relevance score.
+        include_blueprints: include full structural blueprints inline (may
+            produce large output on large repos).
+        focus: optional "prefix:weight" pairs for this call only; overrides
+            persistent focus without modifying it.
     """
     file_hit_count, keywords, all_hits, expanded, _used_fts = _score_task_files(task, focus)
     if not keywords:
@@ -3545,24 +3521,18 @@ def scope_task(task: str, max_files: int = 5, include_blueprints: bool = False, 
 
 @_tool
 def scope_area(task: str, max_depth: int = 4, focus: str = "") -> str:
-    """Like scope_task, but rolls matches up into a directory tree instead of a
-    flat file list — shows WHERE in a large monorepo a task's matches cluster,
-    so you can `cd`/pin MCP_WORKSPACE_ROOT into that sub-project first.
-
-    WHEN TO USE: in a multi-project repo (several apps/services under one root)
-    when you don't yet know which sub-project a task lives in, or a flat
-    scope_task result is spread thin across unrelated areas. Once you know the
-    sub-project, scope_task/scope_hint run cleaner scoped to just that folder.
-    Skip this for repos that are already a single project.
+    """Like scope_task, but rolls matches into a directory tree instead of a
+    flat list — shows WHERE in a monorepo a task's matches cluster, when you
+    don't yet know which sub-project a task lives in. Once you do, set_scope
+    into that directory and use scope_task/scope_hint from there.
 
     Args:
         task: plain-English description of what you want to do.
-        max_depth: how many directory levels deep to roll scores up (default 4).
-        focus: optional comma-separated "prefix:weight" pairs for this call only.
+        max_depth: directory levels to roll scores up (default 4).
+        focus: optional "prefix:weight" pairs for this call only.
 
-    Returns an indented directory tree annotated with match scores/file counts,
-    plus a suggested `cd` target — the most specific directory that still
-    captures a real cluster (2+ files) of the top matches.
+    Returns a directory tree with match scores/counts plus a suggested
+    set_scope target.
     """
     file_hit_count, keywords, all_hits, expanded, _used_fts = _score_task_files(task, focus)
     if not keywords:
@@ -3720,31 +3690,15 @@ def _fts_search(
 
 @_tool
 def semantic_search(query: str, max_results: int = 10, focus: str = "") -> str:
-    """Search the workspace by MEANING rather than exact symbol names.
-
-    WHEN TO USE: when scope_task returns poor results because you know the
-    CONCEPT but not the CODE NAME — e.g. "authentication token refresh"
-    instead of "refreshAuthToken", "connection pool exhaustion" instead of
-    "PoolExhaustedException". Also useful for cross-cutting concerns that
-    live in several differently-named files.
-
-    How it works:
-      1. FTS5 BM25 full-text search over decomposed identifier tokens
-      2. RRF fusion with symbol-index keyword hits
-      3. Reverse-import graph expansion to surface structurally adjacent files
-
-    TIP: use scope_task when you know the exact class/function name.
-         Use semantic_search when you know what the code DOES but not what
-         it is CALLED.
+    """Search the workspace by MEANING rather than exact symbol names — use
+    when scope_task returns poor results because you know the CONCEPT but not
+    the CODE NAME, e.g. "authentication token refresh" vs "refreshAuthToken".
 
     Args:
-        query:       natural-language description of what the code does, e.g.
-                     "database connection retry logic"
-                     "user authentication token expiry handler"
+        query: natural-language description of what the code does.
         max_results: how many ranked files to return (default 10, max 25).
-        focus:       optional comma-separated "prefix:weight" pairs applied only
-                     for this call — does not modify .mimir-focus or the
-                     session-wide weights.  Overrides persistent focus when set.
+        focus: optional "prefix:weight" pairs for this call only; overrides
+            persistent focus without modifying it.
     """
     try:
         max_results = max(1, min(int(max_results), 25))
@@ -3895,19 +3849,14 @@ def semantic_search(query: str, max_results: int = 10, focus: str = "") -> str:
 
 @_tool
 def get_imports(path: str) -> str:
-    """List every import in a source file and resolve workspace-local ones to actual paths.
-
-    WHEN TO USE: after get_file_structure reveals an unfamiliar symbol, call this
-    to find which file it comes from — without reading raw file contents. Resolves
-    relative paths (./foo, ../lib/bar) and the @/ alias (Next.js root). Use the
-    returned workspace paths as arguments to get_file_structure to inspect those
-    files next.
+    """List every import in a source file, resolving workspace-local ones to
+    actual paths (relative paths, Next.js @/ alias). Use when an unfamiliar
+    symbol appears and you need to trace its origin without reading the file.
 
     Args:
         path: path to the file, relative to the workspace root.
 
-    Returns each import as [workspace] resolved/path.ts or [external] package-name,
-    with the names being imported shown inline.
+    Returns each import as [workspace] resolved/path or [external] package-name.
     """
     try:
         resolved = _resolve_in_workspace(path)
@@ -3967,21 +3916,13 @@ def get_imports(path: str) -> str:
 
 @_tool
 def get_dependents(path: str) -> str:
-    """Find all workspace files that directly import the given file.
-
-    WHEN TO USE: after identifying a file you are about to change, call this
-    to see the blast radius — which other files in the workspace will be
-    directly affected. Returns only first-hop importers (files with a direct
-    import statement pointing at this file).
-
-    Works for languages where mimir resolves imports to workspace paths:
-    TypeScript, JavaScript, and Python. For other languages use find_callers
-    to trace symbol-level usage instead.
+    """Find all workspace files that directly import the given file — blast
+    radius before changing it. First-hop importers only. Works for
+    TypeScript/JavaScript/Python (resolved import paths); for other languages
+    use find_callers for symbol-level usage instead.
 
     Args:
         path: workspace-relative path to the file being changed.
-
-    Returns a list of files that import it, or a clear message if none do.
     """
     try:
         resolved = _resolve_in_workspace(path)
@@ -4014,26 +3955,14 @@ def get_dependents(path: str) -> str:
 
 @_tool
 def get_symbol(path: str, symbol_name: str) -> str:
-    """Return the complete source code of ONE named symbol (function, class, or method)
-    — bodies included.
-
-    This is the efficient middle ground between get_file_structure (signatures only,
-    no bodies) and reading the raw file (everything). Use it when you know which
-    symbol you need and want just its implementation.
-
-    WHEN TO USE: after scope_task or get_file_structure identifies the symbol you
-    need, call get_symbol to read only that function or class instead of the entire
-    file. Typically 10-50× fewer tokens than reading the whole file.
+    """Return the complete source (body included) of ONE named symbol — the
+    efficient middle ground between get_file_structure (signatures only) and
+    reading the whole file. Each line is prefixed with its real line number
+    (matching get_file_structure), usable directly as an edit anchor.
 
     Args:
-        path: workspace-relative path to the source file (e.g. "src/services/auth.py")
-        symbol_name: exact name of the function, class, or method (e.g. "authenticate")
-
-    Returns the full source of the symbol with its original indentation, including
-    docstrings, decorators on the definition line, and the complete body. Each
-    line is prefixed with its real line number in the file (e.g. "L42  ..."),
-    matching get_file_structure's blueprint format, so the output can be used
-    directly as an edit anchor without a follow-up grep.
+        path: workspace-relative path to the source file.
+        symbol_name: exact name of the function, class, or method.
     """
     try:
         resolved = _resolve_in_workspace(path)
@@ -4072,21 +4001,13 @@ def get_symbol(path: str, symbol_name: str) -> str:
 
 @_tool
 def get_changed_files(base: str = "main") -> str:
-    """Return structural blueprints of every source file changed vs a git base branch.
-
-    Combines committed branch changes, uncommitted edits, and untracked new files
-    into a single compact overview — the ideal first call at the start of a session
-    to orient yourself on what is currently in flight.
-
-    WHEN TO USE: at the start of a session when you need to know which files are
-    actively being worked on, before deciding where to focus.
+    """Structural blueprints of every source file changed vs a git base branch
+    — committed, uncommitted, and untracked — for orienting on what's
+    currently in flight at the start of a session.
 
     Args:
-        base: the branch or commit to diff against (default "main"; try "master" or
-              "HEAD~1" if main does not exist).
-
-    Returns blueprints of each changed source file (bodies stripped, symbols + line
-    numbers only) so you get the full structural picture in one call.
+        base: branch or commit to diff against (default "main"; try "master"
+            or "HEAD~1" if main doesn't exist).
     """
     try:
         def _git(*args: str) -> "subprocess.CompletedProcess[str]":
@@ -4174,16 +4095,10 @@ def get_changed_files(base: str = "main") -> str:
 
 @_tool
 def get_architecture() -> str:
-    """Return a high-level map of the entire workspace: directories, files, and
-    their top-level symbols. One compact overview instead of dozens of
-    get_file_structure calls.
-
-    WHEN TO USE: at the very start of a session to understand the project layout
-    before diving into specific files. Much cheaper than exploring directory by
-    directory. For a specific directory use get_file_structure(dir_path) instead.
-
-    The map is built from cached blueprints during startup warmup so this call
-    is nearly instant after the index is ready (check get_status).
+    """High-level map of the whole workspace: directories, files, top-level
+    symbols. One call at session start instead of exploring directory by
+    directory; for one specific directory use get_file_structure(dir_path).
+    Nearly instant once the index is warm (check get_status).
     """
     global _ARCHITECTURE_MAP
     if _ARCHITECTURE_MAP:
@@ -4414,24 +4329,14 @@ def _cs_find_call_sites(lang: str, raw: bytes, symbol_name: str) -> list[tuple[i
 
 @_tool
 def find_callers(symbol_name: str, max_results: int = 20) -> str:
-    """Find every call site of a symbol across the workspace.
+    """Find every call/usage site of a symbol across the workspace — calls,
+    bare/delegate references, and type references, excluding the definition's
+    own name and import statements. Falls back to a ripgrep/regex whole-word
+    text scan for languages without tree-sitter support.
 
-    Uses an in-process tree-sitter query (when the grammar loads cleanly) to
-    match every identifier reference to the symbol — calls (`foo(...)`,
-    `x.foo(...)`), bare/delegate references (`x.foo`, `this.foo`), and type
-    references (`Foo.Member`, `Get<Foo>()`) — while excluding the
-    definition's own name, comments, docstrings, and import/using
-    statements. Falls back to a ripgrep/regex text scan for a language whose
-    grammar isn't available, or entirely when tree-sitter isn't installed —
-    that fallback matches the identifier as a whole word anywhere in the
-    file, including non-reference text.
-
-    Unlike verify_symbol_existence (which searches only definition blueprints),
-    this searches implementation code to find where the symbol is called.
-
-    WHEN TO USE: after verify_symbol_existence tells you WHERE something is
-    defined, use find_callers to trace WHO calls it — for impact analysis,
-    understanding data flow, or finding all consumers of an interface.
+    Unlike verify_symbol_existence (definitions only), this searches
+    implementation code for where a symbol is actually used — impact analysis,
+    tracing data flow, or finding all consumers of an interface.
 
     Args:
         symbol_name: exact identifier to search for (case-sensitive).
@@ -4635,25 +4540,15 @@ def find_callers(symbol_name: str, max_results: int = 20) -> str:
 
 @_tool
 def record_alias(domain_term: str, code_name: str) -> str:
-    """Record a domain/feature name → code name mapping so future scope_task
-    calls find the right files even when described in non-technical language.
-
-    WHEN TO USE: call this whenever you discover that a feature name used in
-    task descriptions maps to a different name in the codebase. For example,
-    if searching for "corrective actions filter" returns the wrong files but
-    "RectificationFilter" finds them immediately, call:
-        record_alias("corrective actions", "RectificationFilter")
-
-    The mapping is saved to .mimiraliases in the workspace root and applied
-    automatically to all future scope_task calls in this project.
+    """Record a domain/feature name → code name mapping, applied automatically
+    to all future scope_task calls in this project. Call this when a task
+    description's feature name ("corrective actions filter") maps to a
+    different codebase name ("RectificationFilter") that finds the right files.
 
     Args:
-        domain_term: the plain-English feature/domain name (e.g. "corrective actions filter")
-        code_name: the actual class/module/file prefix used in the codebase
-                   (e.g. "RectificationFilter"). For multiple code names, call
-                   record_alias once per name or separate them with commas.
-
-    Returns a confirmation message showing the saved mapping.
+        domain_term: plain-English feature/domain name.
+        code_name: the actual class/module/file prefix; comma-separate for
+            multiple code names mapping to the same domain term.
     """
     domain = domain_term.strip().lower()
     code = code_name.strip()
@@ -4726,34 +4621,16 @@ def record_alias(domain_term: str, code_name: str) -> str:
 
 @_tool
 def record_note(path_prefix: str, note: str) -> str:
-    """Attach a free-text contextual note to files/paths matching a prefix, so
-    future scope_task/get_file_structure calls surface it as prose alongside
-    those files.
-
-    DIFFERENT FROM record_alias: record_alias teaches mimir SEARCH VOCABULARY
-    (a domain term expands into a code name, silently feeding scope_task's
-    keyword extraction). record_note attaches CONTEXT (shown verbatim as a
-    "note:" line, never used for ranking or search). Use record_note for things
-    like non-obvious architecture ("this uses platform-native timers, not the
-    shared service"), gotchas, or pointers to the real implementation file when
-    it differs from what the name suggests. Use record_alias when a plain-English
-    term and a code identifier are just two names for the same thing.
-
-    WHEN TO USE: after discovering something about a path/feature that a future
-    reader would NOT be able to infer purely from the file/symbol names — e.g.
-    you found out the "real" logic lives elsewhere, or that a method looks
-    unused but is called reflectively. Prefer narrow, specific prefixes — a
-    note on a broad prefix like "" or "src" will surface on every file.
+    """Attach a free-text contextual note to files/paths matching a prefix — e.g.
+    non-obvious architecture, a gotcha, or where the real logic actually lives.
+    Surfaced verbatim as prose in scope_task/get_file_structure, never used for
+    ranking. Different from record_alias, which teaches search vocabulary.
 
     Args:
-        path_prefix: a workspace-relative path or substring identifying the
-                     files this note applies to (e.g. "Features/Playback" or
-                     "SyncService.cs"). Matches by substring, same as .mimir-focus.
-        note: the free-text note. Kept short (multi-line input is flattened
-              to one line — the storage format is one note per line).
-
-    Returns a confirmation showing the saved note, or "Already recorded" if
-    this exact (prefix, note) pair already exists.
+        path_prefix: workspace-relative path or substring (substring match,
+            same as .mimir-focus). Prefer narrow prefixes — "" or "src" surfaces
+            on every file.
+        note: free-text; kept short, flattened to one line if multi-line.
     """
     prefix = path_prefix.strip().replace("\\", "/").lower()
     if "=" in prefix:
@@ -4799,26 +4676,16 @@ def record_note(path_prefix: str, note: str) -> str:
 
 @_tool
 def add_ignore(pattern: str, reason: str = "") -> str:
-    """Add a gitignore-style pattern to .mimirignore to exclude noisy files from the index.
+    """Add a gitignore-style pattern to .mimirignore, excluding noisy
+    files/directories (vendor libs, generated code, build artefacts) from the
+    index. Takes effect on the next file walk (within 30s).
 
-    Call this when you encounter files or directories that add noise without useful
-    symbols — vendor libraries, generated code, test fixtures, build artefacts,
-    minified bundles, resource XML, etc.
-
-    IMPORTANT: Always tell the user what you are about to add and why BEFORE calling
-    this tool — they may want to adjust the pattern or skip it entirely. A pattern
-    that is too broad can silently exclude real source files.
-
-    The pattern is appended immediately and takes effect on the next file walk
-    (within 30 seconds). The architecture map cache is also cleared so the next
-    get_architecture call reflects the updated exclusions.
+    IMPORTANT: tell the user what you're about to add and why BEFORE calling —
+    a pattern that's too broad can silently exclude real source files.
 
     Args:
         pattern: gitignore-style glob, e.g. "**/vendor/**" or "**/*.generated.cs"
-        reason:  short human-readable note saved as a comment above the pattern
-                 so the team knows why it was added (e.g. "vendored jQuery bundles")
-
-    Returns confirmation showing the added pattern.
+        reason: short note saved as a comment above the pattern.
     """
     global _MIMIRIGNORE_PATTERNS, _FILE_LIST, _FILE_LIST_TS, _ARCHITECTURE_MAP
 
@@ -4969,45 +4836,19 @@ def audit_index_health(max_findings: int = 5) -> str:
 
 @_tool
 def set_focus(entries: str, persist: bool = True) -> str:
-    """Set (or clear) per-project score weights so scope_task biases results toward
-    the projects you're actively working in and away from those you're not.
-
-    Each entry is a path-prefix substring optionally followed by :weight.
-    Default weight when omitted is 3.0 (3× boost).  Use a weight below 1.0 to
-    suppress a project (e.g. 0.3 reduces its scores to 30%).  Multiple entries are
-    comma-separated.  Pass an empty string to clear all weights and restore equal
-    scoring across every project.
-
-    By default the weights are saved to .mimir-focus in the workspace root and take
-    effect immediately — no restart needed.  Pass persist=False to apply weights for
-    this session only without touching the file (useful when two AI assistants share
-    the same workspace and you don't want them overwriting each other's focus state).
-    Call set_focus("") to reset at any time.
-
-    The special prefix '*' acts as a default weight for every file that does NOT
-    match any named prefix — useful in mixed mono-repos to suppress noisy sibling
-    directories without listing each one explicitly.
-
-    For a single-call override without any persistent state change, pass the focus
-    string directly to scope_task or semantic_search via their focus= parameter.
+    """Set (or clear) per-project score weights so scope_task/semantic_search bias
+    results toward the projects you're actively working in.
 
     Args:
-        entries: comma-separated list of prefix[:weight] pairs, e.g.:
-            "Carps.Mobile"                            → boost Mobile 3×, others unchanged
-            "Carps.Mobile, Carps.Keypad:0.3"          → boost Mobile, suppress Keypad
-            "Carps.Mobile:3, Carps.Keypad:0.3"        → explicit weights for both
-            "app/src/main/java:5, *:0.2"              → boost Java 5×, suppress everything else 0.2×
-            ""                                         → clear all, equal scoring
-        persist: if True (default), save weights to .mimir-focus so they survive
-                 server restart and are visible to other sessions.  If False, apply
-                 weights in memory for this session only.
+        entries: comma-separated prefix[:weight] pairs, default weight 3.0 if
+            omitted; weight below 1.0 suppresses a project. '*' sets the default
+            weight for files matching no named prefix. "" clears all weights.
+            e.g. "Carps.Mobile, Carps.Keypad:0.3" or "app/src/main/java:5, *:0.2"
+        persist: if False, applies for this session only, without writing
+            .mimir-focus (use when another assistant shares this workspace).
 
-    Examples:
-        set_focus("InControl.Carps.Mobile")
-        set_focus("InControl.Carps.Mobile, InControl.Carps.Keypad:0.3")
-        set_focus("app/src/main/java:5, *:0.2")
-        set_focus("src/auth:3.0", persist=False)   # session-local, no file write
-        set_focus("")
+    For a one-off override with no persistent state change, pass focus= directly
+    to scope_task/semantic_search instead.
     """
     global _FOCUS_WEIGHTS
     raw = entries.strip()
@@ -5043,30 +4884,15 @@ def set_focus(entries: str, persist: bool = True) -> str:
 
 @_tool
 def set_scope(path: str) -> str:
-    """Hard-narrow every search tool (scope_task, scope_area, scope_hint,
-    verify_symbol_existence, find_callers) to only files under one directory —
-    the same effect as `cd`-ing into a sub-project before running mimir, but
-    without losing the whole-repo index or paying a reindex cost.
-
-    WHEN TO USE: in a large monorepo (multiple apps/services under one root),
-    once scope_area or a first scope_task pass tells you which sub-project a
-    task lives in, call set_scope on that directory so every subsequent call
-    in this session only sees that sub-project. Persists until cleared with
-    set_scope("") — it survives across separate CLI invocations and MCP calls,
-    unlike a per-call scope_task `focus=` override.
-
-    Unlike set_focus (a soft ranking bias — the rest of the repo still shows
-    up, just lower-scored), this is a hard filter: files outside the scoped
-    directory are excluded from results entirely. The two are independent and
-    can be combined (set_focus re-ranks within whatever set_scope allows through).
+    """Hard-narrow every search tool to only files under one directory — like
+    `cd`-ing into a sub-project, without losing the whole-repo index or a
+    reindex cost. Persists until cleared with set_scope(""). Unlike set_focus
+    (a soft ranking bias), this is a hard filter: files outside are excluded
+    entirely. The two are independent and combine.
 
     Args:
-        path: workspace-relative directory path, e.g. "src/carps-web". Must
-              exist under the workspace root and contain at least one
-              indexed source file.
-
-    Returns confirmation with the number of files now in scope, or an error
-    if the path doesn't exist or contains no source files.
+        path: workspace-relative directory, e.g. "src/carps-web"; must exist
+            and contain at least one indexed source file. "" clears scope.
     """
     global _ACTIVE_SCOPE
     norm = path.strip().replace("\\", "/").strip("/")
@@ -5104,21 +4930,12 @@ def set_scope(path: str) -> str:
 
 @_tool
 def get_status() -> str:
-    """Report the current state of the mimir index for this workspace.
-
-    Call this at the start of a session to understand what mimir knows about
-    the workspace before using other tools. Key things to check:
-
-    - symbol_index=warm means scope_task and verify_symbol_existence use a fast
-      SQL index; symbol_index=building means they fall back to a slower linear
-      scan and may miss recently added symbols
-    - blueprints_cached shows how many files are already parsed
-    - ignored_patterns reports how many .mimirignore rules are active (not
-      the rules themselves — a file missing from search results is worth
-      checking against .mimirignore directly)
-
-    If the index is still building, you can proceed — tools still work, just
-    slower. For large repos (8000+ files) the index typically builds in <60s.
+    """Report the current state of the mimir index: warmup progress, file
+    count, active scope/focus, and .mimirignore/.mimiraliases/.mimirnotes
+    counts. Call at session start. symbol_index=building means scope_task/
+    verify_symbol_existence fall back to a slower scan and may miss recent
+    symbols — tools still work, just slower (<60s typical to warm even on
+    8000+ files).
     """
     try:
         total_files = len(_iter_source_files())
@@ -5409,7 +5226,11 @@ def setup() -> None:
                 "- Call `record_alias(domain_term, code_name)` when you discover a feature name maps\n"
                 "  to a different code name — future scope_task searches will expand it automatically\n"
                 "- Call `add_ignore(pattern, reason)` when you encounter vendor/generated/test files\n"
-                "  that add noise — always tell the user what you are adding and why first\n"
+                "  that add noise — always tell the user what you are adding and why first\n\n"
+                "In a monorepo, if scope_task results span unrelated sub-projects, call scope_area\n"
+                "to see where matches cluster, then set_scope(dir) to hard-narrow (excludes other\n"
+                "sub-projects entirely) or set_focus(prefix) to soft-bias (they still appear, just\n"
+                "lower-scored). Both clear with an empty-string call — set_scope(\"\")/set_focus(\"\").\n"
             )
             with open(claude_md, "a", encoding="utf-8") as f:
                 f.write(snippet)
@@ -5459,7 +5280,11 @@ def setup() -> None:
                 "to save it — future scope_task searches will expand it automatically\n"
                 "9. When you encounter vendor/generated/noisy files, tell the user what you found, "
                 "ask for confirmation, then call `add_ignore(pattern, reason)` to exclude them\n\n"
-                "Do not use built-in file search, glob, or grep if mimir tools are available.\n"
+                "Do not use built-in file search, glob, or grep if mimir tools are available.\n\n"
+                "In a monorepo, if scope_task results span unrelated sub-projects, call scope_area "
+                "to see where matches cluster, then set_scope(dir) to hard-narrow (excludes other "
+                "sub-projects entirely) or set_focus(prefix) to soft-bias (they still appear, just "
+                "lower-scored). Both clear with an empty-string call — set_scope(\"\")/set_focus(\"\").\n"
             )
             with open(copilot_instructions, "a", encoding="utf-8") as f:
                 f.write(copilot_snippet)
