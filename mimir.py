@@ -5456,104 +5456,92 @@ def _clip(text: str, limit: int = 6000) -> str:
 # Entry point
 # --------------------------------------------------------------------------- #
 def setup() -> None:
-    """Console-script entry point: drop MCP config files into the current project."""
-    import json
+    """Console-script entry point: drop the workflow-instruction file(s) for one
+    client (CLAUDE.md or copilot-instructions.md) and a starter .mimirignore
+    into the current project.
+
+    Usage: `mimir-setup [claude|copilot]` — defaults to claude when no arg is
+    given. Writes only the file(s) for the named client, so a Copilot-only
+    project doesn't get an unused CLAUDE.md and vice versa.
+
+    Does not write .mcp.json / .vscode/mcp.json — register mimir with your
+    client at user/global scope instead (connect-claude.sh / connect-copilot.sh),
+    which needs no per-repo config file at all. Run mimir-setup per project just
+    for the instructions and ignore patterns, which are genuinely project-specific.
+    """
+    import sys as _sys
+
+    arg = (_sys.argv[1].strip().lower() if len(_sys.argv) > 1 else "claude")
+    if arg not in ("claude", "copilot"):
+        print(f"ERROR: unknown client {arg!r} — expected 'claude' or 'copilot'.")
+        return
 
     cwd = Path.cwd()
 
-    claude_cfg = cwd / ".mcp.json"
-    if claude_cfg.exists():
-        print(f"skipped  {claude_cfg}  (already exists)")
-    else:
-        claude_cfg.write_text(json.dumps({
-            "mcpServers": {
-                "mimir": {
-                    "command": "mimir",
-                    "env": {"MCP_WORKSPACE_ROOT": "."}
-                }
-            }
-        }, indent=2) + "\n")
-        print(f"created  {claude_cfg}")
-
-    vscode_dir = cwd / ".vscode"
-    vscode_dir.mkdir(exist_ok=True)
-    copilot_cfg = vscode_dir / "mcp.json"
-    if copilot_cfg.exists():
-        print(f"skipped  {copilot_cfg}  (already exists)")
-    else:
-        copilot_cfg.write_text(json.dumps({
-            "servers": {
-                "mimir": {
-                    "type": "stdio",
-                    "command": "mimir",
-                    "env": {"MCP_WORKSPACE_ROOT": "${workspaceFolder}"}
-                }
-            }
-        }, indent=2) + "\n")
-        print(f"created  {copilot_cfg}")
-
-    claude_md = cwd / "CLAUDE.md"
     mimir_marker = "## Code exploration — use mimir tools"
-    if claude_md.exists() and mimir_marker in claude_md.read_text(encoding="utf-8"):
-        print(f"skipped  {claude_md}  (mimir section already present)")
-    else:
-        snippet = (
-            f"\n{mimir_marker}\n\n"
-            "This project has mimir MCP tools available. Use them before reading raw files.\n\n"
-            "At the start of any coding session:\n"
-            "1. Call `get_status` to check the index is ready and see active exclusions\n"
-            "2. Call `get_architecture()` for a high-level map of the whole codebase (cheap)\n"
-            "3. Call `get_changed_files()` to see what is currently in flight vs main\n"
-            "4. Call `scope_task(\"describe what you want to do\")` to find relevant files\n\n"
-            "For any task involving existing code:\n"
-            "- Use `scope_task` before opening files — it finds the right files in one call\n"
-            "- Use `get_symbol(path, name)` to read ONE function or class body instead of the whole file\n"
-            "- Use `get_file_structure` to see a file's full symbol map before reading it line by line\n"
-            "- Use `verify_symbol_existence` before assuming a function or type exists\n"
-            "- Use `find_callers` after `verify_symbol_existence` to trace impact\n"
-            "- Use `get_dependents(path)` to find what else imports a file before changing it\n"
-            "- Use `get_imports` when an unfamiliar symbol appears and you need to trace its origin\n"
-            "- Call `record_alias(domain_term, code_name)` when you discover a feature name maps\n"
-            "  to a different code name — future scope_task searches will expand it automatically\n"
-            "- Call `add_ignore(pattern, reason)` when you encounter vendor/generated/test files\n"
-            "  that add noise — always tell the user what you are adding and why first\n"
-        )
-        with open(claude_md, "a", encoding="utf-8") as f:
-            f.write(snippet)
-        action = "updated" if claude_md.exists() else "created"
-        print(f"{action}  {claude_md}  (mimir section appended)")
 
-    github_dir = cwd / ".github"
-    github_dir.mkdir(exist_ok=True)
-    copilot_instructions = github_dir / "copilot-instructions.md"
-    copilot_marker = "## Code exploration — use mimir tools"
-    if copilot_instructions.exists() and copilot_marker in copilot_instructions.read_text(encoding="utf-8"):
-        print(f"skipped  {copilot_instructions}  (mimir section already present)")
-    else:
-        copilot_snippet = (
-            f"{copilot_marker}\n\n"
-            "This project has mimir MCP tools. Always use them before using built-in search or reading files.\n\n"
-            "Workflow for any coding session:\n"
-            "1. Call `get_status` to confirm the index is ready\n"
-            "2. Call `get_architecture()` for a high-level map of the whole codebase (one cheap call)\n"
-            "3. Call `get_changed_files()` to see what is currently in flight vs main\n"
-            "4. Call `scope_task` with a description of the task — use its ranked file list and "
-            "suggested get_symbol calls, do NOT fall back to glob or grep\n"
-            "   - Tip: use technical/class names when known (e.g. 'RectificationFilter') "
-            "rather than feature names (e.g. 'corrective actions filter')\n"
-            "5. Call `get_symbol(path, name)` to read ONE function or class body — much cheaper "
-            "than reading the whole file\n"
-            "6. Use `get_dependents(path)` before changing a shared file to see blast radius\n"
-            "7. When you discover a domain/feature term maps to a code name, call `record_alias` "
-            "to save it — future scope_task searches will expand it automatically\n"
-            "8. When you encounter vendor/generated/noisy files, tell the user what you found, "
-            "ask for confirmation, then call `add_ignore(pattern, reason)` to exclude them\n\n"
-            "Do not use built-in file search, glob, or grep if mimir tools are available.\n"
-        )
-        with open(copilot_instructions, "a", encoding="utf-8") as f:
-            f.write(copilot_snippet)
-        action = "updated" if copilot_instructions.exists() else "created"
-        print(f"{action}  {copilot_instructions}  (mimir section appended)")
+    if arg == "claude":
+        claude_md = cwd / "CLAUDE.md"
+        if claude_md.exists() and mimir_marker in claude_md.read_text(encoding="utf-8"):
+            print(f"skipped  {claude_md}  (mimir section already present)")
+        else:
+            snippet = (
+                f"\n{mimir_marker}\n\n"
+                "This project has mimir MCP tools available. Use them before reading raw files.\n\n"
+                "At the start of any coding session:\n"
+                "1. Call `get_status` to check the index is ready and see active exclusions\n"
+                "2. Call `get_architecture()` for a high-level map of the whole codebase (cheap)\n"
+                "3. Call `get_changed_files()` to see what is currently in flight vs main\n"
+                "4. Call `scope_task(\"describe what you want to do\")` to find relevant files\n\n"
+                "For any task involving existing code:\n"
+                "- Use `scope_task` before opening files — it finds the right files in one call\n"
+                "- Use `get_symbol(path, name)` to read ONE function or class body instead of the whole file\n"
+                "- Use `get_file_structure` to see a file's full symbol map before reading it line by line\n"
+                "- Use `verify_symbol_existence` before assuming a function or type exists\n"
+                "- Use `find_callers` after `verify_symbol_existence` to trace impact\n"
+                "- Use `get_dependents(path)` to find what else imports a file before changing it\n"
+                "- Use `get_imports` when an unfamiliar symbol appears and you need to trace its origin\n"
+                "- Call `record_alias(domain_term, code_name)` when you discover a feature name maps\n"
+                "  to a different code name — future scope_task searches will expand it automatically\n"
+                "- Call `add_ignore(pattern, reason)` when you encounter vendor/generated/test files\n"
+                "  that add noise — always tell the user what you are adding and why first\n"
+            )
+            with open(claude_md, "a", encoding="utf-8") as f:
+                f.write(snippet)
+            action = "updated" if claude_md.exists() else "created"
+            print(f"{action}  {claude_md}  (mimir section appended)")
+
+    if arg == "copilot":
+        github_dir = cwd / ".github"
+        github_dir.mkdir(exist_ok=True)
+        copilot_instructions = github_dir / "copilot-instructions.md"
+        if copilot_instructions.exists() and mimir_marker in copilot_instructions.read_text(encoding="utf-8"):
+            print(f"skipped  {copilot_instructions}  (mimir section already present)")
+        else:
+            copilot_snippet = (
+                f"{mimir_marker}\n\n"
+                "This project has mimir MCP tools. Always use them before using built-in search or reading files.\n\n"
+                "Workflow for any coding session:\n"
+                "1. Call `get_status` to confirm the index is ready\n"
+                "2. Call `get_architecture()` for a high-level map of the whole codebase (one cheap call)\n"
+                "3. Call `get_changed_files()` to see what is currently in flight vs main\n"
+                "4. Call `scope_task` with a description of the task — use its ranked file list and "
+                "suggested get_symbol calls, do NOT fall back to glob or grep\n"
+                "   - Tip: use technical/class names when known (e.g. 'RectificationFilter') "
+                "rather than feature names (e.g. 'corrective actions filter')\n"
+                "5. Call `get_symbol(path, name)` to read ONE function or class body — much cheaper "
+                "than reading the whole file\n"
+                "6. Use `get_dependents(path)` before changing a shared file to see blast radius\n"
+                "7. When you discover a domain/feature term maps to a code name, call `record_alias` "
+                "to save it — future scope_task searches will expand it automatically\n"
+                "8. When you encounter vendor/generated/noisy files, tell the user what you found, "
+                "ask for confirmation, then call `add_ignore(pattern, reason)` to exclude them\n\n"
+                "Do not use built-in file search, glob, or grep if mimir tools are available.\n"
+            )
+            with open(copilot_instructions, "a", encoding="utf-8") as f:
+                f.write(copilot_snippet)
+            action = "updated" if copilot_instructions.exists() else "created"
+            print(f"{action}  {copilot_instructions}  (mimir section appended)")
 
     mimirignore = cwd / ".mimirignore"
     if mimirignore.exists():
@@ -5614,7 +5602,8 @@ def setup() -> None:
         )
         print(f"created  {mimirignore}")
 
-    print("\nDone. Restart Claude Code or reload VS Code to pick up the config.")
+    client_name = "Claude Code" if arg == "claude" else "Copilot"
+    print(f"\nDone. Restart {client_name} (or reload VS Code) to pick up the instructions.")
 
 
 _CLI_HELP = """\
@@ -5622,8 +5611,9 @@ mimir — structural code index for Claude Code and GitHub Copilot
 
 SETUP (run once per project)
   cd your-project
-  mimir-setup               Creates .mcp.json, .vscode/mcp.json, and CLAUDE.md
-                            then restart Claude Code or reload VS Code
+  mimir-setup [claude|copilot]   Creates CLAUDE.md or copilot-instructions.md (default: claude),
+                                  plus .mimirignore. Register the mimir MCP server itself
+                                  with connect-claude.sh / connect-copilot.sh.
 
 TERMINAL COMMANDS
   mimir hint   "<rough terms>"  Cheap first pass: discover what the codebase calls

@@ -63,30 +63,33 @@ for the client's CLI (`claude` / `code`) and for `mimir` on PATH before
 registering, and only touches that one client's config — run either, both, or
 neither depending on what you use.
 
-**Per-project (`mimir-setup`)** — use this instead if you want the config
-committed and shared with a team, or need Copilot in VS Code without the
-`code` CLI available:
-
-Run this once in the root of any project you want to use mimir with:
+**`mimir-setup [claude|copilot]`** — the MCP server registration above is
+client-wide and identical for every project, but the *instructions telling the
+AI when and how to use mimir* are genuinely project-specific, so those still
+need a per-project step. Run this once in the root of any project you want to
+use mimir with:
 
 ```bash
 cd /path/to/your-project
-mimir-setup
+mimir-setup            # defaults to claude
+mimir-setup copilot    # or explicitly for Copilot
 ```
 
-This creates five files:
+Writes only the file(s) for the named client, plus a starter `.mimirignore`:
 
-| File | Purpose |
-|---|---|
-| `.mcp.json` | Registers mimir with Claude Code |
-| `.vscode/mcp.json` | Registers mimir with GitHub Copilot in VS Code |
-| `CLAUDE.md` | Tells Claude Code when and how to use each tool |
-| `.github/copilot-instructions.md` | Tells Copilot to use mimir and not fall back to built-in search |
-| `.mimirignore` | Starter exclusion patterns (build output, vendor libs, generated files) |
+| Client | File | Purpose |
+|---|---|---|
+| `claude` (default) | `CLAUDE.md` | Tells Claude Code when and how to use each tool |
+| `copilot` | `.github/copilot-instructions.md` | Tells Copilot to use mimir and not fall back to built-in search |
+| both | `.mimirignore` | Starter exclusion patterns (build output, vendor libs, generated files) |
 
-That's it. Restart Claude Code (or reload VS Code) and mimir is active.
+It does **not** create `.mcp.json` / `.vscode/mcp.json` — that's what
+`connect-claude`/`connect-copilot` are for. If you need a per-repo config file
+instead (e.g. to commit and share with a team, or for a client without a CLI
+to register at user scope), see the manual `.mcp.json` / `.vscode/mcp.json`
+snippets further down.
 
-The command is safe to re-run — it skips any file that already exists, and only appends to `CLAUDE.md` if the mimir section isn't already there.
+The command is safe to re-run — it skips any file that already exists, and only appends to `CLAUDE.md`/`copilot-instructions.md` if the mimir section isn't already there.
 
 ---
 
@@ -156,7 +159,7 @@ For any task involving existing code:
 
 ## Connecting to Claude Code (manual setup)
 
-`mimir-setup` handles this automatically. If you prefer to configure manually, drop a `.mcp.json` file in the project root:
+`connect-claude.sh`/`.ps1` handles this automatically at user scope (recommended — see above). If you'd rather use a per-repo config instead, drop a `.mcp.json` file in the project root:
 
 ```json
 {
@@ -177,7 +180,7 @@ Claude Code picks this up automatically when you open that folder. The `"."` res
 
 ## Connecting to GitHub Copilot (VS Code) (manual setup)
 
-`mimir-setup` handles this automatically. If you prefer to configure manually, drop a `.vscode/mcp.json` file in the project root:
+`connect-copilot.sh`/`.ps1` handles this automatically at user-profile scope (recommended — see above). If you'd rather use a per-repo config instead, drop a `.vscode/mcp.json` file in the project root:
 
 ```json
 {
@@ -201,7 +204,7 @@ To use the tools in Copilot Chat, open the chat panel, switch to agent mode, and
 
 ### Giving Copilot persistent instructions (manual setup)
 
-`mimir-setup` also creates `.github/copilot-instructions.md`, which Copilot reads automatically. If you prefer to create it manually:
+`mimir-setup copilot` creates `.github/copilot-instructions.md`, which Copilot reads automatically. If you prefer to create it manually:
 
 ```markdown
 ## Code exploration — use mimir tools
