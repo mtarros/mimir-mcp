@@ -5494,32 +5494,43 @@ def _write_servers_json(path: Path, entry: dict) -> str:
 
 
 def _register_mcp_server(arg: str, is_global: bool, cwd: Path) -> None:
-    """Register mimir as an MCP server with the named client. claude/copilot go
-    through that client's own CLI (claude mcp add / code --add-mcp); visualstudio
-    has no such CLI (confirmed against Microsoft's MCP docs — UI or hand-edited
-    mcp.json only) so it merges the JSON file directly instead. Never raises: a
-    missing CLI, failed subprocess call, or unparseable existing file prints a
-    clear fallback message and setup() continues on to the instruction files
-    regardless, since that half of the job is independent."""
-    if arg == "visualstudio":
-        # %USERPROFILE%\.mcp.json (global, every solution) vs <solution>\.vscode\mcp.json
-        # (project scope) — the latter is the same file mimir-setup copilot
-        # already writes for VS Code, and Visual Studio auto-discovers it too
-        # (confirmed in Microsoft's MCP docs' file-discovery order), so both
-        # clients share one file when a project is set up for both.
-        path = (Path.home() / ".mcp.json") if is_global else (cwd / ".vscode" / "mcp.json")
-        entry = {
-            "type": "stdio",
-            "command": "mimir",
-            "env": {"MCP_WORKSPACE_ROOT": "." if is_global else str(cwd)},
-        }
+    """Register mimir as an MCP server with the named client. Project scope for
+    copilot/visualstudio is always a direct JSON merge into .vscode/mcp.json —
+    not `code --add-mcp`, whose merge behavior with an already-populated
+    mcp.json isn't documented anywhere and was observed in practice to skip
+    adding mimir when other servers were already present. claude (both scopes)
+    and copilot's global scope still go through their own CLI (claude mcp add
+    / code --add-mcp) since those don't have that same reported failure and,
+    for copilot --global, there's no confirmed direct file path to write
+    instead. Never raises: a missing CLI, failed subprocess call, or
+    unparseable existing file prints a clear fallback message and setup()
+    continues on to the instruction files regardless, since that half of the
+    job is independent."""
+    if arg in ("copilot", "visualstudio") and not is_global:
+        # Both clients read the same file at project scope (confirmed in
+        # Microsoft's Visual Studio MCP docs' file-discovery order), so this
+        # one write covers whichever is actually installed.
+        path = cwd / ".vscode" / "mcp.json"
+        entry = {"type": "stdio", "command": "mimir", "env": {"MCP_WORKSPACE_ROOT": str(cwd)}}
         try:
             result = _write_servers_json(path, entry)
-            scope = "user profile" if is_global else "this project"
             if result == "unchanged":
-                print(f"skipped  MCP registration  (mimir already registered in {path}, {scope})")
+                print(f"skipped  MCP registration  (mimir already registered in {path})")
             else:
-                print(f"{result}  {path}  (mimir server entry, {scope})")
+                print(f"{result}  {path}  (mimir server entry)")
+        except Exception as e:
+            print(f"WARNING: could not write {path}: {e}")
+        return
+
+    if arg == "visualstudio":  # is_global, given the branch above handles project scope
+        path = Path.home() / ".mcp.json"
+        entry = {"type": "stdio", "command": "mimir", "env": {"MCP_WORKSPACE_ROOT": "."}}
+        try:
+            result = _write_servers_json(path, entry)
+            if result == "unchanged":
+                print(f"skipped  MCP registration  (mimir already registered in {path})")
+            else:
+                print(f"{result}  {path}  (mimir server entry, user profile)")
         except Exception as e:
             print(f"WARNING: could not write {path}: {e}")
         return
@@ -5546,7 +5557,7 @@ def _register_mcp_server(arg: str, is_global: bool, cwd: Path) -> None:
         except Exception as e:
             print(f"WARNING: could not run 'claude mcp add': {e}")
 
-    elif arg == "copilot":
+    elif arg == "copilot":  # is_global, given the branch above handles project scope
         cli = shutil.which("code")
         if not cli:
             print("skipped  MCP registration  ('code' CLI not found on PATH — in VS "
@@ -5554,16 +5565,16 @@ def _register_mcp_server(arg: str, is_global: bool, cwd: Path) -> None:
                   "re-run mimir-setup)")
             return
         mcp_json = '{"name":"mimir","command":"mimir","env":{"MCP_WORKSPACE_ROOT":"${workspaceFolder}"}}'
-        cmd = [cli, "--add-mcp", mcp_json]
-        if not is_global:
-            cmd = [cli, "--folder-uri", str(cwd), "--add-mcp", mcp_json]
         try:
             proc = subprocess.run(
-                cmd, capture_output=True, text=True, timeout=15, stdin=subprocess.DEVNULL,
+                [cli, "--add-mcp", mcp_json],
+                capture_output=True, text=True, timeout=15, stdin=subprocess.DEVNULL,
             )
             if proc.returncode == 0:
-                scope = "user profile" if is_global else "this project (.vscode/mcp.json)"
-                print(f"registered  mimir with Copilot ({scope})")
+                print("registered  mimir with Copilot (user profile) — "
+                      "if it doesn't show up, VS Code's own merge with any "
+                      "already-registered servers is unverified; check via "
+                      "'MCP: Open User Configuration' in the Command Palette")
             else:
                 out = (proc.stdout or proc.stderr or "").strip()
                 print(f"WARNING: 'code --add-mcp' failed: {out or 'unknown error'}")
@@ -5583,28 +5594,34 @@ def setup() -> None:
     discovers that file too, confirmed in Microsoft's MCP docs).
 
     Without --global (default): registers mimir at PROJECT scope — a committed
-    .mcp.json for claude, .vscode/mcp.json for copilot/visualstudio (claude via
-    `claude mcp add`; copilot via `code --add-mcp`; visualstudio by writing the
-    JSON directly, since it has no CLI for this) — and writes CLAUDE.md or
-    copilot-instructions.md plus a starter .mimirignore into the current repo.
-    Use this once you're ready to share mimir with a team on this project —
-    everything it creates is meant to be committed.
+    .mcp.json for claude (via `claude mcp add`), .vscode/mcp.json for
+    copilot/visualstudio (written directly as JSON, no CLI needed — `code
+    --add-mcp`'s merge behavior with an already-populated file isn't
+    documented and was observed skipping mimir when other servers were
+    already registered, so project scope no longer goes through it) — and
+    writes CLAUDE.md or copilot-instructions.md plus a starter .mimirignore
+    into the current repo. Use this once you're ready to share mimir with a
+    team on this project — everything it creates is meant to be committed.
 
     --global: registers mimir at USER scope instead (available in every
     project on this machine, nothing in any repo) and writes the same
     instructions to your user profile (~/.claude/CLAUDE.md for claude; a VS
     Code user "*.instructions.md" file for copilot; visualstudio has no known
     global-instructions surface, so that part is skipped — only the MCP
-    registration, at %USERPROFILE%\\.mcp.json, applies). Skips .mimirignore,
-    which is inherently project-specific. Use this while mimir is still your
-    personal tool — drop --global later, in a given project, once you're
-    ready to make it a shared team setup there; the two scopes layer without
+    registration, at %USERPROFILE%\\.mcp.json, applies). copilot --global
+    still goes through `code --add-mcp` (no confirmed direct file path for
+    VS Code's user-profile MCP config) — if mimir doesn't show up and you
+    already have other user-scope servers registered, check via "MCP: Open
+    User Configuration" in the Command Palette. Skips .mimirignore, which is
+    inherently project-specific. Use this while mimir is still your personal
+    tool — drop --global later, in a given project, once you're ready to
+    make it a shared team setup there; the two scopes layer without
     conflict.
 
     Registration falls back to a printed warning (never aborts the rest of
-    setup) if the client's own CLI isn't on PATH, the command fails, or (for
-    visualstudio) an existing mcp.json isn't valid JSON — see HowTo.md for the
-    manual .mcp.json / .vscode/mcp.json snippets in that case.
+    setup) if a required CLI isn't on PATH, a subprocess call fails, or an
+    existing mcp.json isn't valid JSON — see HowTo.md for the manual
+    .mcp.json / .vscode/mcp.json snippets in that case.
     """
     argv = sys.argv[1:]
     is_global = "--global" in argv

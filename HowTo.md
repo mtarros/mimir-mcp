@@ -88,11 +88,18 @@ The two scopes don't conflict — global instructions/registration apply
 everywhere, a project's own `mimir-setup` (no `--global`) layers on top for
 that one repo when you're ready to move it from personal to shared.
 
-`claude`/`copilot` registration goes through that client's own CLI (`claude
-mcp add` / `code --add-mcp`); `visualstudio` has no CLI for this (confirmed
-against Microsoft's docs — UI or hand-edited `mcp.json` only), so mimir-setup
-merges the JSON file directly instead, preserving any other servers already
-in it. Either way, if the CLI is missing, the command fails, or an existing
+`claude` registration (both scopes) and `copilot --global` go through that
+client's own CLI (`claude mcp add` / `code --add-mcp`). Every other case —
+`copilot`/`visualstudio` project scope, and `visualstudio --global` — merges
+the JSON file directly instead, preserving any other servers already in it:
+`code --add-mcp`'s merge behavior with an already-populated `mcp.json` isn't
+documented anywhere and was observed in practice to silently skip adding
+mimir when other servers were already registered, so project scope no longer
+depends on it at all (and doesn't need the `code` CLI installed, either).
+`copilot --global` still uses it, for lack of a confirmed direct file path —
+if mimir doesn't show up there and you already have other user-scope servers,
+check via **MCP: Open User Configuration** in the Command Palette. Either
+way, if a required CLI is missing, a command fails, or an existing
 `.mcp.json` isn't valid JSON, `mimir-setup` prints a warning and still writes
 the instruction files — see the manual `.mcp.json` / `.vscode/mcp.json`
 snippets further down as a fallback.
