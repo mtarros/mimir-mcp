@@ -3626,66 +3626,6 @@ def scope_area(task: str, max_depth: int = 4, focus: str = "") -> str:
     return "\n".join(parts_out)
 
 
-@_tool
-def get_context(task: str, max_files: int = 3, focus: str = "") -> str:
-    """One-shot context loader: ranked files + blueprints + key symbol bodies.
-
-    Combines scope_task, get_file_structure, and get_symbol into a single call.
-    Use this when starting work on a task to get everything you need up front
-    without 3–4 serial round trips.
-
-    WHEN TO USE: prefer this over scope_task when you know you will immediately
-    need to read the file structures. Skip it if you only want the ranked file
-    list (use scope_task instead) or if max_files > 3 (output becomes large).
-
-    Args:
-        task: plain-English description of what you want to do.
-        max_files: number of top files to include blueprints for (default 3).
-        focus: optional comma-separated "prefix:weight" pairs for this call only.
-
-    Returns ranked file list, blueprints for the top files, and the full bodies
-    of the 2 most relevant definition symbols found in those files.
-    """
-    # Step 1: rank files and collect symbol hits (reuse scope_task scoring)
-    scope_out = scope_task(task, max_files=max_files, include_blueprints=True, focus=focus)
-
-    # Step 2: find the best 2 definition symbols across the top files and
-    # append their full bodies so the AI doesn't need a follow-up get_symbol call.
-    keywords = _extract_scope_keywords(_expand_task_with_aliases(task))
-    valid_kws = [kw for kw in keywords if re.match(r"^\w[\w]*$", kw)]
-
-    sym_bodies: list[str] = []
-    seen_sym_keys: set[tuple[str, str]] = set()
-    if valid_kws:
-        try:
-            multi_hits = _symbol_hits_multi(valid_kws, max_per_kw=5)
-            for kw in valid_kws:
-                for rel, line, sig in multi_hits.get(kw, []):
-                    name = _symbol_name_from_sig(sig)
-                    if not name:
-                        continue
-                    key = (rel, name)
-                    if key in seen_sym_keys:
-                        continue
-                    seen_sym_keys.add(key)
-                    try:
-                        body = _extract_symbol_body(_resolve_in_workspace(rel), name)
-                    except Exception:
-                        body = None
-                    if body:
-                        sym_bodies.append(f"### {name}  ({rel}:{line})\n{body}")
-                    if len(sym_bodies) >= 2:
-                        break
-                if len(sym_bodies) >= 2:
-                    break
-        except Exception:
-            pass
-
-    if sym_bodies:
-        return scope_out + "\n\n## Key symbol bodies\n\n" + "\n\n".join(sym_bodies)
-    return scope_out
-
-
 # ---------------------------------------------------------------------------
 # semantic_search helpers
 # ---------------------------------------------------------------------------
@@ -5601,18 +5541,23 @@ def setup() -> None:
                 "1. Call `get_status` to check the index is ready and see active exclusions\n"
                 "2. If the user names or clearly implies a specific sub-project/app/API area (e.g.\n"
                 "   \"the mobile app\", \"the API\"), call `set_focus(\"matching-prefix:3\")` immediately —\n"
-                "   or pass `focus=\"prefix:3\"` directly on individual `scope_task`/`get_context`/\n"
-                "   `semantic_search` calls. In a multi-sub-project repo, unscoped ranking silently\n"
+                "   or pass `focus=\"prefix:3\"` directly on individual `scope_task`/`semantic_search`\n"
+                "   calls. In a multi-sub-project repo, unscoped ranking silently\n"
                 "   defaults to whichever sub-project has the most indexed symbols; it will NOT\n"
                 "   reliably surface the right area on its own\n"
-                "3. Call `get_architecture()` for a high-level map of the whole codebase (cheap)\n"
-                "4. Call `get_changed_files()` to see what is currently in flight vs main\n"
+                "3. Call `get_architecture()` for a high-level map of the whole codebase (cheap) —\n"
+                "   once per session if you don't already have this context warm; skip it for a\n"
+                "   narrow follow-up task later in the same session\n"
+                "4. Call `get_changed_files()` to see what is currently in flight vs main — same,\n"
+                "   once per session, not per task\n"
                 "5. Call `scope_task(\"describe what you want to do\")` to find relevant files\n\n"
                 "For any task involving existing code:\n"
                 "- Use `scope_task` before opening files — it finds the right files in one call\n"
                 "- Use `get_symbol(path, name)` to read ONE function or class body instead of the whole file\n"
                 "- Use `get_file_structure` to see a file's full symbol map before reading it line by line\n"
-                "- Use `verify_symbol_existence` before assuming a function or type exists\n"
+                "- Skip `verify_symbol_existence` if the symbol already showed up in scope_task's\n"
+                "  \"Matched symbols\" with a file:line — that's already confirmation. Use it only for a\n"
+                "  symbol scope_task didn't surface, before assuming it exists\n"
                 "- Use `find_callers` after `verify_symbol_existence` to trace impact\n"
                 "- Use `get_dependents(path)` to find what else imports a file before changing it\n"
                 "- Use `get_imports` when an unfamiliar symbol appears and you need to trace its origin\n"
@@ -5649,12 +5594,15 @@ def setup() -> None:
                 "1. Call `get_status` to confirm the index is ready\n"
                 "2. If the user names or clearly implies a specific sub-project/app/API area (e.g. "
                 "\"the mobile app\", \"the API\"), call `set_focus(\"matching-prefix:3\")` immediately — "
-                "or pass `focus=\"prefix:3\"` directly on individual `scope_task`/`get_context`/"
-                "`semantic_search` calls. In a multi-sub-project repo, unscoped ranking silently "
+                "or pass `focus=\"prefix:3\"` directly on individual `scope_task`/`semantic_search` "
+                "calls. In a multi-sub-project repo, unscoped ranking silently "
                 "defaults to whichever sub-project has the most indexed symbols; it will NOT "
                 "reliably surface the right area on its own\n"
-                "3. Call `get_architecture()` for a high-level map of the whole codebase (one cheap call)\n"
-                "4. Call `get_changed_files()` to see what is currently in flight vs main\n"
+                "3. Call `get_architecture()` for a high-level map of the whole codebase (one cheap "
+                "call) — once per session if you don't already have this context warm; skip it for a "
+                "narrow follow-up task later in the same session\n"
+                "4. Call `get_changed_files()` to see what is currently in flight vs main — same, "
+                "once per session, not per task\n"
                 "5. Call `scope_task` with a description of the task — use its ranked file list and "
                 "suggested get_symbol calls, do NOT fall back to glob or grep\n"
                 "   - Tip: use technical/class names when known (e.g. 'RectificationFilter') "

@@ -93,7 +93,7 @@ def workspace(tmp_path):
 
 class TestToolRegistration:
     async def test_all_tools_listed(self, workspace):
-        """All 23 tools must be registered — any missing tool fails silently in production."""
+        """All 22 tools must be registered — any missing tool fails silently in production."""
         async with Client(_make_transport(workspace)) as client:
             tools = await client.list_tools()
             names = {t.name for t in tools}
@@ -103,7 +103,6 @@ class TestToolRegistration:
             "scope_task",
             "scope_area",
             "scope_hint",
-            "get_context",
             "set_focus",
             "set_scope",
             "reset_scope",
@@ -904,26 +903,3 @@ class TestSetScope:
         assert scope_file.exists()
         assert scope_file.read_text().strip() == "backend"
 
-
-@pytest.mark.asyncio
-class TestGetContextWire:
-    async def test_returns_ranked_files_and_blueprint(self, workspace):
-        async with Client(_make_transport(workspace)) as client:
-            r = await client.call_tool("get_context", {
-                "task": "UserService authenticate login",
-                "max_files": 2,
-            })
-        text = _text(r)
-        assert "EXCEPTION" not in text
-        assert "Ranked files" in text or "ranked" in text.lower()
-        # Blueprint content: at least one L-prefixed line number should appear
-        assert re.search(r'\bL\d+\b', text), "Expected blueprint line numbers in output"
-
-    async def test_no_crash_on_unknown_task(self, workspace):
-        async with Client(_make_transport(workspace)) as client:
-            r = await client.call_tool("get_context", {
-                "task": "xyzzy_nonexistent_feature_qwerty",
-            })
-        text = _text(r)
-        assert "EXCEPTION" not in text
-        assert len(text) > 0

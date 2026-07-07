@@ -129,12 +129,15 @@ At the start of any coding session:
 1. Call `get_status` to check the index is ready and see active exclusions.
 2. If the user names or clearly implies a specific sub-project/app/API area (e.g.
    "the mobile app", "the API"), call `set_focus("matching-prefix:3")` immediately —
-   or pass `focus="prefix:3"` directly on individual `scope_task`/`get_context`/
-   `semantic_search` calls. In a multi-sub-project repo, unscoped ranking silently
+   or pass `focus="prefix:3"` directly on individual `scope_task`/`semantic_search`
+   calls. In a multi-sub-project repo, unscoped ranking silently
    defaults to whichever sub-project has the most indexed symbols; it will NOT
    reliably surface the right area on its own.
-3. Call `get_architecture()` for a high-level map of the whole codebase (cheap).
-4. Call `get_changed_files()` to see what is currently in flight vs main.
+3. Call `get_architecture()` for a high-level map of the whole codebase (cheap) —
+   once per session if you don't already have this context warm; skip it for a
+   narrow follow-up task later in the same session.
+4. Call `get_changed_files()` to see what is currently in flight vs main — same,
+   once per session, not per task.
 5. Call `scope_task("describe what you want to do")` to find relevant files.
 
 For any task involving existing code:
@@ -150,7 +153,9 @@ For any task involving existing code:
   whole file.
 - Use `get_file_structure` to see a file's full symbol map before reading it line
   by line.
-- Use `verify_symbol_existence` before assuming a function or type exists.
+- Skip `verify_symbol_existence` if the symbol already showed up in `scope_task`'s
+  "Matched symbols" with a file:line — that's already confirmation. Use it only for
+  a symbol `scope_task` didn't surface, before assuming it exists.
 - Use `find_callers` after `verify_symbol_existence` to trace impact.
 - Use `get_dependents(path)` to find what else imports a file before changing it.
 - Use `get_imports` when an unfamiliar symbol appears and you need to trace its
@@ -220,12 +225,15 @@ Workflow for any coding session:
 1. Call `get_status` to confirm the index is ready.
 2. If the user names or clearly implies a specific sub-project/app/API area (e.g.
    "the mobile app", "the API"), call `set_focus("matching-prefix:3")` immediately —
-   or pass `focus="prefix:3"` directly on individual `scope_task`/`get_context`/
-   `semantic_search` calls. In a multi-sub-project repo, unscoped ranking silently
+   or pass `focus="prefix:3"` directly on individual `scope_task`/`semantic_search`
+   calls. In a multi-sub-project repo, unscoped ranking silently
    defaults to whichever sub-project has the most indexed symbols; it will NOT
    reliably surface the right area on its own.
-3. Call `get_architecture()` for a high-level map of the whole codebase (one cheap call).
-4. Call `get_changed_files()` to see what is currently in flight vs main.
+3. Call `get_architecture()` for a high-level map of the whole codebase (one cheap
+   call) — once per session if you don't already have this context warm; skip it
+   for a narrow follow-up task later in the same session.
+4. Call `get_changed_files()` to see what is currently in flight vs main — same,
+   once per session, not per task.
 5. For vague queries, call `scope_hint("rough terms")` first to find the right symbol
    names, then call `scope_task` with those names.
 6. Call `get_symbol(path, name)` to read ONE function or class body.
@@ -454,25 +462,6 @@ Returns: keywords searched, matched symbols with file:line locations, ranked fil
 **How scores work:** BM25-style. Symbol definition hits score 3×, usage hits 1×, capped per keyword (repeated hits of one word give diminishing returns), then weighted by IDF — rare identifiers count up to 2×, ubiquitous words as little as 0.05×. Scores are length-normalized so god-files that weakly match everything don't dominate. Path/filename matches score 3×. Adjacent capitalized words ("Unavailable Types") are also searched as their compound identifier (`UnavailableType`). Files inside the active `set_focus` prefix get a multiplier on top, and git recency gives a bounded boost to already-matched files.
 
 ---
-
-### 5b. `get_context` — one-shot context loader
-
-Combines `scope_task`, `get_file_structure`, and `get_symbol` into a single call. Use this when you know you'll need to read file structures and key symbols right away, and you want to avoid 3–4 serial round trips.
-
-**Example:**
-> `get_context("UserService authenticate login", max_files=3)`
-
-Returns: ranked files section (same as `scope_task`), blueprints for each top file, and the full bodies of the 2 most relevant definition symbols.
-
-**When to prefer `get_context` over `scope_task`:**
-- You're starting fresh on a task and need to orient quickly
-- `max_files` is 2–3 (output stays manageable)
-- You expect to call `get_file_structure` immediately after `scope_task` anyway
-
-**When to prefer `scope_task` instead:**
-- You only want the ranked file list to decide what to look at next
-- `max_files` > 3 (blueprints for many files produce very large output)
-- You're in a mono-repo and want to scan the ranked list before committing to reading anything
 
 ---
 
