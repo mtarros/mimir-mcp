@@ -4056,14 +4056,20 @@ def get_dependents(path: str) -> str:
 
 @_tool
 def get_symbol(path: str, symbol_name: str) -> str:
-    """Return the complete source (body included) of ONE named symbol — the
-    efficient middle ground between get_file_structure (signatures only) and
-    reading the whole file. Each line is prefixed with its real line number
-    (matching get_file_structure), usable directly as an edit anchor.
+    """Return the complete source (body included) of one or more named symbols
+    in ONE file — the efficient middle ground between get_file_structure
+    (signatures only) and reading the whole file. Each line is prefixed with
+    its real line number (matching get_file_structure), usable directly as an
+    edit anchor. For a file with many small symbols (e.g. property-heavy
+    MAUI/XAML code-behind, where a full blueprint barely compresses — there's
+    little body to strip), pass several comma-separated names in one call
+    instead of one get_symbol call per name or get_file_structure's whole
+    blueprint — cheaper than either.
 
     Args:
         path: workspace-relative path to the source file.
-        symbol_name: exact name of the function, class, or method.
+        symbol_name: exact name of a function/class/method/property, or
+            several comma-separated (e.g. "Foo, Bar, Baz").
     """
     try:
         resolved = _resolve_in_workspace(path)
@@ -4071,33 +4077,56 @@ def get_symbol(path: str, symbol_name: str) -> str:
         return f"Error: {e}"
     if not resolved.exists():
         return f"Error: '{path}' not found in workspace."
-    body = _extract_symbol_body(resolved, symbol_name)
-    if body is None:
-        # Offer a helpful fallback hint
-        blueprint = _build_blueprint(resolved)
-        return (
-            f"Symbol '{symbol_name}' not found in '{path}'.\n\n"
-            f"Available symbols in this file:\n{blueprint}"
-        )
-    line_count = body.count('\n') + 1
-    start_line = None
+
+    names = [n.strip() for n in symbol_name.split(",") if n.strip()]
+    if not names:
+        return "Error: symbol_name must be a non-empty name, or comma-separated names."
+
     try:
         full_text = resolved.read_bytes().decode('utf-8', 'replace')
+    except OSError as e:
+        return f"Error reading '{path}': {e}"
+
+    sections: list[str] = []
+    missing: list[str] = []
+    for name in names:
+        body = _extract_symbol_body(resolved, name)
+        if body is None:
+            missing.append(name)
+            continue
+        line_count = body.count('\n') + 1
         offset = full_text.find(body)
-        if offset != -1:
-            start_line = full_text.count('\n', 0, offset) + 1
-    except OSError:
-        pass
-    if start_line is not None:
-        numbered = "\n".join(
-            f"L{start_line + i}  {line}"
-            for i, line in enumerate(body.splitlines())
+        start_line = full_text.count('\n', 0, offset) + 1 if offset != -1 else None
+        if start_line is not None:
+            numbered = "\n".join(
+                f"L{start_line + i}  {line}"
+                for i, line in enumerate(body.splitlines())
+            )
+            sub_header = f"symbol={name}  ({line_count} lines, starting at L{start_line})"
+        else:
+            numbered = body
+            sub_header = f"symbol={name}  ({line_count} lines)"
+        if len(names) == 1:
+            return f"# {path}  {sub_header}\n\n{numbered}"
+        sections.append(f"## {sub_header}\n\n{numbered}")
+
+    if not sections:
+        # Single-name not-found case (only path here since len(names)==1
+        # already returned above on success) falls through to this shared
+        # not-found path for both the one-name and all-missing cases.
+        blueprint = _build_blueprint(resolved)
+        return (
+            f"Symbol(s) not found in '{path}': {', '.join(missing)}\n\n"
+            f"Available symbols in this file:\n{blueprint}"
         )
-        header = f"# {path}  symbol={symbol_name}  ({line_count} lines, starting at L{start_line})"
-    else:
-        numbered = body
-        header = f"# {path}  symbol={symbol_name}  ({line_count} lines)"
-    return f"{header}\n\n{numbered}"
+
+    # "(N of M found)" only earns its chars when there's actually a miss to
+    # explain — for the common all-found case it's pure overhead the
+    # per-symbol "## symbol=X (...)" sub-headers already make redundant.
+    header = f"# {path}"
+    if missing:
+        header += f"  ({len(sections)} of {len(names)} symbols found)\nNot found: {', '.join(missing)}"
+    return header + "\n\n" + "\n\n".join(sections)
 
 
 @_tool

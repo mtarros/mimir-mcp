@@ -582,6 +582,31 @@ class TestGetSymbolWire:
         assert "Error" in text or "not found" in text.lower()
         assert "EXCEPTION" not in text
 
+    async def test_comma_separated_names_returns_all_in_one_call(self, workspace):
+        async with Client(_make_transport(workspace)) as client:
+            r = await client.call_tool(
+                "get_symbol",
+                {"path": "src/service.py", "symbol_name": "authenticate, get_user"},
+            )
+        text = _text(r)
+        assert "return True" in text
+        assert "return None" in text
+        assert "symbol=authenticate" in text
+        assert "symbol=get_user" in text
+        assert "EXCEPTION" not in text
+
+    async def test_comma_separated_names_reports_partial_miss(self, workspace):
+        async with Client(_make_transport(workspace)) as client:
+            r = await client.call_tool(
+                "get_symbol",
+                {"path": "src/service.py", "symbol_name": "authenticate, TotallyBogusName"},
+            )
+        text = _text(r)
+        assert "return True" in text          # the found one still returned in full
+        assert "TotallyBogusName" in text      # named as not found
+        assert "1 of 2 symbols found" in text
+        assert "EXCEPTION" not in text
+
 
 # ---------------------------------------------------------------------------
 # get_changed_files

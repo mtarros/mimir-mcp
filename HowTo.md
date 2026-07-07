@@ -487,16 +487,18 @@ Returns ranked files with matched symbol signatures showing why each file was ra
 
 ### 7. `get_symbol` — read just the code you need
 
-Returns the complete source of ONE named function, class, or method — bodies included. The efficient middle ground between `get_file_structure` (signatures only) and reading the whole raw file.
+Returns the complete source of one or more named functions/classes/methods — bodies included. The efficient middle ground between `get_file_structure` (signatures only) and reading the whole raw file.
 
 **Example:**
 > `get_symbol("src/services/auth.py", "authenticate")`
 
 Returns just the `authenticate` method — 20 lines instead of the 400-line file.
 
-WHEN TO USE: after `scope_task` or `get_file_structure` identifies the symbol you need. Typically 10–50× fewer tokens than reading the whole file.
+**Batching:** pass several comma-separated names in one call — `get_symbol("src/services/auth.py", "authenticate, refresh_token, revoke")` — to get all of them with one shared header instead of one call (and one header) per name. This matters most on property-heavy files (MAUI/XAML code-behind, DTOs with many one-line fields) where `get_file_structure`'s blueprint barely compresses — there's little body to strip when most "symbols" are already one line — so several targeted `get_symbol` calls beat the blueprint, and one batched call beats several separate ones.
 
-If the symbol is not found, the response includes the file's full blueprint so you can see what IS available.
+WHEN TO USE: after `scope_task` or `get_file_structure` identifies the symbol(s) you need. Typically 10–50× fewer tokens than reading the whole file.
+
+If a symbol isn't found, it's listed under "Not found" and the response still includes the file's full blueprint so you can see what IS available; other requested symbols that were found are still returned in full.
 
 ---
 

@@ -795,6 +795,67 @@ class TestPathInScope:
 
 
 # ---------------------------------------------------------------------------
+# get_symbol — comma-separated batching (one shared header vs N separate
+# ~100-char headers). Real motivation: TileView.xaml.cs in a live A/B test —
+# property-heavy MAUI code-behind where get_file_structure's blueprint barely
+# compresses (little body to strip), and separate get_symbol calls each pay
+# their own header. Batching should always be <= calling get_symbol N times
+# and concatenating, and single-name behavior must be byte-identical to
+# before this feature existed (existing callers/tests depend on that shape).
+# ---------------------------------------------------------------------------
+
+class TestGetSymbolBatching:
+    @pytest.fixture(autouse=True)
+    def workspace(self, tmp_path, monkeypatch):
+        (tmp_path / "props.cs").write_text(
+            "public class Tile\n"
+            "{\n"
+            "    public string A { get; set; } = \"\";\n"
+            "    public string B { get; set; } = \"\";\n"
+            "    public string C { get; set; } = \"\";\n"
+            "}\n"
+        )
+        monkeypatch.setattr(mimir, "WORKSPACE_ROOT", tmp_path)
+
+    def test_single_name_unchanged_format(self):
+        # Single-name output must still be the plain "# path  symbol=X (...)"
+        # shape, not the multi-symbol "N of M symbols found" wrapper.
+        out = mimir.get_symbol("props.cs", "A")
+        assert out.startswith("# props.cs  symbol=A")
+        assert "of" not in out.split("\n")[0]
+
+    def test_batch_returns_all_requested_symbols(self):
+        out = mimir.get_symbol("props.cs", "A, B, C")
+        assert "symbols found" not in out   # no miss -> no summary-line overhead
+        for name in ("A", "B", "C"):
+            assert f"symbol={name}" in out
+
+    def test_batch_cheaper_than_n_separate_calls(self):
+        batched = mimir.get_symbol("props.cs", "A, B, C")
+        separate_total = sum(len(mimir.get_symbol("props.cs", n)) for n in ("A", "B", "C"))
+        assert len(batched) < separate_total, (
+            f"batched ({len(batched)} chars) should beat 3 separate calls "
+            f"({separate_total} chars) by avoiding repeated headers"
+        )
+
+    def test_batch_partial_miss_still_returns_found_symbols(self):
+        out = mimir.get_symbol("props.cs", "A, DoesNotExist")
+        assert "1 of 2 symbols found" in out
+        assert "Not found: DoesNotExist" in out
+        assert "symbol=A" in out
+
+    def test_batch_all_missing_falls_back_to_blueprint_hint(self):
+        out = mimir.get_symbol("props.cs", "Nope1, Nope2")
+        assert "not found" in out.lower()
+        assert "Nope1" in out and "Nope2" in out
+        assert "public class Tile" in out or "class Tile" in out  # blueprint fallback
+
+    def test_whitespace_and_empty_entries_tolerated(self):
+        out = mimir.get_symbol("props.cs", " A ,  , B")
+        assert "symbol=A" in out and "symbol=B" in out
+
+
+# ---------------------------------------------------------------------------
 # CLI dispatch — mimir <subcommand> <arg>
 # ---------------------------------------------------------------------------
 
