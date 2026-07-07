@@ -126,12 +126,13 @@ The section looks like this (you can edit it to suit your project):
 This project has mimir MCP tools available. Use them before reading raw files.
 
 At the start of any coding session:
-1. Call `get_status` to check the index is ready, see active exclusions, and note
-   any project_focus already set.
-2. If the user mentions a specific sub-project or area (e.g. "I'm working on the
-   mobile app"), call `set_focus("matching-prefix")` immediately — this boosts files
-   in that area for all subsequent searches. If no focus is set and the user has not
-   indicated one, leave it unset.
+1. Call `get_status` to check the index is ready and see active exclusions.
+2. If the user names or clearly implies a specific sub-project/app/API area (e.g.
+   "the mobile app", "the API"), call `set_focus("matching-prefix:3")` immediately —
+   or pass `focus="prefix:3"` directly on individual `scope_task`/`get_context`/
+   `semantic_search` calls. In a multi-sub-project repo, unscoped ranking silently
+   defaults to whichever sub-project has the most indexed symbols; it will NOT
+   reliably surface the right area on its own.
 3. Call `get_architecture()` for a high-level map of the whole codebase (cheap).
 4. Call `get_changed_files()` to see what is currently in flight vs main.
 5. Call `scope_task("describe what you want to do")` to find relevant files.
@@ -216,9 +217,13 @@ Manage it interactively instead with `/mcp add` inside a `copilot` session, or c
 This project has mimir MCP tools. Always use them before using built-in search or reading files.
 
 Workflow for any coding session:
-1. Call `get_status` to confirm the index is ready and note any project_focus set.
-2. If the user mentions a specific sub-project, call `set_focus("prefix")` to bias
-   searches toward that area. Call `set_focus("")` when switching to another area.
+1. Call `get_status` to confirm the index is ready.
+2. If the user names or clearly implies a specific sub-project/app/API area (e.g.
+   "the mobile app", "the API"), call `set_focus("matching-prefix:3")` immediately —
+   or pass `focus="prefix:3"` directly on individual `scope_task`/`get_context`/
+   `semantic_search` calls. In a multi-sub-project repo, unscoped ranking silently
+   defaults to whichever sub-project has the most indexed symbols; it will NOT
+   reliably surface the right area on its own.
 3. Call `get_architecture()` for a high-level map of the whole codebase (one cheap call).
 4. Call `get_changed_files()` to see what is currently in flight vs main.
 5. For vague queries, call `scope_hint("rough terms")` first to find the right symbol
