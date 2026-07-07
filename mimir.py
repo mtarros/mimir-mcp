@@ -1149,7 +1149,7 @@ def _build_architecture_map() -> str:
     if omitted > 0:
         parts.append(
             f"... {omitted} more {'directory' if omitted == 1 else 'directories'} omitted. "
-            f"Use get_directory_structure for a specific path."
+            f"Use get_file_structure on a specific directory path."
         )
 
     result = '\n'.join(parts).rstrip()
@@ -2875,24 +2875,17 @@ def _resolve_import(specifier: str, source_file: Path) -> tuple[str, str]:
 
 
 @_tool
-def get_file_structure(path: str) -> str:
-    """Return a compact structural blueprint of ONE source file: only classes,
-    functions, methods, structs, and their signatures - all bodies, loops, and
-    implementation text stripped out.
+def get_file_structure(path: str, max_files: int = 10) -> str:
+    """Structural blueprint(s): signatures + line numbers, bodies stripped.
 
-    WHEN TO USE: call this BEFORE reading a source file's raw contents. It gives
-    you the symbol map (with line numbers) at a fraction of the token cost, which
-    is almost always enough to decide what to do next. Only read raw lines after
-    this, and only the specific ranges you actually need.
+    Pass a FILE for its symbol map, or a DIRECTORY for every source file's
+    blueprint under it (capped at max_files) — use the latter for "what's in
+    this module/layer" orientation, not for finding code by what it does
+    (use scope_task for that).
 
     Args:
-        path: path to the file, relative to the workspace root.
-
-    Returns a dense text map like:
-        # src/auth/session.py  [py · tree-sitter]
-        L12  class SessionManager
-        L18    def create(self, user_id) -> Session
-        L40  def revoke_all(user_id)
+        path: file or directory path, relative to the workspace root.
+        max_files: directory mode only — cap on blueprints returned (default 10).
     """
     try:
         resolved = _resolve_in_workspace(path)
@@ -2901,8 +2894,45 @@ def get_file_structure(path: str) -> str:
     if not resolved.exists():
         return (f"Error: '{path}' not found under {WORKSPACE_ROOT}. "
                 f"Double-check the relative path.")
+
     if resolved.is_dir():
-        return f"Error: '{path}' is a directory, not a file. Pass a single source file."
+        target_str = str(resolved) + os.sep
+        matches = sorted(
+            (p for p in _iter_source_files() if str(p).startswith(target_str)),
+            key=lambda p: str(p),
+        )
+        total = len(matches)
+        if not matches:
+            return f"No source files found under '{path}'."
+
+        shown = matches[:max_files]
+        parts = [f"# {path}  ({total} source file{'s' if total != 1 else ''}"
+                 f"{', showing first ' + str(len(shown)) if total > max_files else ''})\n"]
+        for p in shown:
+            try:
+                parts.append(_build_blueprint(p))
+                notes = _notes_for_path(str(p.relative_to(WORKSPACE_ROOT)))
+                if notes:
+                    parts.extend(f"  {n}" for n in notes)
+                parts.append("")
+            except Exception:
+                pass
+
+        if total > max_files:
+            parts.append(
+                f"... {total - max_files} more file{'s' if total - max_files != 1 else ''} not shown."
+                f" Increase max_files or narrow path to a subdirectory."
+            )
+
+        if not (WORKSPACE_ROOT / ".mimirignore").exists():
+            parts.append(
+                f"\nTip: to exclude noisy files or subdirectories from mimir's index, add"
+                f" gitignore-style patterns to .mimirignore in the workspace root"
+                f" (e.g. '**/obj/**' or '**/*.generated.cs')."
+            )
+
+        return "\n".join(parts)
+
     if _is_blacklisted(resolved):
         return f"Error: '{path}' lives in a blacklisted directory and is not mapped."
     try:
@@ -4150,7 +4180,7 @@ def get_architecture() -> str:
 
     WHEN TO USE: at the very start of a session to understand the project layout
     before diving into specific files. Much cheaper than exploring directory by
-    directory. For a specific directory use get_directory_structure instead.
+    directory. For a specific directory use get_file_structure(dir_path) instead.
 
     The map is built from cached blueprints during startup warmup so this call
     is nearly instant after the index is ready (check get_status).
@@ -4604,75 +4634,6 @@ def find_callers(symbol_name: str, max_results: int = 20) -> str:
 
 
 @_tool
-def get_directory_structure(dir_path: str, max_files: int = 10) -> str:
-    """Get structural blueprints for every source file under a directory.
-
-    Use this to understand a module, layer, or namespace at a glance — before
-    diving into individual files. Good for orientation when scope_task points
-    you at a file and you want to see what else lives alongside it.
-
-    WHEN TO USE: when you know WHERE to look but not WHICH file — e.g.
-    "show me all the controllers", "what services are in this layer?".
-    For finding code by what it DOES, use scope_task instead.
-
-    Args:
-        dir_path: path relative to workspace root, e.g. "src/api/controllers".
-        max_files: cap on blueprints returned (default 10). Increase if the
-                   directory is large, or narrow the path to a subdirectory.
-    """
-    try:
-        target = (WORKSPACE_ROOT / dir_path).resolve()
-        target.relative_to(WORKSPACE_ROOT)   # safety: must stay inside workspace
-    except ValueError:
-        return f"Error: '{dir_path}' resolves outside the workspace root."
-    except Exception as e:
-        return f"Error: invalid path '{dir_path}': {e}."
-
-    if not target.exists():
-        return f"Not found: '{dir_path}' does not exist in the workspace."
-    if not target.is_dir():
-        return f"'{dir_path}' is a file, not a directory — use get_file_structure instead."
-
-    target_str = str(target) + os.sep
-    matches = sorted(
-        (p for p in _iter_source_files() if str(p).startswith(target_str)),
-        key=lambda p: str(p),
-    )
-    total = len(matches)
-    if not matches:
-        return f"No source files found under '{dir_path}'."
-
-    shown = matches[:max_files]
-    parts = [f"# {dir_path}  ({total} source file{'s' if total != 1 else ''}"
-             f"{', showing first ' + str(len(shown)) if total > max_files else ''})\n"]
-    for path in shown:
-        try:
-            parts.append(_build_blueprint(path))
-            notes = _notes_for_path(str(path.relative_to(WORKSPACE_ROOT)))
-            if notes:
-                parts.extend(f"  {n}" for n in notes)
-            parts.append("")
-        except Exception:
-            pass
-
-    if total > max_files:
-        parts.append(
-            f"... {total - max_files} more file{'s' if total - max_files != 1 else ''} not shown."
-            f" Increase max_files or narrow dir_path to a subdirectory."
-        )
-
-    ignore_hint = (
-        f"\nTip: to exclude noisy files or subdirectories from mimir's index, add"
-        f" gitignore-style patterns to .mimirignore in the workspace root"
-        f" (e.g. '**/obj/**' or '**/*.generated.cs')."
-    )
-    if not (WORKSPACE_ROOT / ".mimirignore").exists():
-        parts.append(ignore_hint)
-
-    return "\n".join(parts)
-
-
-@_tool
 def record_alias(domain_term: str, code_name: str) -> str:
     """Record a domain/feature name → code name mapping so future scope_task
     calls find the right files even when described in non-technical language.
@@ -4766,8 +4727,8 @@ def record_alias(domain_term: str, code_name: str) -> str:
 @_tool
 def record_note(path_prefix: str, note: str) -> str:
     """Attach a free-text contextual note to files/paths matching a prefix, so
-    future scope_task/get_file_structure/get_directory_structure calls surface
-    it as prose alongside those files.
+    future scope_task/get_file_structure calls surface it as prose alongside
+    those files.
 
     DIFFERENT FROM record_alias: record_alias teaches mimir SEARCH VOCABULARY
     (a domain term expands into a code name, silently feeding scope_task's
@@ -5624,9 +5585,8 @@ MCP TOOLS (available to Claude Code and GitHub Copilot)
   scope_task               Find relevant files from a task description
   scope_area               Directory-tree view of where a task's matches cluster (monorepos)
   set_scope                Hard-narrow every tool to one directory; set_scope("") clears
-  get_file_structure       Compact symbol map of a single file (classes, methods, line nos)
+  get_file_structure       Compact symbol map of a file, or every file under a directory
   get_symbol               Full source of ONE named symbol — efficient middle ground
-  get_directory_structure  Symbol maps for every file under a directory
   get_changed_files        Blueprints of files changed vs a git branch (session orientation)
   get_imports              Resolve imports to workspace files or external packages
   get_dependents           Find all files that directly import a given file (blast radius)

@@ -380,9 +380,9 @@ Returns a high-level map of the entire workspace: directories grouped by file co
   ...
 ```
 
-WHEN TO USE: at the very start of a session to understand the project layout before diving into specific files. For a specific directory use `get_directory_structure` instead.
+WHEN TO USE: at the very start of a session to understand the project layout before diving into specific files. For a specific directory use `get_file_structure(dir_path)` instead.
 
-Large repos (60+ directories) show the most file-dense modules first with a note pointing to `get_directory_structure` for the rest.
+Large repos (60+ directories) show the most file-dense modules first with a note pointing to `get_file_structure` for the rest.
 
 ---
 
@@ -500,14 +500,15 @@ If the symbol is not found, the response includes the file's full blueprint so y
 
 ---
 
-### 8. `get_file_structure` — understand a file
+### 8. `get_file_structure` — understand a file or browse a module
 
-Returns a compact map of a single file: every class, function, method, and their signatures — with line numbers, bodies stripped.
+Pass a file for a compact map of it: every class, function, method, and their signatures — with line numbers, bodies stripped. Pass a directory instead and it returns the same blueprint for every source file under it (capped at `max_files`, default 10) — use this when you know *where* to look but not *which* file.
 
-**Example:**
+**Examples:**
 > `get_file_structure("lib/lessonProgress.ts")`
+> `get_file_structure("src/api/controllers", max_files=10)`
 
-Use this when you want the full symbol map of a file before deciding which symbols to read. Use `get_symbol` when you already know which symbol you need.
+Use this when you want the full symbol map of a file before deciding which symbols to read — `get_symbol` when you already know which symbol you need, `scope_task` when you don't know where to look at all.
 
 ---
 
@@ -535,18 +536,7 @@ Works for: TypeScript, JavaScript, Python, Kotlin, Swift, C#, Go, Rust.
 
 ---
 
-### 10. `get_directory_structure` — browse a module
-
-Returns structural blueprints for every source file under a directory. Use this when you know *where* to look but not *which* file.
-
-**Example:**
-> `get_directory_structure("src/api/controllers", max_files=10)`
-
-Use `scope_task` when you don't know where to look. Use `get_directory_structure` when you already know the directory.
-
----
-
-### 11. `verify_symbol_existence` — confirm a symbol is real
+### 10. `verify_symbol_existence` — confirm a symbol is real
 
 Searches the entire workspace for a symbol definition and returns its exact location and signature.
 
@@ -557,7 +547,7 @@ Use this before assuming a function or type exists, before importing it, or when
 
 ---
 
-### 12. `find_callers` — trace who calls a symbol
+### 11. `find_callers` — trace who calls a symbol
 
 Searches raw source text across the entire workspace for every call site and usage of a symbol. Unlike `verify_symbol_existence` (which only finds definitions), this finds where a symbol is called, passed, or referenced in implementation code.
 
@@ -570,7 +560,7 @@ WHEN TO USE: after `verify_symbol_existence` tells you where something is define
 
 ---
 
-### 13. `get_dependents` — blast-radius analysis
+### 12. `get_dependents` — blast-radius analysis
 
 Returns every workspace file that directly imports a given file. Built from the reverse import index constructed at startup — no extra configuration needed.
 
@@ -583,7 +573,7 @@ WHEN TO USE: before modifying a widely-used utility, service, or model — get t
 
 ---
 
-### 14. `record_alias` — teach mimir your project's vocabulary
+### 13. `record_alias` — teach mimir your project's vocabulary
 
 Records a mapping from a domain/feature name to the code name used in the codebase. Once saved, `scope_task` automatically expands matching phrases before searching.
 
@@ -612,7 +602,7 @@ push notifications = PushNotificationService, PushManager
 
 ---
 
-### 14b. `record_note` — attach context to a path
+### 13b. `record_note` — attach context to a path
 
 Records a free-text note tied to a path prefix. **Different from `record_alias`**: aliases expand search vocabulary (silently fed into `scope_task`'s keyword matching); notes attach context — shown as prose next to matching files, never used for ranking or search.
 
@@ -621,7 +611,7 @@ Records a free-text note tied to a path prefix. **Different from `record_alias`*
 
 **How it works:**
 - Writes to `.mimirnotes` in the workspace root (human-editable, commit to git)
-- Shown as `note: ...` lines under matching files in `get_file_structure`, `get_directory_structure`, and `scope_task`'s ranked-files list
+- Shown as `note: ...` lines under matching files in `get_file_structure` (file or directory mode) and `scope_task`'s ranked-files list
 - Multiple notes can accumulate under the same prefix — it's an append-only log, unlike `.mimiraliases` which merges into one line per domain term
 - Shown longest-matching-prefix first, capped at 3 notes per file (with a "+N more" line if truncated) so one broad-prefix note doesn't drown every query in text
 - `get_status` shows a count summary only — full notes appear in the file-scoped output above, not in `get_status` itself
@@ -638,7 +628,7 @@ Features/Playback = check MainActivity.java/AppDelegate.swift for the real logic
 
 ---
 
-### 15. `add_ignore` — exclude noisy files on the fly
+### 14. `add_ignore` — exclude noisy files on the fly
 
 Adds a gitignore-style pattern to `.mimirignore` and takes effect immediately — no restart needed. The AI uses this when it encounters vendor libraries, generated code, test fixtures, or build artefacts that pollute blueprints and `get_architecture` output.
 

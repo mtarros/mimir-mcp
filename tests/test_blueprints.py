@@ -1,5 +1,6 @@
 """
-Tests for blueprint format, get_directory_structure, and cache version handling.
+Tests for blueprint format, get_file_structure's directory mode, and cache
+version handling.
 
 Run with: pytest tests/ -v
 """
@@ -77,10 +78,10 @@ class TestBlueprintHeader:
 
 
 # ---------------------------------------------------------------------------
-# get_directory_structure
+# get_file_structure — directory mode
 # ---------------------------------------------------------------------------
 
-class TestGetDirectoryStructure:
+class TestGetFileStructureDirectoryMode:
     @pytest.fixture
     def workspace(self, tmp_path):
         """Create a mini workspace with source files in subdirectories."""
@@ -114,41 +115,45 @@ class TestGetDirectoryStructure:
         mimir._FILE_LIST_TS = orig_ts
 
     def test_returns_blueprints_for_directory(self, workspace):
-        result = mimir.get_directory_structure("src/controllers")
+        result = mimir.get_file_structure("src/controllers")
         assert "UserController" in result
         assert "JobController" in result
 
     def test_excludes_other_directories(self, workspace):
-        result = mimir.get_directory_structure("src/controllers")
+        result = mimir.get_file_structure("src/controllers")
         assert "UserService" not in result  # lives in services/, not controllers/
 
     def test_shows_file_count(self, workspace):
-        result = mimir.get_directory_structure("src/controllers")
+        result = mimir.get_file_structure("src/controllers")
         assert "2 source files" in result
 
     def test_max_files_cap(self, workspace):
-        result = mimir.get_directory_structure("src/controllers", max_files=1)
+        result = mimir.get_file_structure("src/controllers", max_files=1)
         assert "more file" in result  # truncation notice
 
     def test_path_outside_workspace_rejected(self, workspace):
-        result = mimir.get_directory_structure("../../etc")
-        assert "outside" in result.lower()
+        result = mimir.get_file_structure("../../etc")
+        assert "escapes" in result.lower() or "outside" in result.lower()
 
     def test_nonexistent_path(self, workspace):
-        result = mimir.get_directory_structure("src/does/not/exist")
+        result = mimir.get_file_structure("src/does/not/exist")
         assert "not found" in result.lower() or "Not found" in result
 
-    def test_file_path_instead_of_dir(self, workspace):
-        result = mimir.get_directory_structure("src/controllers/UserController.py")
-        assert "file" in result.lower() and "get_file_structure" in result
+    def test_file_path_returns_file_blueprint(self, workspace):
+        # A file path in "directory mode" position now just returns its own
+        # blueprint — get_file_structure dispatches on is_dir(), not on which
+        # branch the caller thought they were using.
+        result = mimir.get_file_structure("src/controllers/UserController.py")
+        assert "UserController" in result
+        assert "lines]" in result
 
     def test_empty_directory(self, workspace):
         (workspace / "src" / "empty").mkdir()
-        result = mimir.get_directory_structure("src/empty")
+        result = mimir.get_file_structure("src/empty")
         assert "No source files" in result
 
     def test_blueprints_include_line_count(self, workspace):
-        result = mimir.get_directory_structure("src/controllers")
+        result = mimir.get_file_structure("src/controllers")
         assert "lines]" in result
 
 

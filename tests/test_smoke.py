@@ -92,7 +92,7 @@ def workspace(tmp_path):
 
 class TestToolRegistration:
     async def test_all_tools_listed(self, workspace):
-        """All 19 tools must be registered — any missing tool fails silently in production."""
+        """All 18 tools must be registered — any missing tool fails silently in production."""
         async with Client(_make_transport(workspace)) as client:
             tools = await client.list_tools()
             names = {t.name for t in tools}
@@ -107,7 +107,6 @@ class TestToolRegistration:
             "get_imports",
             "get_dependents",
             "find_callers",
-            "get_directory_structure",
             "get_status",
             "record_alias",
             "record_note",
@@ -302,26 +301,26 @@ class TestGetDependentsWire:
 
 
 # ---------------------------------------------------------------------------
-# get_directory_structure
+# get_file_structure — directory mode
 # ---------------------------------------------------------------------------
 
-class TestGetDirectoryStructureWire:
+class TestGetFileStructureDirectoryModeWire:
     async def test_returns_blueprints_for_dir(self, workspace):
         async with Client(_make_transport(workspace)) as client:
-            r = await client.call_tool("get_directory_structure", {"dir_path": "src"})
+            r = await client.call_tool("get_file_structure", {"path": "src"})
         text = _text(r)
         assert "UserService" in text or "User" in text
         assert "EXCEPTION" not in text
 
     async def test_path_traversal_rejected(self, workspace):
         async with Client(_make_transport(workspace)) as client:
-            r = await client.call_tool("get_directory_structure", {"dir_path": "../../etc"})
+            r = await client.call_tool("get_file_structure", {"path": "../../etc"})
         text = _text(r)
-        assert "outside" in text.lower() or "Error" in text
+        assert "escapes" in text.lower() or "outside" in text.lower() or "Error" in text
 
     async def test_nonexistent_dir_handled(self, workspace):
         async with Client(_make_transport(workspace)) as client:
-            r = await client.call_tool("get_directory_structure", {"dir_path": "src/does_not_exist"})
+            r = await client.call_tool("get_file_structure", {"path": "src/does_not_exist"})
         text = _text(r)
         assert "EXCEPTION" not in text
         assert "not found" in text.lower() or "No source" in text
