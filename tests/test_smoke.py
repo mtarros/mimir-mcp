@@ -10,6 +10,7 @@ Run them with: pytest tests/test_smoke.py -v
 They are excluded from the default test run to keep `pytest tests/` fast.
 Add -m smoke to target just these: pytest -m smoke tests/test_smoke.py -v
 """
+import json
 import os
 import re
 import sys
@@ -46,6 +47,13 @@ def _make_transport(workspace: Path) -> StdioTransport:
         args=[str(MIMIR_PY)],
         env=env,
     )
+
+
+async def _mimir_call(client, command: str, args: str = ""):
+    """Call the v2 `mimir` dispatcher tool — the wire-level replacement for
+    calling a pre-v2 tool name directly, since only locate/inspect/mimir are
+    registered now. Returns the same CallToolResult shape _text() expects."""
+    return await client.call_tool("mimir", {"command": command, "args": args})
 
 
 # ---------------------------------------------------------------------------
@@ -92,30 +100,13 @@ def workspace(tmp_path):
 
 class TestToolRegistration:
     async def test_all_tools_listed(self, workspace):
-        """All 18 tools must be registered — any missing tool fails silently in production."""
+        """Only locate/inspect/mimir are registered — the v2 (2026-07-09)
+        3-tool surface. Everything else is reachable through mimir_dispatch's
+        legacy-name routing, not as a directly-registered MCP tool."""
         async with Client(_make_transport(workspace)) as client:
             tools = await client.list_tools()
             names = {t.name for t in tools}
-        expected = {
-            "get_file_structure",
-            "verify_symbol_existence",
-            "scope_task",
-            "scope_area",
-            "scope_hint",
-            "set_focus",
-            "set_scope",
-            "get_imports",
-            "get_dependents",
-            "find_callers",
-            "get_status",
-            "record_alias",
-            "record_note",
-            "add_ignore",
-            "get_symbol",
-            "get_changed_files",
-            "get_architecture",
-            "semantic_search",
-        }
+        expected = {"locate", "inspect", "mimir"}
         assert expected == names, f"Tool mismatch. Extra: {names - expected}, Missing: {expected - names}"
 
     async def test_all_tools_have_descriptions(self, workspace):
@@ -125,11 +116,20 @@ class TestToolRegistration:
             assert t.description and len(t.description) > 20, \
                 f"Tool '{t.name}' has missing/short description"
 
+    async def test_wire_budget_under_4000_chars(self, workspace):
+        """Regression guard: total list_tools() JSON must stay well under the
+        old 18-tool ~15,100-char baseline, so the per-turn schema tax the v2
+        redesign cut can't silently creep back up."""
+        async with Client(_make_transport(workspace)) as client:
+            tools = await client.list_tools()
+        total_wire = sum(len(json.dumps(t.model_dump(exclude_none=True))) for t in tools)
+        assert total_wire < 4000, f"Tool schema wire size regressed: {total_wire} chars (budget: 4000)"
+
     async def test_tool_results_are_text_not_none(self, workspace):
         """Every tool must return a non-empty string — no None, no empty result."""
         async with Client(_make_transport(workspace)) as client:
-            r = await client.call_tool("get_file_structure", {"path":"src/service.py"})
-        assert _text(r), "get_file_structure returned empty string"
+            r = await client.call_tool("inspect", {"path": "src/service.py"})
+        assert _text(r), "inspect returned empty string"
         assert "EXCEPTION" not in _text(r), "Unhandled exception escaped tool handler"
 
 
@@ -140,21 +140,21 @@ class TestToolRegistration:
 class TestGetFileStructureWire:
     async def test_returns_blueprint_with_l_lines(self, workspace):
         async with Client(_make_transport(workspace)) as client:
-            r = await client.call_tool("get_file_structure", {"path":"src/service.py"})
+            r = await client.call_tool("inspect", {"path": "src/service.py"})
         text = _text(r)
         assert "UserService" in text
         assert text.count("\nL") >= 2, "Blueprint should have multiple L-lines"
 
     async def test_file_not_found_returns_error_string(self, workspace):
         async with Client(_make_transport(workspace)) as client:
-            r = await client.call_tool("get_file_structure", {"path":"does/not/exist.py"})
+            r = await client.call_tool("inspect", {"path": "does/not/exist.py"})
         text = _text(r)
         assert "not found" in text.lower() or "Error" in text
         assert "EXCEPTION" not in text
 
     async def test_path_traversal_rejected(self, workspace):
         async with Client(_make_transport(workspace)) as client:
-            r = await client.call_tool("get_file_structure", {"path":"../../etc/passwd"})
+            r = await client.call_tool("inspect", {"path": "../../etc/passwd"})
         text = _text(r)
         assert "outside" in text.lower() or "escapes" in text.lower() or "error" in text.lower()
 
@@ -167,13 +167,13 @@ class TestScopeTaskWire:
     async def test_finds_relevant_file(self, workspace):
         # Use exact symbol names — scope_task keyword search is token-exact, not stemmed
         async with Client(_make_transport(workspace)) as client:
-            r = await client.call_tool("scope_task", {"task": "UserService authenticate login"})
+            r = await _mimir_call(client, "scope_task", "UserService authenticate login")
         text = _text(r)
         assert "UserService" in text or "service.py" in text
 
     async def test_returns_nonempty_response(self, workspace):
         async with Client(_make_transport(workspace)) as client:
-            r = await client.call_tool("scope_task", {"task": "UserService"})
+            r = await _mimir_call(client, "scope_task", "UserService")
         text = _text(r)
         assert len(text) > 50
         assert "EXCEPTION" not in text
@@ -196,7 +196,7 @@ class TestScopeTaskWire:
             "    def on_timer_tick(self): pass\n"
         )
         async with Client(_make_transport(tmp_path)) as client:
-            r = await client.call_tool("scope_task", {"task": "TimerJob timer", "max_files": 2})
+            r = await _mimir_call(client, "scope_task", "TimerJob timer max_files=2")
         text = _text(r)
         assert "EXCEPTION" not in text
         lines = text.splitlines()
@@ -214,46 +214,46 @@ class TestScopeTaskWire:
 class TestVerifySymbolExistenceWire:
     async def test_finds_known_symbol(self, workspace):
         async with Client(_make_transport(workspace)) as client:
-            r = await client.call_tool("verify_symbol_existence", {"symbol_name": "UserService"})
+            r = await _mimir_call(client, "verify_symbol_existence", "UserService")
         text = _text(r)
         assert "UserService" in text
         assert "service.py" in text
 
     async def test_not_found_returns_graceful_message(self, workspace):
         async with Client(_make_transport(workspace)) as client:
-            r = await client.call_tool("verify_symbol_existence", {"symbol_name": "AbsolutelyNonExistentXYZ"})
+            r = await _mimir_call(client, "verify_symbol_existence", "AbsolutelyNonExistentXYZ")
         text = _text(r)
         assert "EXCEPTION" not in text
         assert len(text) > 0
 
 
 # ---------------------------------------------------------------------------
-# get_imports
+# get_imports (via inspect view="imports")
 # ---------------------------------------------------------------------------
 
 class TestGetImportsWire:
     async def test_resolves_workspace_import(self, workspace):
         async with Client(_make_transport(workspace)) as client:
-            r = await client.call_tool("get_imports", {"path":"src/controllers/auth.py"})
+            r = await client.call_tool("inspect", {"path": "src/controllers/auth.py", "view": "imports"})
         text = _text(r)
         assert "workspace" in text.lower() or "service" in text.lower()
         assert "EXCEPTION" not in text
 
     async def test_file_with_no_imports_handled(self, workspace):
         async with Client(_make_transport(workspace)) as client:
-            r = await client.call_tool("get_imports", {"path":"src/models.py"})
+            r = await client.call_tool("inspect", {"path": "src/models.py", "view": "imports"})
         text = _text(r)
         assert "EXCEPTION" not in text
 
 
 # ---------------------------------------------------------------------------
-# find_callers
+# find_callers (via inspect view="callers")
 # ---------------------------------------------------------------------------
 
 class TestFindCallersWire:
     async def test_finds_call_site(self, workspace):
         async with Client(_make_transport(workspace)) as client:
-            r = await client.call_tool("find_callers", {"symbol_name": "authenticate"})
+            r = await client.call_tool("inspect", {"symbol": "authenticate", "view": "callers"})
         text = _text(r)
         assert "auth.py" in text
         assert "EXCEPTION" not in text
@@ -261,66 +261,66 @@ class TestFindCallersWire:
     async def test_dotted_name_rejected_over_wire(self, workspace):
         """Validation must hold end-to-end, not just in unit tests."""
         async with Client(_make_transport(workspace)) as client:
-            r = await client.call_tool("find_callers", {"symbol_name": "some.method"})
+            r = await client.call_tool("inspect", {"symbol": "some.method", "view": "callers"})
         text = _text(r)
         assert text.startswith("Error")
         assert "EXCEPTION" not in text
 
     async def test_not_found_returns_graceful_message(self, workspace):
         async with Client(_make_transport(workspace)) as client:
-            r = await client.call_tool("find_callers", {"symbol_name": "GhostFunctionXYZ"})
+            r = await client.call_tool("inspect", {"symbol": "GhostFunctionXYZ", "view": "callers"})
         text = _text(r)
         assert "EXCEPTION" not in text
         assert "No usages" in text or "not found" in text.lower()
 
 
 # ---------------------------------------------------------------------------
-# get_dependents
+# get_dependents (via inspect view="dependents")
 # ---------------------------------------------------------------------------
 
 class TestGetDependentsWire:
     async def test_returns_importer(self, workspace):
         """auth.py imports src.service, so service.py should list auth.py as a dependent."""
         async with Client(_make_transport(workspace)) as client:
-            r = await client.call_tool("get_dependents", {"path": "src/service.py"})
+            r = await client.call_tool("inspect", {"path": "src/service.py", "view": "dependents"})
         text = _text(r)
         assert "auth.py" in text
         assert "EXCEPTION" not in text
 
     async def test_file_with_no_dependents(self, workspace):
         async with Client(_make_transport(workspace)) as client:
-            r = await client.call_tool("get_dependents", {"path": "src/models.py"})
+            r = await client.call_tool("inspect", {"path": "src/models.py", "view": "dependents"})
         text = _text(r)
         assert "EXCEPTION" not in text
 
     async def test_unknown_path_handled(self, workspace):
         async with Client(_make_transport(workspace)) as client:
-            r = await client.call_tool("get_dependents", {"path": "src/does_not_exist.py"})
+            r = await client.call_tool("inspect", {"path": "src/does_not_exist.py", "view": "dependents"})
         text = _text(r)
         assert "EXCEPTION" not in text
 
 
 # ---------------------------------------------------------------------------
-# get_file_structure — directory mode
+# get_file_structure — directory mode (via inspect)
 # ---------------------------------------------------------------------------
 
 class TestGetFileStructureDirectoryModeWire:
     async def test_returns_blueprints_for_dir(self, workspace):
         async with Client(_make_transport(workspace)) as client:
-            r = await client.call_tool("get_file_structure", {"path": "src"})
+            r = await client.call_tool("inspect", {"path": "src"})
         text = _text(r)
         assert "UserService" in text or "User" in text
         assert "EXCEPTION" not in text
 
     async def test_path_traversal_rejected(self, workspace):
         async with Client(_make_transport(workspace)) as client:
-            r = await client.call_tool("get_file_structure", {"path": "../../etc"})
+            r = await client.call_tool("inspect", {"path": "../../etc"})
         text = _text(r)
         assert "escapes" in text.lower() or "outside" in text.lower() or "Error" in text
 
     async def test_nonexistent_dir_handled(self, workspace):
         async with Client(_make_transport(workspace)) as client:
-            r = await client.call_tool("get_file_structure", {"path": "src/does_not_exist"})
+            r = await client.call_tool("inspect", {"path": "src/does_not_exist"})
         text = _text(r)
         assert "EXCEPTION" not in text
         assert "not found" in text.lower() or "No source" in text
@@ -333,21 +333,21 @@ class TestGetFileStructureDirectoryModeWire:
 class TestGetStatusWire:
     async def test_returns_workspace_path(self, workspace):
         async with Client(_make_transport(workspace)) as client:
-            r = await client.call_tool("get_status", {})
+            r = await _mimir_call(client, "status")
         text = _text(r)
         assert str(workspace) in text
         assert "EXCEPTION" not in text
 
     async def test_shows_source_file_count(self, workspace):
         async with Client(_make_transport(workspace)) as client:
-            r = await client.call_tool("get_status", {})
+            r = await _mimir_call(client, "status")
         text = _text(r)
         assert "source_files" in text
         assert "3" in text  # workspace fixture has 3 .py files
 
     async def test_shows_index_state(self, workspace):
         async with Client(_make_transport(workspace)) as client:
-            r = await client.call_tool("get_status", {})
+            r = await _mimir_call(client, "status")
         text = _text(r)
         assert "symbol_index" in text
         # Either warm or building — both are valid immediately after startup
@@ -356,14 +356,14 @@ class TestGetStatusWire:
     async def test_shows_mimirignore_hint_when_no_file(self, workspace):
         """When .mimirignore doesn't exist, get_status should tell the user how to create one."""
         async with Client(_make_transport(workspace)) as client:
-            r = await client.call_tool("get_status", {})
+            r = await _mimir_call(client, "status")
         text = _text(r)
         assert ".mimirignore" in text
 
     async def test_shows_active_patterns_when_file_exists(self, workspace):
         (workspace / ".mimirignore").write_text("**/vendor/**\n**/obj/**\n")
         async with Client(_make_transport(workspace)) as client:
-            r = await client.call_tool("get_status", {})
+            r = await _mimir_call(client, "status")
         text = _text(r)
         assert "**/vendor/**" in text or "2 active" in text
 
@@ -375,10 +375,7 @@ class TestGetStatusWire:
 class TestRecordAliasWire:
     async def test_saves_alias_and_confirms(self, workspace):
         async with Client(_make_transport(workspace)) as client:
-            r = await client.call_tool(
-                "record_alias",
-                {"domain_term": "live tutor", "code_name": "LiveTutor"},
-            )
+            r = await _mimir_call(client, "alias", "live tutor, LiveTutor")
         text = _text(r)
         assert "live tutor" in text.lower()
         assert "LiveTutor" in text
@@ -389,14 +386,14 @@ class TestRecordAliasWire:
 
     async def test_duplicate_returns_already_recorded(self, workspace):
         async with Client(_make_transport(workspace)) as client:
-            await client.call_tool("record_alias", {"domain_term": "foo feature", "code_name": "FooService"})
-            r = await client.call_tool("record_alias", {"domain_term": "foo feature", "code_name": "FooService"})
+            await _mimir_call(client, "alias", "foo feature, FooService")
+            r = await _mimir_call(client, "alias", "foo feature, FooService")
         text = _text(r)
         assert "already" in text.lower() or "FooService" in text
 
     async def test_empty_inputs_rejected(self, workspace):
         async with Client(_make_transport(workspace)) as client:
-            r = await client.call_tool("record_alias", {"domain_term": "", "code_name": "Foo"})
+            r = await _mimir_call(client, "alias", ", Foo")
         text = _text(r)
         assert "Error" in text
 
@@ -408,10 +405,7 @@ class TestRecordAliasWire:
 class TestRecordNoteWire:
     async def test_saves_note_and_confirms(self, workspace):
         async with Client(_make_transport(workspace)) as client:
-            r = await client.call_tool(
-                "record_note",
-                {"path_prefix": "src/service.py", "note": "watch for the auth quirk here"},
-            )
+            r = await _mimir_call(client, "note", "src/service.py, watch for the auth quirk here")
         text = _text(r)
         assert "src/service.py" in text
         assert "watch for the auth quirk here" in text
@@ -422,29 +416,26 @@ class TestRecordNoteWire:
 
     async def test_duplicate_returns_already_recorded(self, workspace):
         async with Client(_make_transport(workspace)) as client:
-            await client.call_tool("record_note", {"path_prefix": "src/models.py", "note": "dup note"})
-            r = await client.call_tool("record_note", {"path_prefix": "src/models.py", "note": "dup note"})
+            await _mimir_call(client, "note", "src/models.py, dup note")
+            r = await _mimir_call(client, "note", "src/models.py, dup note")
         text = _text(r)
         assert "already" in text.lower()
 
     async def test_empty_inputs_rejected(self, workspace):
         async with Client(_make_transport(workspace)) as client:
-            r = await client.call_tool("record_note", {"path_prefix": "", "note": "x"})
+            r = await _mimir_call(client, "note", ", x")
         text = _text(r)
         assert "Error" in text
 
     async def test_prefix_with_equals_rejected(self, workspace):
         async with Client(_make_transport(workspace)) as client:
-            r = await client.call_tool("record_note", {"path_prefix": "Config=Prod", "note": "x"})
+            r = await _mimir_call(client, "note", "Config=Prod, x")
         text = _text(r)
         assert "Error" in text
 
     async def test_multiline_note_flattened(self, workspace):
         async with Client(_make_transport(workspace)) as client:
-            r = await client.call_tool(
-                "record_note",
-                {"path_prefix": "src/models.py", "note": "line one\nline two\nline three"},
-            )
+            r = await _mimir_call(client, "note", "src/models.py, line one\nline two\nline three")
             text = _text(r)
             assert "EXCEPTION" not in text
             notes_file = workspace / ".mimirnotes"
@@ -453,26 +444,20 @@ class TestRecordNoteWire:
             # No embedded raw newline inside a note entry — file stays one-line-per-note.
             assert "line one\nline two" not in raw
             # File must still parse cleanly after the flattened write.
-            r2 = await client.call_tool("get_status", {})
+            r2 = await _mimir_call(client, "status")
             assert "EXCEPTION" not in _text(r2)
 
     async def test_note_surfaces_in_get_file_structure(self, workspace):
         async with Client(_make_transport(workspace)) as client:
-            await client.call_tool(
-                "record_note",
-                {"path_prefix": "src/service.py", "note": "check the retry logic here"},
-            )
-            r = await client.call_tool("get_file_structure", {"path": "src/service.py"})
+            await _mimir_call(client, "note", "src/service.py, check the retry logic here")
+            r = await client.call_tool("inspect", {"path": "src/service.py"})
         text = _text(r)
         assert "note: check the retry logic here" in text
 
     async def test_note_surfaces_in_scope_task(self, workspace):
         async with Client(_make_transport(workspace)) as client:
-            await client.call_tool(
-                "record_note",
-                {"path_prefix": "src/service.py", "note": "surfaces in ranked output"},
-            )
-            r = await client.call_tool("scope_task", {"task": "UserService authenticate login"})
+            await _mimir_call(client, "note", "src/service.py, surfaces in ranked output")
+            r = await _mimir_call(client, "scope_task", "UserService authenticate login")
         text = _text(r)
         assert "note: surfaces in ranked output" in text
 
@@ -480,17 +465,12 @@ class TestRecordNoteWire:
         """A note's text must never influence scope_task's scores — notes are
         display-only, unlike record_alias which deliberately does affect ranking."""
         async with Client(_make_transport(workspace)) as client:
-            before = _text(await client.call_tool(
-                "scope_task", {"task": "UserService authenticate login"}
-            ))
-            await client.call_tool(
-                "record_note",
-                {"path_prefix": "src/service.py",
-                 "note": "totally unrelated keywords xylophone zeppelin quokka"},
+            before = _text(await _mimir_call(client, "scope_task", "UserService authenticate login"))
+            await _mimir_call(
+                client, "note",
+                "src/service.py, totally unrelated keywords xylophone zeppelin quokka",
             )
-            after = _text(await client.call_tool(
-                "scope_task", {"task": "UserService authenticate login"}
-            ))
+            after = _text(await _mimir_call(client, "scope_task", "UserService authenticate login"))
 
         def match_counts(text: str) -> list[str]:
             return [l for l in text.splitlines() if re.match(r"\s*\d+\.\s", l)]
@@ -508,10 +488,7 @@ class TestRecordNoteWire:
 class TestAddIgnoreWire:
     async def test_adds_pattern_and_writes_file(self, workspace):
         async with Client(_make_transport(workspace)) as client:
-            r = await client.call_tool(
-                "add_ignore",
-                {"pattern": "**/vendor/**", "reason": "third-party libs"},
-            )
+            r = await _mimir_call(client, "ignore", "**/vendor/**, third-party libs")
         text = _text(r)
         assert "**/vendor/**" in text
         assert "EXCEPTION" not in text
@@ -521,22 +498,22 @@ class TestAddIgnoreWire:
 
     async def test_duplicate_pattern_rejected(self, workspace):
         async with Client(_make_transport(workspace)) as client:
-            await client.call_tool("add_ignore", {"pattern": "**/dist/**"})
-            r = await client.call_tool("add_ignore", {"pattern": "**/dist/**"})
+            await _mimir_call(client, "ignore", "**/dist/**")
+            r = await _mimir_call(client, "ignore", "**/dist/**")
         text = _text(r)
         assert "already" in text.lower()
         assert "EXCEPTION" not in text
 
     async def test_empty_pattern_rejected(self, workspace):
         async with Client(_make_transport(workspace)) as client:
-            r = await client.call_tool("add_ignore", {"pattern": ""})
+            r = await _mimir_call(client, "ignore", "")
         text = _text(r)
         assert "Error" in text
         assert "EXCEPTION" not in text
 
     async def test_path_traversal_rejected(self, workspace):
         async with Client(_make_transport(workspace)) as client:
-            r = await client.call_tool("add_ignore", {"pattern": "../../etc/**"})
+            r = await _mimir_call(client, "ignore", "../../etc/**")
         text = _text(r)
         assert "Error" in text
         assert "EXCEPTION" not in text
@@ -548,18 +525,18 @@ class TestAddIgnoreWire:
 
 class TestGetSymbolWire:
     async def test_returns_function_body(self, workspace):
-        """get_symbol should return the full authenticate method body."""
+        """inspect(symbol=...) should return the full authenticate method body."""
         async with Client(_make_transport(workspace)) as client:
-            r = await client.call_tool("get_symbol", {"path": "src/service.py", "symbol_name": "authenticate"})
+            r = await client.call_tool("inspect", {"path": "src/service.py", "symbol": "authenticate"})
         text = _text(r)
         assert "authenticate" in text
         assert "return True" in text   # body content, not just signature
         assert "EXCEPTION" not in text
 
     async def test_returns_class_body(self, workspace):
-        """get_symbol on a class name should return the whole class."""
+        """inspect(symbol=...) on a class name should return the whole class."""
         async with Client(_make_transport(workspace)) as client:
-            r = await client.call_tool("get_symbol", {"path": "src/service.py", "symbol_name": "UserService"})
+            r = await client.call_tool("inspect", {"path": "src/service.py", "symbol": "UserService"})
         text = _text(r)
         assert "UserService" in text
         assert "authenticate" in text  # method inside the class
@@ -568,7 +545,7 @@ class TestGetSymbolWire:
     async def test_unknown_symbol_returns_blueprint_hint(self, workspace):
         """When the symbol is not found, the response should include available symbols."""
         async with Client(_make_transport(workspace)) as client:
-            r = await client.call_tool("get_symbol", {"path": "src/service.py", "symbol_name": "GhostXYZ"})
+            r = await client.call_tool("inspect", {"path": "src/service.py", "symbol": "GhostXYZ"})
         text = _text(r)
         assert "not found" in text.lower() or "GhostXYZ" in text
         # Should suggest what IS in the file
@@ -577,7 +554,7 @@ class TestGetSymbolWire:
 
     async def test_unknown_file_returns_error(self, workspace):
         async with Client(_make_transport(workspace)) as client:
-            r = await client.call_tool("get_symbol", {"path": "src/does_not_exist.py", "symbol_name": "foo"})
+            r = await client.call_tool("inspect", {"path": "src/does_not_exist.py", "symbol": "foo"})
         text = _text(r)
         assert "Error" in text or "not found" in text.lower()
         assert "EXCEPTION" not in text
@@ -585,8 +562,8 @@ class TestGetSymbolWire:
     async def test_comma_separated_names_returns_all_in_one_call(self, workspace):
         async with Client(_make_transport(workspace)) as client:
             r = await client.call_tool(
-                "get_symbol",
-                {"path": "src/service.py", "symbol_name": "authenticate, get_user"},
+                "inspect",
+                {"path": "src/service.py", "symbol": "authenticate, get_user"},
             )
         text = _text(r)
         assert "return True" in text
@@ -598,8 +575,8 @@ class TestGetSymbolWire:
     async def test_comma_separated_names_reports_partial_miss(self, workspace):
         async with Client(_make_transport(workspace)) as client:
             r = await client.call_tool(
-                "get_symbol",
-                {"path": "src/service.py", "symbol_name": "authenticate, TotallyBogusName"},
+                "inspect",
+                {"path": "src/service.py", "symbol": "authenticate, TotallyBogusName"},
             )
         text = _text(r)
         assert "return True" in text          # the found one still returned in full
@@ -645,7 +622,7 @@ class TestGetChangedFilesWire:
     async def test_returns_changed_file_blueprint(self, git_workspace):
         """Should return blueprint for models.py which was added on the feature branch."""
         async with Client(_make_transport(git_workspace)) as client:
-            r = await client.call_tool("get_changed_files", {"base": "main"})
+            r = await _mimir_call(client, "changed", "main")
         text = _text(r)
         assert "models.py" in text
         assert "EXCEPTION" not in text
@@ -653,7 +630,7 @@ class TestGetChangedFilesWire:
     async def test_shows_diff_summary_table(self, git_workspace):
         """Summary table with +/- line counts should appear before the blueprints."""
         async with Client(_make_transport(git_workspace)) as client:
-            r = await client.call_tool("get_changed_files", {"base": "main"})
+            r = await _mimir_call(client, "changed", "main")
         text = _text(r)
         # models.py is a new untracked-then-committed file; summary line shows +N -0 or +N -M
         assert "+" in text
@@ -663,14 +640,14 @@ class TestGetChangedFilesWire:
     async def test_non_git_workspace_handled(self, workspace):
         """Plain tmp_path (no git repo) should return a clear error, not crash."""
         async with Client(_make_transport(workspace)) as client:
-            r = await client.call_tool("get_changed_files", {})
+            r = await _mimir_call(client, "changed")
         text = _text(r)
         # Either no changes found, or a clear error — never an EXCEPTION
         assert "EXCEPTION" not in text
 
     async def test_bad_base_branch_handled(self, git_workspace):
         async with Client(_make_transport(git_workspace)) as client:
-            r = await client.call_tool("get_changed_files", {"base": "nonexistent-branch-xyz"})
+            r = await _mimir_call(client, "changed", "nonexistent-branch-xyz")
         text = _text(r)
         assert "EXCEPTION" not in text
 
@@ -683,7 +660,7 @@ class TestGetArchitectureWire:
     async def test_returns_directory_sections(self, workspace):
         """Architecture map should include directory headers."""
         async with Client(_make_transport(workspace)) as client:
-            r = await client.call_tool("get_architecture", {})
+            r = await _mimir_call(client, "arch")
         text = _text(r)
         assert "src" in text
         assert "EXCEPTION" not in text
@@ -691,7 +668,7 @@ class TestGetArchitectureWire:
     async def test_includes_top_level_symbols(self, workspace):
         """Architecture map should list top-level symbol names."""
         async with Client(_make_transport(workspace)) as client:
-            r = await client.call_tool("get_architecture", {})
+            r = await _mimir_call(client, "arch")
         text = _text(r)
         # service.py has UserService at top level
         assert "UserService" in text
@@ -699,7 +676,7 @@ class TestGetArchitectureWire:
 
     async def test_returns_nonempty_string(self, workspace):
         async with Client(_make_transport(workspace)) as client:
-            r = await client.call_tool("get_architecture", {})
+            r = await _mimir_call(client, "arch")
         text = _text(r)
         assert len(text) > 50
         assert "EXCEPTION" not in text
@@ -710,13 +687,13 @@ class TestGetArchitectureWire:
         try:
             async with Client(_make_transport(workspace)) as client:
                 # Prime the architecture cache (warmup may or may not have run yet)
-                await client.call_tool("get_architecture", {})
+                await _mimir_call(client, "arch")
                 # Write a new file AFTER the server started
                 new_file.write_text("class BrandNewService:\n    pass\n")
                 # add_ignore clears _ARCHITECTURE_MAP and _FILE_LIST as a side effect
-                await client.call_tool("add_ignore", {"pattern": "__test_marker__"})
+                await _mimir_call(client, "ignore", "__test_marker__")
                 # Next call must rebuild from scratch and discover brandnew.py
-                r = await client.call_tool("get_architecture", {})
+                r = await _mimir_call(client, "arch")
             text = _text(r)
             assert "BrandNewService" in text
             assert "EXCEPTION" not in text
@@ -755,13 +732,13 @@ def dual_workspace(tmp_path):
 class TestPerCallFocus:
     async def test_scope_task_focus_boosts_matching_path(self, dual_workspace):
         async with Client(_make_transport(dual_workspace)) as client:
-            r = await client.call_tool("scope_task", {
+            r = await client.call_tool("locate", {
                 "task": "authenticate user",
                 "focus": "backend:5.0",
             })
         text = _text(r)
         assert "EXCEPTION" not in text
-        # scope_task output has a "Ranked files" section: "  1. backend/auth/..." etc.
+        # locate's output has ranked lines like "1. backend/auth/...  [..]  score".
         # Find the first ranked entry and confirm it's backend.
         ranked_lines = [
             ln.strip() for ln in text.splitlines()
@@ -775,11 +752,11 @@ class TestPerCallFocus:
     async def test_scope_task_focus_does_not_mutate_global(self, dual_workspace):
         """A second call without focus should give unbiased results independent of the first."""
         async with Client(_make_transport(dual_workspace)) as client:
-            r1 = await client.call_tool("scope_task", {
+            r1 = await client.call_tool("locate", {
                 "task": "authenticate user",
                 "focus": "backend:100.0",
             })
-            r2 = await client.call_tool("scope_task", {
+            r2 = await client.call_tool("locate", {
                 "task": "authenticate user",
             })
         text1 = _text(r1)
@@ -799,10 +776,7 @@ class TestPerCallFocus:
 class TestSetFocusPersist:
     async def test_persist_false_no_file_written(self, workspace):
         async with Client(_make_transport(workspace)) as client:
-            r = await client.call_tool("set_focus", {
-                "entries": "src:2.0",
-                "persist": False,
-            })
+            r = await _mimir_call(client, "set_focus", "src:2.0 persist=false")
         text = _text(r)
         assert "EXCEPTION" not in text
         assert "session" in text.lower(), f"Expected 'session' in response: {text!r}"
@@ -812,10 +786,7 @@ class TestSetFocusPersist:
 
     async def test_persist_true_file_written(self, workspace):
         async with Client(_make_transport(workspace)) as client:
-            r = await client.call_tool("set_focus", {
-                "entries": "src:2.0",
-                "persist": True,
-            })
+            r = await _mimir_call(client, "set_focus", "src:2.0 persist=true")
         text = _text(r)
         assert "EXCEPTION" not in text
         assert (workspace / ".mimir-focus").exists(), (
@@ -826,8 +797,8 @@ class TestSetFocusPersist:
 class TestSetScope:
     async def test_set_scope_hard_filters_scope_task(self, dual_workspace):
         async with Client(_make_transport(dual_workspace)) as client:
-            set_r = await client.call_tool("set_scope", {"path": "backend"})
-            task_r = await client.call_tool("scope_task", {"task": "authenticate user"})
+            set_r = await _mimir_call(client, "set_scope", "backend")
+            task_r = await _mimir_call(client, "scope_task", "authenticate user")
         set_text = _text(set_r)
         task_text = _text(task_r)
         assert "EXCEPTION" not in set_text
@@ -837,13 +808,9 @@ class TestSetScope:
 
     async def test_set_scope_hard_filters_verify_symbol_existence(self, dual_workspace):
         async with Client(_make_transport(dual_workspace)) as client:
-            await client.call_tool("set_scope", {"path": "backend"})
-            in_scope = await client.call_tool(
-                "verify_symbol_existence", {"symbol_name": "BackendAuthService"}
-            )
-            out_of_scope = await client.call_tool(
-                "verify_symbol_existence", {"symbol_name": "FrontendAuthService"}
-            )
+            await _mimir_call(client, "set_scope", "backend")
+            in_scope = await _mimir_call(client, "verify_symbol_existence", "BackendAuthService")
+            out_of_scope = await _mimir_call(client, "verify_symbol_existence", "FrontendAuthService")
         assert "FOUND" in _text(in_scope) and "NOT FOUND" not in _text(in_scope)
         assert "NOT FOUND" in _text(out_of_scope), (
             f"Expected out-of-scope symbol to be filtered out:\n{_text(out_of_scope)}"
@@ -851,36 +818,34 @@ class TestSetScope:
 
     async def test_set_scope_hard_filters_find_callers(self, dual_workspace):
         async with Client(_make_transport(dual_workspace)) as client:
-            await client.call_tool("set_scope", {"path": "backend"})
-            r = await client.call_tool("find_callers", {"symbol_name": "authenticate_user"})
+            await _mimir_call(client, "set_scope", "backend")
+            r = await client.call_tool("inspect", {"symbol": "authenticate_user", "view": "callers"})
         text = _text(r)
         assert "frontend" not in text, f"frontend leaked into scoped find_callers:\n{text}"
 
     async def test_set_scope_empty_clears_and_restores_full_repo(self, dual_workspace):
         async with Client(_make_transport(dual_workspace)) as client:
-            await client.call_tool("set_scope", {"path": "backend"})
-            reset_r = await client.call_tool("set_scope", {"path": ""})
-            after_r = await client.call_tool(
-                "verify_symbol_existence", {"symbol_name": "FrontendAuthService"}
-            )
+            await _mimir_call(client, "set_scope", "backend")
+            reset_r = await _mimir_call(client, "set_scope", "")
+            after_r = await _mimir_call(client, "verify_symbol_existence", "FrontendAuthService")
         assert "cleared" in _text(reset_r).lower()
         assert "FOUND" in _text(after_r) and "NOT FOUND" not in _text(after_r)
 
     async def test_set_scope_empty_with_nothing_set_is_a_noop(self, dual_workspace):
         async with Client(_make_transport(dual_workspace)) as client:
-            r = await client.call_tool("set_scope", {"path": ""})
+            r = await _mimir_call(client, "set_scope", "")
         assert "No active scope" in _text(r)
 
     async def test_set_scope_rejects_nonexistent_path(self, dual_workspace):
         async with Client(_make_transport(dual_workspace)) as client:
-            r = await client.call_tool("set_scope", {"path": "does/not/exist"})
+            r = await _mimir_call(client, "set_scope", "does/not/exist")
         text = _text(r)
         assert "Error" in text
         assert not (dual_workspace / ".mimir-scope").exists()
 
     async def test_set_scope_persists_to_file(self, dual_workspace):
         async with Client(_make_transport(dual_workspace)) as client:
-            await client.call_tool("set_scope", {"path": "backend"})
+            await _mimir_call(client, "set_scope", "backend")
         scope_file = dual_workspace / ".mimir-scope"
         assert scope_file.exists()
         assert scope_file.read_text().strip() == "backend"

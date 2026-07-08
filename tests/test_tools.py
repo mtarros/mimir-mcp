@@ -971,3 +971,285 @@ class TestNotesForPath:
         monkeypatch.setattr(mimir, "_MIMIRNOTES", {"src/service.py": ["from global dict"]})
         result = mimir._notes_for_path("src/service.py")
         assert result == ["note: from global dict"]
+
+
+# ---------------------------------------------------------------------------
+# v2 tool surface — locate / inspect / mimir_dispatch
+# ---------------------------------------------------------------------------
+
+class _V2WorkspaceMixin:
+    @pytest.fixture(autouse=True)
+    def workspace(self, tmp_path, monkeypatch):
+        (tmp_path / "src").mkdir()
+        (tmp_path / "src" / "service.py").write_text(
+            "class UserService:\n"
+            "    def authenticate(self, u, p):\n"
+            "        return True\n"
+            "    def get_user(self, uid):\n"
+            "        return None\n"
+        )
+        (tmp_path / "src" / "auth.py").write_text(
+            "from src.service import UserService\n\n"
+            "def login(u, p):\n"
+            "    return UserService().authenticate(u, p)\n"
+        )
+        monkeypatch.setattr(mimir, "WORKSPACE_ROOT", tmp_path)
+        monkeypatch.setattr(mimir, "_FILE_LIST", [])
+        monkeypatch.setattr(mimir, "_FILE_LIST_TS", 0.0)
+        monkeypatch.setattr(mimir, "_FTS_READY", False)
+        monkeypatch.setattr(mimir, "_DISK_CACHE", None)
+        monkeypatch.setattr(mimir, "_MIMIRIGNORE_PATTERNS", [])
+        monkeypatch.setattr(mimir, "_MIMIRALIASES", {})
+        monkeypatch.setattr(mimir, "_MIMIRNOTES", {})
+        monkeypatch.setattr(mimir, "_CACHE", mimir._CACHE.__class__())
+        monkeypatch.setattr(mimir, "_GIT_RECENCY_CACHE", {"ts": float("inf"), "scores": {}})
+        monkeypatch.setattr(mimir, "_REVERSE_IMPORTS", {})
+        monkeypatch.setattr(mimir, "_ACTIVE_SCOPE", None)
+        monkeypatch.setattr(mimir, "_FOCUS_WEIGHTS", {})
+        monkeypatch.setattr(mimir, "_ARCHITECTURE_MAP", "")
+        monkeypatch.setattr(mimir, "_LAST_OVERVIEW_HASH", None)
+        return tmp_path
+
+
+class TestLocate(_V2WorkspaceMixin):
+    def test_finds_relevant_file(self):
+        out = mimir.locate("UserService authenticate login")
+        assert "service.py" in out
+        assert out.startswith("# locate:")
+
+    def test_symbol_names_shown_inline_not_full_signatures(self):
+        out = mimir.locate("UserService authenticate")
+        assert "authenticate" in out
+        # Compact format: no separate "## Matched symbols" section like scope_task.
+        assert "## Matched symbols" not in out
+
+    def test_suggests_batched_inspect_call(self):
+        out = mimir.locate("UserService authenticate")
+        assert 'inspect("' in out
+
+    def test_falls_back_to_semantic_search_on_zero_hits(self):
+        out = mimir.locate("completely unmatched gibberish query zzqxv")
+        assert "falling back to semantic search" in out
+
+    def test_mode_area_routes_to_scope_area(self):
+        out = mimir.locate("UserService", mode="area")
+        # scope_area's output format starts with a directory-tree header, not "# locate:"
+        assert not out.startswith("# locate:")
+
+    def test_mode_symbol_routes_to_verify_symbol_existence(self):
+        out = mimir.locate("UserService", mode="symbol")
+        assert "FOUND" in out
+
+    def test_unknown_mode_returns_error(self):
+        out = mimir.locate("UserService", mode="bogus")
+        assert "Error" in out and "bogus" in out
+
+    def test_max_files_respected(self):
+        out = mimir.locate("UserService authenticate", max_files=1)
+        ranked = [l for l in out.splitlines() if l.strip().startswith(("1.", "2."))]
+        assert len(ranked) <= 1
+
+    def test_never_raises(self):
+        # int(max_files) on a non-numeric string should be caught, not propagate.
+        out = mimir.locate("UserService", max_files="not-a-number")
+        assert "Error" in out
+
+
+class TestInspect(_V2WorkspaceMixin):
+    def test_default_view_returns_file_structure(self):
+        out = mimir.inspect("src/service.py")
+        assert "UserService" in out
+        assert "symbol=" not in out  # structure mode, not a symbol body
+
+    def test_symbol_param_returns_body(self):
+        out = mimir.inspect("src/service.py", symbol="authenticate")
+        assert "return True" in out
+
+    def test_comma_separated_symbols_batch(self):
+        out = mimir.inspect("src/service.py", symbol="authenticate, get_user")
+        assert "symbol=authenticate" in out and "symbol=get_user" in out
+
+    def test_view_imports(self):
+        out = mimir.inspect("src/auth.py", view="imports")
+        assert "workspace" in out.lower() or "service" in out.lower()
+
+    def test_view_dependents(self):
+        out = mimir.inspect("src/service.py", view="dependents")
+        assert "EXCEPTION" not in out
+
+    def test_view_callers_requires_symbol(self):
+        out = mimir.inspect(view="callers")
+        assert "Error" in out and "callers" in out
+
+    def test_view_callers_ignores_missing_path(self):
+        out = mimir.inspect(symbol="authenticate", view="callers")
+        assert "Error" not in out or "auth.py" in out
+
+    def test_missing_path_required_for_non_callers_views(self):
+        out = mimir.inspect(view="imports")
+        assert "Error" in out and "path" in out
+
+    def test_unknown_view_returns_error(self):
+        out = mimir.inspect("src/service.py", view="bogus")
+        assert "Error" in out and "bogus" in out
+
+    def test_directory_path_returns_directory_structure(self):
+        out = mimir.inspect("src")
+        assert "UserService" in out
+
+
+class TestMimirDispatch(_V2WorkspaceMixin):
+    def test_empty_command_returns_help(self):
+        out = mimir.mimir_dispatch("")
+        assert "mimir commands" in out
+
+    def test_help_lists_commands(self):
+        out = mimir.mimir_dispatch("help")
+        assert "status" in out and "scope_task" in out
+
+    def test_help_for_specific_command_returns_its_docstring(self):
+        out = mimir.mimir_dispatch("help", "record_alias")
+        assert "domain_term" in out
+
+    def test_unknown_command_is_self_teaching(self):
+        out = mimir.mimir_dispatch("totally_bogus_command")
+        assert "Unknown command" in out
+        assert "status" in out  # points at the real command list
+
+    def test_status_command(self):
+        out = mimir.mimir_dispatch("status")
+        assert "source_files" in out
+
+    def test_arch_command(self):
+        out = mimir.mimir_dispatch("arch")
+        assert "EXCEPTION" not in out
+
+    def test_legacy_scope_task_name_still_works(self):
+        out = mimir.mimir_dispatch("scope_task", "UserService authenticate")
+        assert "## Matched symbols" in out  # exact old scope_task format preserved
+
+    def test_legacy_scope_alias_maps_to_scope_task(self):
+        out = mimir.mimir_dispatch("scope", "UserService authenticate")
+        assert "## Matched symbols" in out
+
+    def test_kwarg_extraction_for_scope_task_max_files(self):
+        out = mimir.mimir_dispatch("scope_task", "UserService authenticate max_files=1")
+        ranked = [l for l in out.splitlines() if "## Ranked files" not in l and l.strip().startswith(("1.", "2."))]
+        assert len(ranked) <= 1
+
+    def test_legacy_get_symbol_batching_via_comma_partition(self):
+        out = mimir.mimir_dispatch("get_symbol", "src/service.py, authenticate, get_user")
+        assert "symbol=authenticate" in out and "symbol=get_user" in out
+
+    def test_legacy_record_alias_two_positional(self):
+        out = mimir.mimir_dispatch("alias", "corrective actions, RectificationFilter")
+        assert "corrective actions" in out.lower()
+        assert "RectificationFilter" in out
+
+    def test_legacy_record_note_free_text_with_commas_preserved(self):
+        out = mimir.mimir_dispatch("note", "src/service.py, has a, comma in it")
+        assert "has a, comma in it" in out
+
+    def test_never_raises_on_bad_int_kwarg(self):
+        out = mimir.mimir_dispatch("scope_task", "UserService max_files=not-a-number")
+        assert "Error" in out
+
+    def test_set_scope_then_legacy_scope_task_is_filtered(self):
+        mimir.mimir_dispatch("set_scope", "src")
+        out = mimir.mimir_dispatch("scope_task", "UserService")
+        mimir.mimir_dispatch("set_scope", "")  # reset for other tests
+        assert "EXCEPTION" not in out
+
+
+# ---------------------------------------------------------------------------
+# _upsert_mimir_section — CLAUDE.md/copilot-instructions.md marker splice
+# ---------------------------------------------------------------------------
+
+class TestUpsertMimirSection:
+    def test_creates_when_file_missing(self, tmp_path):
+        target = tmp_path / "CLAUDE.md"
+        action = mimir._upsert_mimir_section(target, f"{mimir._MIMIR_SECTION_MARKER}\n\nbody\n")
+        assert action == "created"
+        assert mimir._MIMIR_SECTION_MARKER in target.read_text()
+
+    def test_appends_when_file_exists_without_marker(self, tmp_path):
+        target = tmp_path / "CLAUDE.md"
+        target.write_text("# My Project\n\nsome existing content\n")
+        action = mimir._upsert_mimir_section(target, f"{mimir._MIMIR_SECTION_MARKER}\n\nbody\n")
+        assert action == "updated"
+        text = target.read_text()
+        assert "some existing content" in text
+        assert mimir._MIMIR_SECTION_MARKER in text
+
+    def test_skips_when_current_version_already_present(self, tmp_path):
+        target = tmp_path / "CLAUDE.md"
+        target.write_text(f"{mimir._MIMIR_SECTION_MARKER}\n\nexisting body\n")
+        action = mimir._upsert_mimir_section(target, f"{mimir._MIMIR_SECTION_MARKER}\n\nNEW body\n")
+        assert action == "skipped"
+        assert "existing body" in target.read_text()
+        assert "NEW body" not in target.read_text()
+
+    def test_replaces_stale_versionless_marker(self, tmp_path):
+        """A section written before the (v2) marker existed must be
+        upgraded, not left stale forever — this was the actual bug in the
+        pre-redesign setup() (skip-if-marker-present-at-all)."""
+        target = tmp_path / "CLAUDE.md"
+        target.write_text(
+            f"{mimir._MIMIR_MARKER_PREFIX}\n\nold v1 body naming scope_task etc.\n"
+        )
+        action = mimir._upsert_mimir_section(target, f"{mimir._MIMIR_SECTION_MARKER}\n\nNEW v2 body\n")
+        assert action == "updated"
+        text = target.read_text()
+        assert "NEW v2 body" in text
+        assert "old v1 body" not in text
+
+    def test_replace_preserves_unrelated_trailing_sections(self, tmp_path):
+        target = tmp_path / "CLAUDE.md"
+        target.write_text(
+            f"# My Project\n\n{mimir._MIMIR_MARKER_PREFIX}\n\nstale\n\n"
+            "## Unrelated section\n\nmust survive\n"
+        )
+        mimir._upsert_mimir_section(target, f"{mimir._MIMIR_SECTION_MARKER}\n\nfresh\n")
+        text = target.read_text()
+        assert "## Unrelated section" in text
+        assert "must survive" in text
+        assert "stale" not in text
+
+    def test_replace_preserves_unrelated_leading_content(self, tmp_path):
+        target = tmp_path / "CLAUDE.md"
+        target.write_text(f"# My Project\n\nintro text\n\n{mimir._MIMIR_MARKER_PREFIX}\n\nstale\n")
+        mimir._upsert_mimir_section(target, f"{mimir._MIMIR_SECTION_MARKER}\n\nfresh\n")
+        text = target.read_text()
+        assert "intro text" in text
+        assert "fresh" in text
+
+
+# ---------------------------------------------------------------------------
+# _write_overview / mimir sync
+# ---------------------------------------------------------------------------
+
+class TestWriteOverview(_V2WorkspaceMixin):
+    def test_writes_overview_file(self):
+        mimir._write_overview()
+        overview = mimir.WORKSPACE_ROOT / mimir._OVERVIEW_FILE
+        assert overview.exists()
+        text = overview.read_text()
+        assert "Source files indexed" in text
+        assert "UserService" in text  # architecture map content
+
+    def test_hash_guard_skips_redundant_write(self, monkeypatch):
+        mimir._write_overview()
+        overview = mimir.WORKSPACE_ROOT / mimir._OVERVIEW_FILE
+        first_mtime = overview.stat().st_mtime_ns
+        mimir._write_overview()  # nothing changed — should not rewrite
+        assert overview.stat().st_mtime_ns == first_mtime
+
+    def test_reflects_active_scope(self, monkeypatch):
+        monkeypatch.setattr(mimir, "_ACTIVE_SCOPE", "src")
+        mimir._write_overview()
+        text = (mimir.WORKSPACE_ROOT / mimir._OVERVIEW_FILE).read_text()
+        assert "Active scope: src" in text
+
+    def test_never_raises_on_write_failure(self, monkeypatch):
+        monkeypatch.setattr(mimir, "WORKSPACE_ROOT", Path("/nonexistent/does/not/exist"))
+        mimir._write_overview()  # must not raise
