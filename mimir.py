@@ -397,6 +397,14 @@ def _init_disk_cache() -> "Optional[object]":
         db.execute(
             "CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT)"
         )
+        # Persisted _FILE_LIST snapshot — lets a fresh CLI subprocess skip the
+        # ~1.9s os.walk() a large repo (e.g. 8,000+ files) costs on every
+        # single invocation otherwise, since a CLI process has no persistent
+        # in-memory _FILE_LIST the way a long-running MCP server does. See
+        # _save_file_list_to_disk/_load_file_list_from_disk.
+        db.execute(
+            "CREATE TABLE IF NOT EXISTS file_list (path TEXT PRIMARY KEY)"
+        )
         # Check the stored schema version BEFORE creating lines/symbols — a
         # version bump may require the symbols table itself to be dropped and
         # recreated (e.g. adding COLLATE NOCASE to `token`), which a plain
@@ -801,6 +809,7 @@ def _cache_evict(path: Path) -> None:
     # Force a file-list re-walk so new/deleted files are picked up immediately
     _FILE_LIST = []
     _FILE_LIST_TS = 0.0
+    _clear_file_list_disk_cache()
 
 
 def _smart_invalidate(path: Path) -> None:
@@ -865,7 +874,79 @@ def _resolve_in_workspace(rel_path: str) -> Path:
 
 _FILE_LIST: list[Path] = []
 _FILE_LIST_TS: float = 0.0
-_FILE_LIST_TTL: float = 30.0  # seconds between re-walks
+_FILE_LIST_TTL: float = 30.0  # seconds between re-walks (in-memory, same process)
+_FILE_LIST_DISK_TTL: float = 300.0  # seconds a disk-persisted list is trusted across processes
+
+
+def _save_file_list_to_disk(paths: list[Path]) -> None:
+    """Persist a freshly-walked file list so the NEXT CLI subprocess (a fresh
+    process, no in-memory _FILE_LIST to reuse) can skip the walk too. Written
+    every time _iter_source_files() actually re-walks, from both the CLI and
+    a running MCP server — cheap (a few thousand short strings), and it's
+    what makes repeat `mimir <command>` shell invocations on a large repo
+    fast instead of ~1.9s each. Best-effort: staleness just means the next
+    load falls through to a real walk, same as if this had never run."""
+    if _DISK_CACHE is None:
+        return
+    try:
+        rels = [str(p.relative_to(WORKSPACE_ROOT)) for p in paths]
+        _DISK_CACHE.execute("DELETE FROM file_list")
+        _DISK_CACHE.executemany(
+            "INSERT OR IGNORE INTO file_list VALUES (?)", [(r,) for r in rels]
+        )
+        _DISK_CACHE.execute(
+            "INSERT OR REPLACE INTO meta VALUES ('file_list_ts', ?)", (str(time.time()),)
+        )
+        _DISK_CACHE.commit()
+    except Exception:
+        pass
+
+
+def _load_file_list_from_disk() -> bool:
+    """CLI-only fast path (called from _cli_run, not the MCP server's own
+    startup — a long-running server should always start from a real walk,
+    not up to _FILE_LIST_DISK_TTL seconds of staleness): reuse a recently-
+    persisted file list instead of re-walking. A stale list only risks
+    missing a very recently added/deleted file in file counts/architecture
+    output until the next real walk — existing file CONTENT is unaffected,
+    since that's separately validated by the blueprint cache's own
+    mtime/size check on every load regardless. Returns True if a
+    fresh-enough list was loaded.
+    """
+    global _FILE_LIST, _FILE_LIST_TS
+    if _DISK_CACHE is None:
+        return False
+    try:
+        row = _DISK_CACHE.execute(
+            "SELECT value FROM meta WHERE key='file_list_ts'"
+        ).fetchone()
+        if row is None or time.time() - float(row[0]) > _FILE_LIST_DISK_TTL:
+            return False
+        rels = [r[0] for r in _DISK_CACHE.execute("SELECT path FROM file_list")]
+        if not rels:
+            return False
+        _FILE_LIST = [WORKSPACE_ROOT / r for r in rels]
+        _FILE_LIST_TS = time.monotonic()
+        return True
+    except Exception:
+        return False
+
+
+def _clear_file_list_disk_cache() -> None:
+    """Drop the persisted file list so the next load (this process or the
+    next CLI invocation) is forced back to a real walk. Called everywhere
+    the in-memory _FILE_LIST is reset (new/deleted file, .mimirignore
+    change, directory add/remove) — otherwise a CLI process started shortly
+    after one of those events would reuse a now-stale disk-persisted list
+    for up to _FILE_LIST_DISK_TTL seconds and miss the change."""
+    if _DISK_CACHE is None:
+        return
+    try:
+        _DISK_CACHE.execute("DELETE FROM file_list")
+        _DISK_CACHE.execute("DELETE FROM meta WHERE key='file_list_ts'")
+        _DISK_CACHE.commit()
+    except Exception:
+        pass
 
 
 def _iter_source_files() -> list[Path]:
@@ -890,6 +971,7 @@ def _iter_source_files() -> list[Path]:
                 result.append(p)
     _FILE_LIST = result
     _FILE_LIST_TS = now
+    _save_file_list_to_disk(result)
     # Auto-scale cache so it always fits the whole workspace — prevents thrashing.
     global _CACHE_MAX
     if len(result) > _CACHE_MAX:
@@ -1338,6 +1420,7 @@ def _start_file_watcher() -> bool:
                 # Directory added/removed — force a file-list re-walk
                 _FILE_LIST = []
                 _FILE_LIST_TS = 0.0
+                _clear_file_list_disk_cache()
                 _ARCHITECTURE_MAP = ""
                 _schedule_overview_write()
                 return
@@ -4914,6 +4997,7 @@ def add_ignore(pattern: str, reason: str = "") -> str:
     _MIMIRIGNORE_PATTERNS = _load_mimirignore()
     _FILE_LIST = []
     _FILE_LIST_TS = 0.0
+    _clear_file_list_disk_cache()
     _ARCHITECTURE_MAP = ''
 
     # Prune already-indexed files that now match the new pattern — otherwise
@@ -5706,6 +5790,7 @@ def _cli_run(subcommand: str, arg: str) -> None:
     """
     global _WARMUP_COMPLETE
     _load_disk_cache()
+    _load_file_list_from_disk()  # skip the ~1.9s walk on a large repo if still fresh
     if not _FTS_READY:
         print(f"[mimir] no warm index found — building one ({len(_iter_source_files())} files, "
               f"first run only)...", file=sys.stderr, flush=True)

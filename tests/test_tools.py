@@ -8,6 +8,7 @@ Run with: pytest tests/ -v
 """
 import os
 import tempfile
+import time
 from pathlib import Path
 
 import pytest
@@ -1253,3 +1254,80 @@ class TestWriteOverview(_V2WorkspaceMixin):
     def test_never_raises_on_write_failure(self, monkeypatch):
         monkeypatch.setattr(mimir, "WORKSPACE_ROOT", Path("/nonexistent/does/not/exist"))
         mimir._write_overview()  # must not raise
+
+
+# ---------------------------------------------------------------------------
+# _save_file_list_to_disk / _load_file_list_from_disk / _clear_file_list_disk_cache
+#
+# Real cost this fixes: a fresh CLI subprocess has no in-memory _FILE_LIST to
+# reuse, so every single `mimir <command>` shell invocation used to re-walk
+# the whole tree from scratch -- measured ~1.9s on the real ~8,000-file Carps
+# repo, even for a command like `status` that barely needs anything else.
+# Persisting the list (with a longer, cross-process TTL than the in-memory
+# 30s one) cut that to ~0.15-0.17s on repeat calls. These tests use a real
+# sqlite3 connection (not monkeypatched to None) since that's what the
+# functions actually read/write.
+# ---------------------------------------------------------------------------
+
+class TestFileListDiskCache:
+    @pytest.fixture(autouse=True)
+    def disk_cache(self, tmp_path, monkeypatch):
+        import sqlite3
+        db = sqlite3.connect(":memory:")
+        db.execute("CREATE TABLE file_list (path TEXT PRIMARY KEY)")
+        db.execute("CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT)")
+        monkeypatch.setattr(mimir, "_DISK_CACHE", db)
+        monkeypatch.setattr(mimir, "WORKSPACE_ROOT", tmp_path)
+        monkeypatch.setattr(mimir, "_FILE_LIST", [])
+        monkeypatch.setattr(mimir, "_FILE_LIST_TS", 0.0)
+        monkeypatch.setattr(mimir, "_MIMIRIGNORE_PATTERNS", [])
+        (tmp_path / "a.py").write_text("x = 1\n")
+        (tmp_path / "b.py").write_text("y = 2\n")
+        return db
+
+    def test_round_trip_save_and_load(self):
+        paths = [mimir.WORKSPACE_ROOT / "a.py", mimir.WORKSPACE_ROOT / "b.py"]
+        mimir._save_file_list_to_disk(paths)
+        # Simulate a fresh process: no in-memory list at all.
+        mimir._FILE_LIST = []
+        mimir._FILE_LIST_TS = 0.0
+        loaded = mimir._load_file_list_from_disk()
+        assert loaded is True
+        assert {p.name for p in mimir._FILE_LIST} == {"a.py", "b.py"}
+
+    def test_load_returns_false_when_nothing_persisted(self):
+        assert mimir._load_file_list_from_disk() is False
+        assert mimir._FILE_LIST == []
+
+    def test_load_returns_false_when_stale(self, monkeypatch):
+        mimir._save_file_list_to_disk([mimir.WORKSPACE_ROOT / "a.py"])
+        # Back-date the persisted timestamp past the disk TTL.
+        stale_ts = time.time() - mimir._FILE_LIST_DISK_TTL - 1
+        mimir._DISK_CACHE.execute(
+            "UPDATE meta SET value = ? WHERE key = 'file_list_ts'", (str(stale_ts),)
+        )
+        mimir._DISK_CACHE.commit()
+        mimir._FILE_LIST = []
+        assert mimir._load_file_list_from_disk() is False
+        assert mimir._FILE_LIST == []
+
+    def test_clear_removes_persisted_list(self):
+        mimir._save_file_list_to_disk([mimir.WORKSPACE_ROOT / "a.py"])
+        mimir._clear_file_list_disk_cache()
+        mimir._FILE_LIST = []
+        assert mimir._load_file_list_from_disk() is False
+
+    def test_functions_are_no_ops_without_disk_cache(self, monkeypatch):
+        monkeypatch.setattr(mimir, "_DISK_CACHE", None)
+        mimir._save_file_list_to_disk([mimir.WORKSPACE_ROOT / "a.py"])  # must not raise
+        assert mimir._load_file_list_from_disk() is False
+        mimir._clear_file_list_disk_cache()  # must not raise
+
+    def test_iter_source_files_persists_after_real_walk(self):
+        """The actual call site: _iter_source_files() itself should persist
+        after a real walk, not just when a test calls _save_ directly."""
+        mimir._iter_source_files()
+        mimir._FILE_LIST = []
+        loaded = mimir._load_file_list_from_disk()
+        assert loaded is True
+        assert {p.name for p in mimir._FILE_LIST} == {"a.py", "b.py"}
