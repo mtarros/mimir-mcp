@@ -44,7 +44,7 @@ import sys
 import subprocess
 import threading
 import time
-from collections import OrderedDict
+from collections import Counter, OrderedDict
 from datetime import datetime, timezone
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
@@ -3146,6 +3146,33 @@ def get_file_structure(path: str, max_files: int = 10) -> str:
     return blueprint
 
 
+# Generic descriptor words that show up when a caller describes a symbol
+# instead of naming it ("Request property", "the AddFooViewModel class") —
+# stripped before picking the most likely intended identifier out of a
+# multi-word phrase. Not exhaustive by design; _extract_bare_identifier
+# falls back to the longest raw token when nothing survives filtering, so
+# an unlisted stopword just means a slightly worse guess, not a failure.
+_SYMBOL_DESCRIPTOR_STOPWORDS = frozenset({
+    "the", "a", "an", "of", "for", "in", "on", "to", "is", "are",
+    "property", "field", "method", "function", "class", "interface",
+    "type", "variable", "value", "attribute", "member", "symbol",
+    "definition", "declaration",
+})
+
+
+def _extract_bare_identifier(text: str) -> Optional[str]:
+    """Best-effort single-identifier guess from a descriptive phrase — the
+    longest token after dropping common descriptor words (identifiers are
+    usually longer and more specific than the English words around them).
+    Returns None if the input has no word-like tokens at all.
+    """
+    tokens = re.findall(r"\w+", text)
+    if not tokens:
+        return None
+    candidates = [t for t in tokens if t.lower() not in _SYMBOL_DESCRIPTOR_STOPWORDS]
+    return max(candidates or tokens, key=len)
+
+
 @_tool
 def verify_symbol_existence(symbol_name: str, max_results: int = 25, path: str = "") -> str:
     """Confirm whether a symbol is actually DEFINED anywhere in the workspace,
@@ -3154,13 +3181,21 @@ def verify_symbol_existence(symbol_name: str, max_results: int = 25, path: str =
 
     Args:
         symbol_name: identifier to look for; matched case-insensitively but
-            results show real casing.
+            results show real casing. A short descriptive phrase ("Request
+            property") is tolerated — the most likely identifier is
+            extracted automatically and the guess is echoed in the output.
         max_results: cap on matches returned (default 25).
         path: optional workspace-relative path/suffix to restrict to one file.
 
     Returns 'FOUND' lines with file:line and signature, or 'NOT FOUND'.
     """
     name = symbol_name.strip()
+    interpreted_note = ""
+    if name and not re.match(r"^\w[\w]*$", name):
+        extracted = _extract_bare_identifier(name)
+        if extracted and re.match(r"^\w[\w]*$", extracted):
+            interpreted_note = f"(interpreted {name!r} as identifier {extracted!r})\n"
+            name = extracted
     if not name or not re.match(r"^\w[\w]*$", name):
         return "Error: pass a single bare identifier, e.g. 'createSession' (no parens, no dots)."
     target = path.strip().replace('\\', '/').lstrip('/')
@@ -3176,11 +3211,20 @@ def verify_symbol_existence(symbol_name: str, max_results: int = 25, path: str =
     raw_hits = raw_hits[:max_results]
     if not raw_hits:
         scope_msg = f" in '{target}'" if target else " in the workspace"
-        return (f"NOT FOUND: no definition of '{name}'{scope_msg}. "
+        return (f"{interpreted_note}NOT FOUND: no definition of '{name}'{scope_msg}. "
                 f"It may be undefined, external, or spelled differently.")
-    out = "\n".join(f"FOUND  {r}:{l}  ->  {s}" for r, l, s in raw_hits)
+    out = interpreted_note + "\n".join(f"FOUND  {r}:{l}  ->  {s}" for r, l, s in raw_hits)
     if len(raw_hits) >= max_results:
-        out += f"\n... (truncated at {max_results}; refine the name to narrow down)"
+        hint = ""
+        # A generic name (e.g. "Startup") truncating at the cap gives no clue
+        # where to look next on its own — if the shown hits cluster under one
+        # sub-project, name it so the obvious follow-up (scope, then retry)
+        # doesn't need a manual look through the raw list first.
+        prefixes = Counter("/".join(r.replace("\\", "/").split("/")[:3]) for r, _l, _s in raw_hits)
+        top_prefix, top_count = prefixes.most_common(1)[0]
+        if top_count >= max(3, len(raw_hits) // 3):
+            hint = f' Most hits cluster under \'{top_prefix}\' — try set_scope("{top_prefix}") to narrow, then retry.'
+        out += f"\n... (truncated at {max_results}; refine the name to narrow down.{hint})"
     return out
 
 
@@ -5872,6 +5916,19 @@ def _cli_run(subcommand: str, arg: str) -> None:
 # pre-v2 tool name, so instructions generated before this change keep working.
 # =============================================================================
 
+def _path_area(rel: str) -> str:
+    """Top-2-directory-segment grouping key for a relative path, e.g.
+    "src/carps-mobile/InControl.Carps.Mobile/UI/X.cs" -> "src/carps-mobile".
+    Excludes the filename deliberately: two files sitting directly in the
+    same shallow directory ("src/a.py", "src/b.py", dirname "src") must
+    count as the same area, not each be treated as its own — a plain
+    parts[:2] on the full path (filename included) gets this wrong whenever
+    a file has fewer than 3 path segments total.
+    """
+    dirname = rel.replace("\\", "/").rsplit("/", 1)[0] if "/" in rel else ""
+    return "/".join(dirname.split("/")[:2])
+
+
 def _render_locate(task: str, max_files: int, focus: str) -> Optional[str]:
     """Compact locate() renderer: ranked files with matched symbol NAMES
     inline (no signatures — inspect() recovers those on demand) instead of
@@ -5919,6 +5976,17 @@ def _render_locate(task: str, max_files: int, focus: str) -> Optional[str]:
     if expanded != task:
         parts.append(f"Aliases expanded: {expanded[len(task):].strip()}")
 
+    # Reference "area" (top 2 DIRECTORY segments, e.g. "src/carps-mobile" —
+    # deliberately excludes the filename, so two files sitting directly in
+    # the same shallow directory ("src/a.py", "src/b.py") count as the same
+    # area rather than each being its own; verified this matters on a real
+    # fixture, not just theoretically) of the highest-scoring result — used
+    # below to flag a lower-ranked file that's BOTH a narrow keyword match
+    # AND in a visibly different part of the repo from the best match, which
+    # in practice is what separates a real secondary hit from noise (see the
+    # annotation comment below).
+    primary_area = _path_area(top_files[0]) if top_files else None
+
     suggestions: list[str] = []
     for i, rel in enumerate(top_files, 1):
         n = int(round(file_hit_count[rel]))
@@ -5933,7 +6001,27 @@ def _render_locate(task: str, max_files: int, focus: str) -> Optional[str]:
         else:
             sym_part = ""
         common_only = bool(file_kws.get(rel)) and file_kws[rel].issubset(low_idf)
-        annotation = "  (common terms only)" if common_only else ""
+        coverage = len(file_kws.get(rel, ()))
+        rel_area = _path_area(rel)
+        off_area = i > 1 and primary_area is not None and rel_area != primary_area
+        if common_only:
+            annotation = "  (common terms only)"
+        elif len(keywords) >= 3 and coverage <= 1 and off_area:
+            # Narrow coverage ALONE isn't enough signal — verified on Carps,
+            # most of a real result set only matches 1 of many search terms
+            # (whichever single word is their strongest overlap) INCLUDING
+            # genuinely relevant secondary files, so flagging on coverage
+            # alone produced false positives on real hits. What actually
+            # separated the two real noise files (both in a Tests project)
+            # from the real hits (all in the same UI project as the top
+            # result) was that they ALSO sat in a completely different part
+            # of the repo — "workflow"/"override" are genuinely rare,
+            # high-IDF terms, just used by an unrelated feature elsewhere.
+            # Combining both signals (narrow match + different area) is
+            # what actually reproduces that real, verified split.
+            annotation = f"  (matched only {coverage} of {len(keywords)} search terms, different area than #1)"
+        else:
+            annotation = ""
         parts.append(f"{i}. {rel}{sym_part}  {n}{annotation}")
         for note in _notes_for_path(rel):
             parts.append(f"   {note}")

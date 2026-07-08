@@ -1055,6 +1055,49 @@ class TestLocate(_V2WorkspaceMixin):
         out = mimir.locate("UserService", max_files="not-a-number")
         assert "Error" in out
 
+    def test_narrow_match_in_different_area_annotated(self):
+        """A file matching only 1 of a multi-keyword query AND sitting in a
+        different top-level area than the #1 result gets a precise,
+        data-driven annotation distinct from the (unrelated) low-IDF one.
+        Real case verified on Carps: 'workflow'/'override' are globally
+        RARE there (high IDF, comfortably above the 0.25 low-IDF cutoff),
+        so IDF alone couldn't flag the two unrelated test files that matched
+        one of those words in a real query's tail — but combining narrow
+        keyword coverage with "different area than the top result" does,
+        since that's what actually separated real noise from real hits.
+        """
+        (mimir.WORKSPACE_ROOT / "other").mkdir()
+        (mimir.WORKSPACE_ROOT / "other" / "unrelated.py").write_text(
+            "class Token:\n    pass\n"
+        )
+        out = mimir.locate("UserService authenticate login Token", max_files=5)
+        lines = [l for l in out.splitlines() if "unrelated.py" in l]
+        assert lines, f"unrelated.py should appear in results:\n{out}"
+        assert "matched only 1 of" in lines[0], lines[0]
+        assert "different area than #1" in lines[0], lines[0]
+
+    def test_narrow_match_in_same_area_not_annotated(self):
+        """The critical negative case: a real re-test against Carps showed
+        the coverage-only version of this annotation ALSO flagged genuinely
+        relevant secondary files that just happened to share the top
+        result's directory — e.g. AddOverridePhotoPage.xaml.cs, in the same
+        UI project as the top-ranked AddOverridePhotoViewModel.cs, matching
+        only "override". A narrow match in the SAME area as #1 must not be
+        flagged — only narrow AND off-area should be."""
+        (mimir.WORKSPACE_ROOT / "src" / "sibling.py").write_text(
+            "class Token:\n    pass\n"
+        )
+        out = mimir.locate("UserService authenticate login Token", max_files=5)
+        lines = [l for l in out.splitlines() if "sibling.py" in l]
+        assert lines, f"sibling.py should appear in results:\n{out}"
+        assert "matched only" not in lines[0], lines[0]
+
+    def test_short_query_does_not_trigger_narrow_coverage_annotation(self):
+        """With fewer than 3 keywords total, matching 1 is normal, not a
+        red flag — must not annotate."""
+        out = mimir.locate("UserService", max_files=5)
+        assert "matched only" not in out
+
 
 class TestInspect(_V2WorkspaceMixin):
     def test_default_view_returns_file_structure(self):
@@ -1097,6 +1140,79 @@ class TestInspect(_V2WorkspaceMixin):
     def test_directory_path_returns_directory_structure(self):
         out = mimir.inspect("src")
         assert "UserService" in out
+
+
+class TestExtractBareIdentifier:
+    def test_returns_single_bare_identifier_unchanged(self):
+        assert mimir._extract_bare_identifier("createSession") == "createSession"
+
+    def test_strips_trailing_descriptor_word(self):
+        assert mimir._extract_bare_identifier("Request property") == "Request"
+
+    def test_picks_longest_non_stopword_from_phrase(self):
+        assert mimir._extract_bare_identifier("the AddOverridePhotoViewModel class") == "AddOverridePhotoViewModel"
+
+    def test_falls_back_to_longest_raw_token_when_all_are_stopwords(self):
+        # "class of the type" -- every token is a stopword; must not return None.
+        result = mimir._extract_bare_identifier("class of the type")
+        assert result is not None
+
+    def test_returns_none_for_no_word_tokens(self):
+        assert mimir._extract_bare_identifier("()...") is None
+
+
+class TestVerifySymbolExistence(_V2WorkspaceMixin):
+    def test_finds_known_symbol(self):
+        out = mimir.verify_symbol_existence("UserService")
+        assert "FOUND" in out and "service.py" in out
+
+    def test_not_found_graceful(self):
+        out = mimir.verify_symbol_existence("TotallyMadeUpNameXYZ")
+        assert "NOT FOUND" in out
+
+    def test_rejects_unrecoverable_input_without_crashing(self):
+        out = mimir.verify_symbol_existence("()...")
+        assert "Error" in out
+
+    def test_auto_extracts_identifier_from_descriptive_phrase(self):
+        out = mimir.verify_symbol_existence("the UserService class")
+        assert "interpreted" in out
+        assert "'UserService'" in out
+        assert "FOUND" in out
+
+    def test_auto_extraction_note_present_on_not_found_too(self):
+        out = mimir.verify_symbol_existence("some TotallyMadeUpNameXYZ thing")
+        assert "interpreted" in out
+        assert "NOT FOUND" in out
+
+    def test_bare_identifier_unaffected_by_extraction_path(self):
+        # A real bare identifier should produce no "(interpreted...)" note at all.
+        out = mimir.verify_symbol_existence("UserService")
+        assert "interpreted" not in out
+
+    def test_truncation_suggests_scope_when_hits_cluster(self, monkeypatch):
+        """Real case: searching a generic name like 'Startup' across a large
+        repo truncates at max_results with no clue where to look next. If
+        the shown hits cluster under one directory, suggest scoping there.
+        Paths need >3 segments so the first-3-segments grouping key lands on
+        a shared directory, not each hit's own (distinct) filename."""
+        clustered_hits = [
+            (f"src/mobile/Sub/Area{i}.cs", "1", f"class Area{i}Startup") for i in range(5)
+        ] + [("src/other/Sub2/Elsewhere.cs", "1", "class ElsewhereStartup")]
+        monkeypatch.setattr(mimir, "_symbol_hits", lambda name, max_results: clustered_hits)
+        out = mimir.verify_symbol_existence("Startup", max_results=6)
+        assert "truncated" in out
+        assert "set_scope" in out
+        assert "src/mobile" in out
+
+    def test_truncation_without_clear_cluster_has_no_scope_hint(self, monkeypatch):
+        scattered_hits = [
+            (f"src/p{i}/Sub/File{i}.cs", "1", f"class File{i}") for i in range(6)
+        ]
+        monkeypatch.setattr(mimir, "_symbol_hits", lambda name, max_results: scattered_hits)
+        out = mimir.verify_symbol_existence("File", max_results=6)
+        assert "truncated" in out
+        assert "set_scope" not in out
 
 
 class TestMimirDispatch(_V2WorkspaceMixin):
