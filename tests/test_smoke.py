@@ -13,6 +13,7 @@ Add -m smoke to target just these: pytest -m smoke tests/test_smoke.py -v
 import json
 import os
 import re
+import subprocess
 import sys
 import asyncio
 from pathlib import Path
@@ -49,11 +50,20 @@ def _make_transport(workspace: Path) -> StdioTransport:
     )
 
 
-async def _mimir_call(client, command: str, args: str = ""):
-    """Call the v2 `mimir` dispatcher tool — the wire-level replacement for
-    calling a pre-v2 tool name directly, since only locate/inspect/mimir are
-    registered now. Returns the same CallToolResult shape _text() expects."""
-    return await client.call_tool("mimir", {"command": command, "args": args})
+def _run_cli(workspace: Path, *args: str) -> tuple[str, int]:
+    """Run `mimir.py <args>` as a real subprocess against `workspace` and
+    return (stdout, exit code). mimir_dispatch (status/arch/changed/
+    set_focus/set_scope/alias/note/ignore/audit/help, plus every pre-v2 tool
+    name) was pulled from MCP registration on 2026-07-09 — the CLI is the
+    only way an AI client reaches those now, so this is the real, current
+    integration path for that surface, not a workaround."""
+    proc = subprocess.run(
+        [sys.executable, str(MIMIR_PY), *args],
+        cwd=str(workspace),
+        env={**os.environ, "MCP_WORKSPACE_ROOT": str(workspace)},
+        capture_output=True, text=True, timeout=30,
+    )
+    return proc.stdout, proc.returncode
 
 
 # ---------------------------------------------------------------------------
@@ -100,13 +110,14 @@ def workspace(tmp_path):
 
 class TestToolRegistration:
     async def test_all_tools_listed(self, workspace):
-        """Only locate/inspect/mimir are registered — the v2 (2026-07-09)
-        3-tool surface. Everything else is reachable through mimir_dispatch's
-        legacy-name routing, not as a directly-registered MCP tool."""
+        """Only locate/inspect are registered as of 2026-07-09 — mimir_dispatch
+        (the "mimir" tool) was pulled from MCP registration too, since its
+        commands are occasional/session-level rather than needed every task.
+        It's reachable via the CLI (`mimir <command> "<args>"`) instead."""
         async with Client(_make_transport(workspace)) as client:
             tools = await client.list_tools()
             names = {t.name for t in tools}
-        expected = {"locate", "inspect", "mimir"}
+        expected = {"locate", "inspect"}
         assert expected == names, f"Tool mismatch. Extra: {names - expected}, Missing: {expected - names}"
 
     async def test_all_tools_have_descriptions(self, workspace):
@@ -116,14 +127,15 @@ class TestToolRegistration:
             assert t.description and len(t.description) > 20, \
                 f"Tool '{t.name}' has missing/short description"
 
-    async def test_wire_budget_under_4000_chars(self, workspace):
+    async def test_wire_budget_under_3000_chars(self, workspace):
         """Regression guard: total list_tools() JSON must stay well under the
-        old 18-tool ~15,100-char baseline, so the per-turn schema tax the v2
-        redesign cut can't silently creep back up."""
+        old 18-tool ~15,100-char baseline (measured ~2,622 for the current
+        2-tool locate/inspect-only surface), so the per-turn schema tax these
+        redesigns cut can't silently creep back up."""
         async with Client(_make_transport(workspace)) as client:
             tools = await client.list_tools()
         total_wire = sum(len(json.dumps(t.model_dump(exclude_none=True))) for t in tools)
-        assert total_wire < 4000, f"Tool schema wire size regressed: {total_wire} chars (budget: 4000)"
+        assert total_wire < 3000, f"Tool schema wire size regressed: {total_wire} chars (budget: 3000)"
 
     async def test_tool_results_are_text_not_none(self, workspace):
         """Every tool must return a non-empty string — no None, no empty result."""
@@ -164,16 +176,20 @@ class TestGetFileStructureWire:
 # ---------------------------------------------------------------------------
 
 class TestScopeTaskWire:
+    """scope_task itself has no MCP wire path anymore (CLI-only via
+    mimir_dispatch); these exercise the same ranking core through the `locate`
+    tool, which is still directly registered and shares _score_task_files."""
+
     async def test_finds_relevant_file(self, workspace):
-        # Use exact symbol names — scope_task keyword search is token-exact, not stemmed
+        # Use exact symbol names — the ranking core is token-exact, not stemmed
         async with Client(_make_transport(workspace)) as client:
-            r = await _mimir_call(client, "scope_task", "UserService authenticate login")
+            r = await client.call_tool("locate", {"task": "UserService authenticate login"})
         text = _text(r)
         assert "UserService" in text or "service.py" in text
 
     async def test_returns_nonempty_response(self, workspace):
         async with Client(_make_transport(workspace)) as client:
-            r = await _mimir_call(client, "scope_task", "UserService")
+            r = await client.call_tool("locate", {"task": "UserService"})
         text = _text(r)
         assert len(text) > 50
         assert "EXCEPTION" not in text
@@ -196,7 +212,7 @@ class TestScopeTaskWire:
             "    def on_timer_tick(self): pass\n"
         )
         async with Client(_make_transport(tmp_path)) as client:
-            r = await _mimir_call(client, "scope_task", "TimerJob timer max_files=2")
+            r = await client.call_tool("locate", {"task": "TimerJob timer", "max_files": 2})
         text = _text(r)
         assert "EXCEPTION" not in text
         lines = text.splitlines()
@@ -212,16 +228,19 @@ class TestScopeTaskWire:
 # ---------------------------------------------------------------------------
 
 class TestVerifySymbolExistenceWire:
+    """verify_symbol_existence itself has no MCP wire path anymore; locate's
+    mode="symbol" routes to it directly and is still registered."""
+
     async def test_finds_known_symbol(self, workspace):
         async with Client(_make_transport(workspace)) as client:
-            r = await _mimir_call(client, "verify_symbol_existence", "UserService")
+            r = await client.call_tool("locate", {"task": "UserService", "mode": "symbol"})
         text = _text(r)
         assert "UserService" in text
         assert "service.py" in text
 
     async def test_not_found_returns_graceful_message(self, workspace):
         async with Client(_make_transport(workspace)) as client:
-            r = await _mimir_call(client, "verify_symbol_existence", "AbsolutelyNonExistentXYZ")
+            r = await client.call_tool("locate", {"task": "AbsolutelyNonExistentXYZ", "mode": "symbol"})
         text = _text(r)
         assert "EXCEPTION" not in text
         assert len(text) > 0
@@ -330,193 +349,37 @@ class TestGetFileStructureDirectoryModeWire:
 # get_status
 # ---------------------------------------------------------------------------
 
-class TestGetStatusWire:
-    async def test_returns_workspace_path(self, workspace):
-        async with Client(_make_transport(workspace)) as client:
-            r = await _mimir_call(client, "status")
-        text = _text(r)
-        assert str(workspace) in text
-        assert "EXCEPTION" not in text
-
-    async def test_shows_source_file_count(self, workspace):
-        async with Client(_make_transport(workspace)) as client:
-            r = await _mimir_call(client, "status")
-        text = _text(r)
-        assert "source_files" in text
-        assert "3" in text  # workspace fixture has 3 .py files
-
-    async def test_shows_index_state(self, workspace):
-        async with Client(_make_transport(workspace)) as client:
-            r = await _mimir_call(client, "status")
-        text = _text(r)
-        assert "symbol_index" in text
-        # Either warm or building — both are valid immediately after startup
-        assert "warm" in text or "building" in text
-
-    async def test_shows_mimirignore_hint_when_no_file(self, workspace):
-        """When .mimirignore doesn't exist, get_status should tell the user how to create one."""
-        async with Client(_make_transport(workspace)) as client:
-            r = await _mimir_call(client, "status")
-        text = _text(r)
-        assert ".mimirignore" in text
-
-    async def test_shows_active_patterns_when_file_exists(self, workspace):
-        (workspace / ".mimirignore").write_text("**/vendor/**\n**/obj/**\n")
-        async with Client(_make_transport(workspace)) as client:
-            r = await _mimir_call(client, "status")
-        text = _text(r)
-        assert "**/vendor/**" in text or "2 active" in text
-
-
 # ---------------------------------------------------------------------------
-# record_alias
+# get_status / record_alias / add_ignore: no MCP wire path anymore (CLI-only
+# via mimir_dispatch) — see TestCliSubprocess near the end of this file for
+# their real, current integration coverage.
 # ---------------------------------------------------------------------------
 
-class TestRecordAliasWire:
-    async def test_saves_alias_and_confirms(self, workspace):
-        async with Client(_make_transport(workspace)) as client:
-            r = await _mimir_call(client, "alias", "live tutor, LiveTutor")
-        text = _text(r)
-        assert "live tutor" in text.lower()
-        assert "LiveTutor" in text
-        assert "EXCEPTION" not in text
-        alias_file = workspace / ".mimiraliases"
-        assert alias_file.exists()
-        assert "LiveTutor" in alias_file.read_text()
-
-    async def test_duplicate_returns_already_recorded(self, workspace):
-        async with Client(_make_transport(workspace)) as client:
-            await _mimir_call(client, "alias", "foo feature, FooService")
-            r = await _mimir_call(client, "alias", "foo feature, FooService")
-        text = _text(r)
-        assert "already" in text.lower() or "FooService" in text
-
-    async def test_empty_inputs_rejected(self, workspace):
-        async with Client(_make_transport(workspace)) as client:
-            r = await _mimir_call(client, "alias", ", Foo")
-        text = _text(r)
-        assert "Error" in text
-
-
 # ---------------------------------------------------------------------------
-# record_note
+# record_note: recording itself is CLI-only now (see TestCliSubprocess), but
+# whether a note SURFACES correctly in locate()/inspect() is still testable
+# over the wire by pre-writing .mimirnotes before the server starts (it's
+# read at module import, same as .mimir-scope/.mimir-focus).
 # ---------------------------------------------------------------------------
 
 class TestRecordNoteWire:
-    async def test_saves_note_and_confirms(self, workspace):
+    async def test_note_surfaces_in_inspect(self, workspace):
+        (workspace / ".mimirnotes").write_text(
+            "src/service.py = check the retry logic here\n"
+        )
         async with Client(_make_transport(workspace)) as client:
-            r = await _mimir_call(client, "note", "src/service.py, watch for the auth quirk here")
-        text = _text(r)
-        assert "src/service.py" in text
-        assert "watch for the auth quirk here" in text
-        assert "EXCEPTION" not in text
-        notes_file = workspace / ".mimirnotes"
-        assert notes_file.exists()
-        assert "watch for the auth quirk here" in notes_file.read_text()
-
-    async def test_duplicate_returns_already_recorded(self, workspace):
-        async with Client(_make_transport(workspace)) as client:
-            await _mimir_call(client, "note", "src/models.py, dup note")
-            r = await _mimir_call(client, "note", "src/models.py, dup note")
-        text = _text(r)
-        assert "already" in text.lower()
-
-    async def test_empty_inputs_rejected(self, workspace):
-        async with Client(_make_transport(workspace)) as client:
-            r = await _mimir_call(client, "note", ", x")
-        text = _text(r)
-        assert "Error" in text
-
-    async def test_prefix_with_equals_rejected(self, workspace):
-        async with Client(_make_transport(workspace)) as client:
-            r = await _mimir_call(client, "note", "Config=Prod, x")
-        text = _text(r)
-        assert "Error" in text
-
-    async def test_multiline_note_flattened(self, workspace):
-        async with Client(_make_transport(workspace)) as client:
-            r = await _mimir_call(client, "note", "src/models.py, line one\nline two\nline three")
-            text = _text(r)
-            assert "EXCEPTION" not in text
-            notes_file = workspace / ".mimirnotes"
-            raw = notes_file.read_text()
-            assert "line one line two line three" in raw
-            # No embedded raw newline inside a note entry — file stays one-line-per-note.
-            assert "line one\nline two" not in raw
-            # File must still parse cleanly after the flattened write.
-            r2 = await _mimir_call(client, "status")
-            assert "EXCEPTION" not in _text(r2)
-
-    async def test_note_surfaces_in_get_file_structure(self, workspace):
-        async with Client(_make_transport(workspace)) as client:
-            await _mimir_call(client, "note", "src/service.py, check the retry logic here")
             r = await client.call_tool("inspect", {"path": "src/service.py"})
         text = _text(r)
         assert "note: check the retry logic here" in text
 
-    async def test_note_surfaces_in_scope_task(self, workspace):
+    async def test_note_surfaces_in_locate(self, workspace):
+        (workspace / ".mimirnotes").write_text(
+            "src/service.py = surfaces in ranked output\n"
+        )
         async with Client(_make_transport(workspace)) as client:
-            await _mimir_call(client, "note", "src/service.py, surfaces in ranked output")
-            r = await _mimir_call(client, "scope_task", "UserService authenticate login")
+            r = await client.call_tool("locate", {"task": "UserService authenticate login"})
         text = _text(r)
         assert "note: surfaces in ranked output" in text
-
-    async def test_note_does_not_affect_ranking(self, workspace):
-        """A note's text must never influence scope_task's scores — notes are
-        display-only, unlike record_alias which deliberately does affect ranking."""
-        async with Client(_make_transport(workspace)) as client:
-            before = _text(await _mimir_call(client, "scope_task", "UserService authenticate login"))
-            await _mimir_call(
-                client, "note",
-                "src/service.py, totally unrelated keywords xylophone zeppelin quokka",
-            )
-            after = _text(await _mimir_call(client, "scope_task", "UserService authenticate login"))
-
-        def match_counts(text: str) -> list[str]:
-            return [l for l in text.splitlines() if re.match(r"\s*\d+\.\s", l)]
-
-        assert match_counts(before) == match_counts(after), (
-            f"ranked-file match counts changed after recording an unrelated note:\n"
-            f"before={match_counts(before)}\nafter={match_counts(after)}"
-        )
-
-
-# ---------------------------------------------------------------------------
-# add_ignore
-# ---------------------------------------------------------------------------
-
-class TestAddIgnoreWire:
-    async def test_adds_pattern_and_writes_file(self, workspace):
-        async with Client(_make_transport(workspace)) as client:
-            r = await _mimir_call(client, "ignore", "**/vendor/**, third-party libs")
-        text = _text(r)
-        assert "**/vendor/**" in text
-        assert "EXCEPTION" not in text
-        ignore_file = workspace / ".mimirignore"
-        assert ignore_file.exists()
-        assert "**/vendor/**" in ignore_file.read_text()
-
-    async def test_duplicate_pattern_rejected(self, workspace):
-        async with Client(_make_transport(workspace)) as client:
-            await _mimir_call(client, "ignore", "**/dist/**")
-            r = await _mimir_call(client, "ignore", "**/dist/**")
-        text = _text(r)
-        assert "already" in text.lower()
-        assert "EXCEPTION" not in text
-
-    async def test_empty_pattern_rejected(self, workspace):
-        async with Client(_make_transport(workspace)) as client:
-            r = await _mimir_call(client, "ignore", "")
-        text = _text(r)
-        assert "Error" in text
-        assert "EXCEPTION" not in text
-
-    async def test_path_traversal_rejected(self, workspace):
-        async with Client(_make_transport(workspace)) as client:
-            r = await _mimir_call(client, "ignore", "../../etc/**")
-        text = _text(r)
-        assert "Error" in text
-        assert "EXCEPTION" not in text
 
 
 # ---------------------------------------------------------------------------
@@ -618,94 +481,10 @@ def git_workspace(tmp_path):
     return tmp_path
 
 
-class TestGetChangedFilesWire:
-    async def test_returns_changed_file_blueprint(self, git_workspace):
-        """Should return blueprint for models.py which was added on the feature branch."""
-        async with Client(_make_transport(git_workspace)) as client:
-            r = await _mimir_call(client, "changed", "main")
-        text = _text(r)
-        assert "models.py" in text
-        assert "EXCEPTION" not in text
-
-    async def test_shows_diff_summary_table(self, git_workspace):
-        """Summary table with +/- line counts should appear before the blueprints."""
-        async with Client(_make_transport(git_workspace)) as client:
-            r = await _mimir_call(client, "changed", "main")
-        text = _text(r)
-        # models.py is a new untracked-then-committed file; summary line shows +N -0 or +N -M
-        assert "+" in text
-        assert "models.py" in text
-        assert "EXCEPTION" not in text
-
-    async def test_non_git_workspace_handled(self, workspace):
-        """Plain tmp_path (no git repo) should return a clear error, not crash."""
-        async with Client(_make_transport(workspace)) as client:
-            r = await _mimir_call(client, "changed")
-        text = _text(r)
-        # Either no changes found, or a clear error — never an EXCEPTION
-        assert "EXCEPTION" not in text
-
-    async def test_bad_base_branch_handled(self, git_workspace):
-        async with Client(_make_transport(git_workspace)) as client:
-            r = await _mimir_call(client, "changed", "nonexistent-branch-xyz")
-        text = _text(r)
-        assert "EXCEPTION" not in text
-
-
 # ---------------------------------------------------------------------------
-# get_architecture
+# get_changed_files / get_architecture: no MCP wire path anymore (CLI-only
+# via mimir_dispatch) — see TestCliSubprocess near the end of this file.
 # ---------------------------------------------------------------------------
-
-class TestGetArchitectureWire:
-    async def test_returns_directory_sections(self, workspace):
-        """Architecture map should include directory headers."""
-        async with Client(_make_transport(workspace)) as client:
-            r = await _mimir_call(client, "arch")
-        text = _text(r)
-        assert "src" in text
-        assert "EXCEPTION" not in text
-
-    async def test_includes_top_level_symbols(self, workspace):
-        """Architecture map should list top-level symbol names."""
-        async with Client(_make_transport(workspace)) as client:
-            r = await _mimir_call(client, "arch")
-        text = _text(r)
-        # service.py has UserService at top level
-        assert "UserService" in text
-        assert "EXCEPTION" not in text
-
-    async def test_returns_nonempty_string(self, workspace):
-        async with Client(_make_transport(workspace)) as client:
-            r = await _mimir_call(client, "arch")
-        text = _text(r)
-        assert len(text) > 50
-        assert "EXCEPTION" not in text
-
-    async def test_rebuilds_when_cache_invalidated(self, workspace):
-        """After invalidation, get_architecture must discover files added since warmup."""
-        new_file = workspace / "src" / "brandnew.py"
-        try:
-            async with Client(_make_transport(workspace)) as client:
-                # Prime the architecture cache (warmup may or may not have run yet)
-                await _mimir_call(client, "arch")
-                # Write a new file AFTER the server started
-                new_file.write_text("class BrandNewService:\n    pass\n")
-                # add_ignore clears _ARCHITECTURE_MAP and _FILE_LIST as a side effect
-                await _mimir_call(client, "ignore", "__test_marker__")
-                # Next call must rebuild from scratch and discover brandnew.py
-                r = await _mimir_call(client, "arch")
-            text = _text(r)
-            assert "BrandNewService" in text
-            assert "EXCEPTION" not in text
-        finally:
-            new_file.unlink(missing_ok=True)
-            ignore_file = workspace / ".mimirignore"
-            if ignore_file.exists():
-                content = ignore_file.read_text()
-                ignore_file.write_text(
-                    "\n".join(l for l in content.splitlines() if "__test_marker__" not in l) + "\n"
-                )
-
 
 # ---------------------------------------------------------------------------
 # Per-call focus parameter and set_focus persist flag
@@ -773,80 +552,231 @@ class TestPerCallFocus:
         assert "frontend" in text2 and "backend" in text2
 
 
-class TestSetFocusPersist:
-    async def test_persist_false_no_file_written(self, workspace):
-        async with Client(_make_transport(workspace)) as client:
-            r = await _mimir_call(client, "set_focus", "src:2.0 persist=false")
-        text = _text(r)
-        assert "EXCEPTION" not in text
-        assert "session" in text.lower(), f"Expected 'session' in response: {text!r}"
-        assert not (workspace / ".mimir-focus").exists(), (
-            ".mimir-focus must not be written when persist=False"
-        )
+# ---------------------------------------------------------------------------
+# set_focus persist flag: no MCP wire path anymore (CLI-only via
+# mimir_dispatch) — see TestCliSubprocess.
+# ---------------------------------------------------------------------------
 
-    async def test_persist_true_file_written(self, workspace):
-        async with Client(_make_transport(workspace)) as client:
-            r = await _mimir_call(client, "set_focus", "src:2.0 persist=true")
-        text = _text(r)
-        assert "EXCEPTION" not in text
-        assert (workspace / ".mimir-focus").exists(), (
-            ".mimir-focus must be written when persist=True"
-        )
-
+# ---------------------------------------------------------------------------
+# set_scope: the ACTION (set_scope() itself — validation, "Scope set"/
+# "cleared" messages, .mimir-scope persistence) is CLI-only now, covered in
+# TestCliSubprocess. Its EFFECT (does an active scope actually filter
+# locate()/inspect()'s results) is still wire-testable: .mimir-scope is read
+# at module import, same as .mimir-focus/.mimirnotes, so pre-writing it
+# before the server starts reproduces "scope already set" without needing
+# set_scope to be a wire call.
+# ---------------------------------------------------------------------------
 
 class TestSetScope:
-    async def test_set_scope_hard_filters_scope_task(self, dual_workspace):
+    async def test_set_scope_hard_filters_locate(self, dual_workspace):
+        (dual_workspace / ".mimir-scope").write_text("backend\n")
         async with Client(_make_transport(dual_workspace)) as client:
-            set_r = await _mimir_call(client, "set_scope", "backend")
-            task_r = await _mimir_call(client, "scope_task", "authenticate user")
-        set_text = _text(set_r)
+            task_r = await client.call_tool("locate", {"task": "authenticate user"})
         task_text = _text(task_r)
-        assert "EXCEPTION" not in set_text
-        assert "Scope set" in set_text and "backend" in set_text
         assert "frontend" not in task_text, f"frontend leaked into scoped results:\n{task_text}"
         assert "backend" in task_text
 
-    async def test_set_scope_hard_filters_verify_symbol_existence(self, dual_workspace):
+    async def test_set_scope_hard_filters_locate_symbol_mode(self, dual_workspace):
+        (dual_workspace / ".mimir-scope").write_text("backend\n")
         async with Client(_make_transport(dual_workspace)) as client:
-            await _mimir_call(client, "set_scope", "backend")
-            in_scope = await _mimir_call(client, "verify_symbol_existence", "BackendAuthService")
-            out_of_scope = await _mimir_call(client, "verify_symbol_existence", "FrontendAuthService")
+            in_scope = await client.call_tool("locate", {"task": "BackendAuthService", "mode": "symbol"})
+            out_of_scope = await client.call_tool("locate", {"task": "FrontendAuthService", "mode": "symbol"})
         assert "FOUND" in _text(in_scope) and "NOT FOUND" not in _text(in_scope)
         assert "NOT FOUND" in _text(out_of_scope), (
             f"Expected out-of-scope symbol to be filtered out:\n{_text(out_of_scope)}"
         )
 
-    async def test_set_scope_hard_filters_find_callers(self, dual_workspace):
+    async def test_set_scope_hard_filters_inspect_callers(self, dual_workspace):
+        (dual_workspace / ".mimir-scope").write_text("backend\n")
         async with Client(_make_transport(dual_workspace)) as client:
-            await _mimir_call(client, "set_scope", "backend")
             r = await client.call_tool("inspect", {"symbol": "authenticate_user", "view": "callers"})
         text = _text(r)
         assert "frontend" not in text, f"frontend leaked into scoped find_callers:\n{text}"
 
-    async def test_set_scope_empty_clears_and_restores_full_repo(self, dual_workspace):
-        async with Client(_make_transport(dual_workspace)) as client:
-            await _mimir_call(client, "set_scope", "backend")
-            reset_r = await _mimir_call(client, "set_scope", "")
-            after_r = await _mimir_call(client, "verify_symbol_existence", "FrontendAuthService")
-        assert "cleared" in _text(reset_r).lower()
-        assert "FOUND" in _text(after_r) and "NOT FOUND" not in _text(after_r)
 
-    async def test_set_scope_empty_with_nothing_set_is_a_noop(self, dual_workspace):
-        async with Client(_make_transport(dual_workspace)) as client:
-            r = await _mimir_call(client, "set_scope", "")
-        assert "No active scope" in _text(r)
+# ---------------------------------------------------------------------------
+# CLI subprocess tests: mimir_dispatch's commands (status, arch, changed,
+# set_focus, set_scope, alias, note, ignore) have no MCP wire path as of
+# 2026-07-09 — the CLI (`mimir <command> "<args>"`) is their real, only
+# integration point now, not a fallback covering for a wire test. These spawn
+# a real `mimir.py` subprocess per test/call, same as the MCP wire tests
+# above do, just through argv instead of JSON-RPC.
+# ---------------------------------------------------------------------------
 
-    async def test_set_scope_rejects_nonexistent_path(self, dual_workspace):
-        async with Client(_make_transport(dual_workspace)) as client:
-            r = await _mimir_call(client, "set_scope", "does/not/exist")
-        text = _text(r)
-        assert "Error" in text
-        assert not (dual_workspace / ".mimir-scope").exists()
+class TestCliSubprocess:
+    def test_status_shows_workspace_and_file_count(self, workspace):
+        out, code = _run_cli(workspace, "status")
+        assert code == 0
+        assert str(workspace) in out
+        assert "source_files" in out
+        assert "3" in out  # workspace fixture has 3 .py files
+        assert "symbol_index" in out
 
-    async def test_set_scope_persists_to_file(self, dual_workspace):
-        async with Client(_make_transport(dual_workspace)) as client:
-            await _mimir_call(client, "set_scope", "backend")
-        scope_file = dual_workspace / ".mimir-scope"
+    def test_status_shows_mimirignore_hint_when_no_file(self, workspace):
+        out, _code = _run_cli(workspace, "status")
+        assert ".mimirignore" in out
+
+    def test_status_shows_active_patterns_when_file_exists(self, workspace):
+        (workspace / ".mimirignore").write_text("**/vendor/**\n**/obj/**\n")
+        out, _code = _run_cli(workspace, "status")
+        assert "**/vendor/**" in out or "2 active" in out
+
+    def test_arch_shows_directories_and_top_level_symbols(self, workspace):
+        out, code = _run_cli(workspace, "arch")
+        assert code == 0
+        assert "src" in out
+        assert "UserService" in out  # service.py's top-level class
+        assert len(out) > 50
+
+    def test_arch_rebuilds_when_cache_invalidated(self, workspace):
+        """After add_ignore's side effect clears _ARCHITECTURE_MAP/_FILE_LIST,
+        the next `arch` call must rediscover files added since the first."""
+        _run_cli(workspace, "arch")  # prime the cache
+        (workspace / "src" / "brandnew.py").write_text("class BrandNewService:\n    pass\n")
+        _run_cli(workspace, "ignore", "__test_marker__")
+        out, code = _run_cli(workspace, "arch")
+        assert code == 0
+        assert "BrandNewService" in out
+
+    def test_changed_returns_changed_file_blueprint(self, git_workspace):
+        out, code = _run_cli(git_workspace, "changed", "main")
+        assert code == 0
+        assert "models.py" in out
+
+    def test_changed_shows_diff_summary(self, git_workspace):
+        out, _code = _run_cli(git_workspace, "changed", "main")
+        assert "+" in out
+        assert "models.py" in out
+
+    def test_changed_non_git_workspace_handled(self, workspace):
+        out, code = _run_cli(workspace, "changed")
+        assert code == 0
+        assert "EXCEPTION" not in out
+
+    def test_changed_bad_base_branch_handled(self, git_workspace):
+        out, code = _run_cli(git_workspace, "changed", "nonexistent-branch-xyz")
+        assert code == 0
+        assert "EXCEPTION" not in out
+
+    def test_alias_saves_and_writes_file(self, workspace):
+        out, code = _run_cli(workspace, "alias", "live tutor, LiveTutor")
+        assert code == 0
+        assert "live tutor" in out.lower()
+        assert "LiveTutor" in out
+        alias_file = workspace / ".mimiraliases"
+        assert alias_file.exists()
+        assert "LiveTutor" in alias_file.read_text()
+
+    def test_alias_duplicate_returns_already_recorded(self, workspace):
+        _run_cli(workspace, "alias", "foo feature, FooService")
+        out, _code = _run_cli(workspace, "alias", "foo feature, FooService")
+        assert "already" in out.lower() or "FooService" in out
+
+    def test_alias_empty_domain_term_rejected(self, workspace):
+        out, _code = _run_cli(workspace, "alias", ", Foo")
+        assert "Error" in out
+
+    def test_note_saves_and_writes_file(self, workspace):
+        out, code = _run_cli(workspace, "note", "src/service.py, watch for the auth quirk here")
+        assert code == 0
+        assert "src/service.py" in out
+        notes_file = workspace / ".mimirnotes"
+        assert notes_file.exists()
+        assert "watch for the auth quirk here" in notes_file.read_text()
+
+    def test_note_duplicate_returns_already_recorded(self, workspace):
+        _run_cli(workspace, "note", "src/models.py, dup note")
+        out, _code = _run_cli(workspace, "note", "src/models.py, dup note")
+        assert "already" in out.lower()
+
+    def test_note_empty_prefix_rejected(self, workspace):
+        out, _code = _run_cli(workspace, "note", ", x")
+        assert "Error" in out
+
+    def test_note_prefix_with_equals_rejected(self, workspace):
+        out, _code = _run_cli(workspace, "note", "Config=Prod, x")
+        assert "Error" in out
+
+    def test_note_multiline_flattened(self, workspace):
+        _run_cli(workspace, "note", "src/models.py, line one\nline two\nline three")
+        raw = (workspace / ".mimirnotes").read_text()
+        assert "line one line two line three" in raw
+        assert "line one\nline two" not in raw
+
+    def test_ignore_adds_pattern_and_writes_file(self, workspace):
+        out, code = _run_cli(workspace, "ignore", "**/vendor/**, third-party libs")
+        assert code == 0
+        assert "**/vendor/**" in out
+        ignore_file = workspace / ".mimirignore"
+        assert ignore_file.exists()
+        assert "**/vendor/**" in ignore_file.read_text()
+
+    def test_ignore_duplicate_pattern_rejected(self, workspace):
+        _run_cli(workspace, "ignore", "**/dist/**")
+        out, _code = _run_cli(workspace, "ignore", "**/dist/**")
+        assert "already" in out.lower()
+
+    def test_ignore_empty_pattern_rejected(self, workspace):
+        out, _code = _run_cli(workspace, "ignore", "")
+        assert "Error" in out
+
+    def test_ignore_path_traversal_rejected(self, workspace):
+        out, _code = _run_cli(workspace, "ignore", "../../etc/**")
+        assert "Error" in out
+
+    def test_set_focus_persist_false_no_file_written(self, workspace):
+        out, code = _run_cli(workspace, "set_focus", "src:2.0 persist=false")
+        assert code == 0
+        assert "session" in out.lower(), f"Expected 'session' in response: {out!r}"
+        assert not (workspace / ".mimir-focus").exists()
+
+    def test_set_focus_persist_true_file_written(self, workspace):
+        out, code = _run_cli(workspace, "set_focus", "src:2.0 persist=true")
+        assert code == 0
+        assert (workspace / ".mimir-focus").exists()
+
+    def test_set_scope_persists_to_file(self, workspace):
+        _run_cli(workspace, "scope", "--set", "src")
+        scope_file = workspace / ".mimir-scope"
         assert scope_file.exists()
-        assert scope_file.read_text().strip() == "backend"
+        assert scope_file.read_text().strip() == "src"
+
+    def test_set_scope_rejects_nonexistent_path(self, workspace):
+        # `scope --set` prints set_scope()'s own error string but doesn't
+        # sys.exit(1) on it — pre-existing behavior, unrelated to the CLI
+        # fallback this class otherwise covers.
+        out, _code = _run_cli(workspace, "scope", "--set", "does/not/exist")
+        assert "Error" in out
+        assert not (workspace / ".mimir-scope").exists()
+
+    def test_set_scope_reset_clears(self, workspace):
+        _run_cli(workspace, "scope", "--set", "src")
+        out, code = _run_cli(workspace, "scope", "--reset")
+        assert code == 0
+        assert "cleared" in out.lower()
+        assert not (workspace / ".mimir-scope").exists()
+
+    def test_set_scope_reset_with_nothing_set_is_a_noop(self, workspace):
+        out, code = _run_cli(workspace, "scope", "--reset")
+        assert code == 0
+        assert "No active scope" in out
+
+    def test_generic_fallback_set_scope_command_name_also_works(self, workspace):
+        """mimir_dispatch's "set_scope" command name (not just the CLI's own
+        `scope --set` idiom) is reachable through the same generic fallback."""
+        out, code = _run_cli(workspace, "set_scope", "src")
+        assert code == 0
+        assert "Scope set" in out
+        assert (workspace / ".mimir-scope").read_text().strip() == "src"
+
+    def test_help_command_shows_specific_docstring(self, workspace):
+        out, code = _run_cli(workspace, "help", "record_alias")
+        assert code == 0
+        assert "domain_term" in out
+
+    def test_unknown_command_self_teaches_and_exits_nonzero(self, workspace):
+        out, code = _run_cli(workspace, "totally_bogus_command")
+        assert code == 1
+        assert "Unknown command" in out
+        assert "status" in out  # points at the real command list
 

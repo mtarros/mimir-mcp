@@ -1,12 +1,22 @@
 # Mimir v2: 18 tools → 3, compact `locate` discovery, zero-round-trip session overview
 
-Implementation plan, written 2026-07-09. **Status: implemented and verified** — all 5 commits landed, 375/375 tests passing.
+Implementation plan, written 2026-07-09. **Status: implemented and verified** — all 5 commits landed, 375/375 tests passing. **Superseded by a same-day follow-up (v3)** — see bottom of this doc — that pulled `mimir_dispatch` from MCP registration entirely, landing on 2 registered tools instead of 3.
 
 ## Results (measured, not estimated)
 
-- **Wire size**: 18-tool schema was 15,112 chars (~3,778 tok) transmitted every turn. 3-tool schema (`locate`/`inspect`/`mimir`): **3,764 chars (~941 tok) — a 75% cut.** Guarded going forward by `TestToolRegistration::test_wire_budget_under_4000_chars`.
+- **Wire size**: 18-tool schema was 15,112 chars (~3,778 tok) transmitted every turn. 3-tool schema (`locate`/`inspect`/`mimir`): **3,764 chars (~941 tok) — a 75% cut.** Guarded going forward by `TestToolRegistration::test_wire_budget_under_4000_chars`. (Superseded — see v3 below: 2,622 chars.)
 - **Carps re-run** (exact "Keypad font-icon rendering" task from the 2026-07-08 A/B session): 12,210 chars (v1, all 3 prior fixes applied) → **9,168 chars (v2, locate+inspect) — mimir now beats the native grep+Read baseline (11,556 chars) by 1.26x**, not just closes the gap. `locate()` alone replaced `scope_task`'s 4,793-char call with a 1,751-char one for the identical ranked result.
 - **Topcat cross-check** (different repo, different task — "retry delay workflow configuration when device does not respond"): `scope_task` 4,051 chars vs `locate` 1,185 chars for **identical ranking** (same top-6 files, same scores, same order) — 3.42x smaller, confirming the win isn't Carps-specific and ranking quality is unchanged, only the presentation format shrank.
+
+## Follow-up: v3 — `mimir_dispatch` pulled from MCP registration (same day, 2026-07-09)
+
+User asked directly: is there any way to cut mimir's token cost further without changing how effective it is? Reasoning: the `mimir` dispatcher tool's commands (`status`, `arch`, `changed`, `alias`, `note`, `ignore`, `audit`, `set_focus`, `set_scope`, plus every pre-v2 tool name) are occasional/session-level actions, not called on every task the way `locate`/`inspect` are — so the "will the AI still use it reliably" risk of moving them off the wire schema is much lower than doing the same to `locate`/`inspect`, which need tool-presence to compete with the model's default instinct to reach for grep/Read.
+
+Change: `mimir_dispatch` (the `mimir` tool) is no longer registered via `mcp.tool()` — only `locate`/`inspect` are (`_MCP_TOOLS = [locate, inspect]`, mimir.py). It's reachable only via the CLI now: `mimir <command> "<args>"`, run through the shell/Bash tool. `_cli_run`'s final `else` branch routes any subcommand not already handled by a dedicated one (`hint`/`locate`/`scope`/`area`/`find`/`callers`/`status`/`audit`/`sync`) to `mimir_dispatch`, and `_main()`'s CLI gate was widened so any subcommand reaches `_cli_run` — previously only a fixed allowlist did, which also meant `locate` itself had been wired into `_cli_run` but never added to that allowlist, making `mimir locate "<task>"` dead code until this fix caught it.
+
+`_MIMIR_SECTION_MARKER` bumped to `(v3)` so `mimir-setup` re-run upgrades a stale generated CLAUDE.md/copilot-instructions.md (via the existing `_upsert_mimir_section` splice-replace) to the new syntax — dispatcher commands are now written as shell commands (`` `mimir alias "domain term, CodeName"` ``) instead of tool calls (`mimir("alias", ...)`), since there's no tool to call anymore; `locate(...)`/`inspect(...)` keep function-call syntax since those are still real tools.
+
+**Result**: wire size 3,764 → **2,622 chars (~655 tokens) — a further 30% cut, 82.6% total from the original 15,112.** Guarded by `TestToolRegistration::test_wire_budget_under_3000_chars`. 43 wire tests in `test_smoke.py` that called the now-unregistered `mimir` tool were either converted to their `locate`/`inspect` equivalent (where one exists — e.g. `verify_symbol_existence` → `locate(mode="symbol")`), rewritten to pre-write the relevant dotfile (`.mimir-scope`/`.mimirnotes`, both read at module import) so the *effect* stays wire-testable without the *action* being wire-callable, or moved to a new `TestCliSubprocess` class that spawns real `mimir.py <args>` subprocesses — the actual current integration path for that surface, not a workaround. No A/B re-test was run for this follow-up (unlike v2, which was gated on real Carps/Topcat measurements before being treated as done) — the underlying ranking/formatting is untouched, only *how* the occasional-action commands are invoked changed, so the risk profile didn't call for the same level of empirical verification.
 
 ## Context
 
