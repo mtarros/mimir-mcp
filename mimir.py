@@ -5916,6 +5916,18 @@ def _cli_run(subcommand: str, arg: str) -> None:
 # pre-v2 tool name, so instructions generated before this change keep working.
 # =============================================================================
 
+# Substrings (not whole-word — "crash"/"crashes"/"crashed" all match) that
+# signal a task description is reporting a bug/symptom rather than
+# describing a feature to build — see the caller-trace suggestion in
+# _render_locate below for why this matters.
+_BUG_REPORT_SIGNALS = (
+    "blank", "broken", "not working", "doesn't work", "does not work",
+    "incorrect", "wrong", "fail", "crash", "stuck", "freeze", "frozen",
+    "bug", "unresponsive", "not operational", "malfunction", "regression",
+    "glitch", "broke",
+)
+
+
 def _path_area(rel: str) -> str:
     """Top-2-directory-segment grouping key for a relative path, e.g.
     "src/carps-mobile/InControl.Carps.Mobile/UI/X.cs" -> "src/carps-mobile".
@@ -6028,6 +6040,25 @@ def _render_locate(task: str, max_files: int, focus: str) -> Optional[str]:
 
     if suggestions:
         parts.append("Next: " + "; ".join(suggestions[:3]))
+
+    # Bug-report language ("blank screen", "not working", ...) is a strong
+    # signal that the real question is "what put this in a broken state",
+    # which a lexical search over the SYMPTOM can't answer as directly as
+    # tracing who calls into the top result — verified on a real ticket
+    # ("Barcode Override Workflow is Incorrect") where two separate locate()
+    # broadening attempts (guessing more search terms) failed to find the
+    # actual entry point, and the fix turned out to be one inspect(...,
+    # view="callers") call away from the first result. Baked into locate()'s
+    # own output rather than left as CLAUDE.md guidance, since a suggestion
+    # the agent has to remember to follow is exactly the reliability gap
+    # this project keeps finding — see _MIMIR_SECTION_MARKER's history.
+    if top_files and any(sig in task.lower() for sig in _BUG_REPORT_SIGNALS):
+        top_stem = os.path.splitext(os.path.basename(top_files[0]))[0]
+        parts.append(
+            f'Bug investigation: also try inspect(symbol="{top_stem}", view="callers") '
+            f"to find what navigates/calls into the top result — often more direct "
+            f"than broadening the search."
+        )
 
     # One compact line of files that import the top results — same signal as
     # scope_task's "Files that import these results" section, without the

@@ -1098,6 +1098,21 @@ class TestLocate(_V2WorkspaceMixin):
         out = mimir.locate("UserService", max_files=5)
         assert "matched only" not in out
 
+    def test_bug_report_language_suggests_caller_trace(self):
+        """Real case: a genuine bug ticket needed inspect(view="callers") to
+        find the actual entry point (what navigates INTO the broken screen)
+        after two lexical-broadening locate() attempts failed to find it —
+        baked directly into locate()'s own output, not left as prompt-only
+        guidance, since that's the failure mode this keeps catching."""
+        out = mimir.locate("UserService login screen is blank and not working")
+        assert 'view="callers"' in out
+        assert "Bug investigation:" in out
+
+    def test_normal_task_does_not_suggest_caller_trace(self):
+        out = mimir.locate("UserService authenticate")
+        assert "Bug investigation:" not in out
+        assert 'view="callers"' not in out
+
 
 class TestInspect(_V2WorkspaceMixin):
     def test_default_view_returns_file_structure(self):
