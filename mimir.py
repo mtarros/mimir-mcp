@@ -371,7 +371,7 @@ _SYMBOL_STOPWORDS = frozenset({
 
 # Increment when the blueprint text format changes so cached blueprints are
 # automatically invalidated and re-parsed on the next server start.
-BLUEPRINT_VERSION = "8"  # bump when index schema or tokenisation changes
+BLUEPRINT_VERSION = "9"  # bump when index schema or tokenisation changes
 
 # Splits PascalCase / camelCase into components: 'StartAutoRefresh' → ['Start','Auto','Refresh']
 _CAMEL_SPLIT_RE = re.compile(r'[A-Z][a-z0-9]*|[a-z][a-z0-9]*')
@@ -461,6 +461,25 @@ def _init_disk_cache() -> "Optional[object]":
             )
         except Exception:
             pass  # FTS5 unavailable in this SQLite build; semantic_search degrades gracefully
+        # FTS5 virtual table for commit-message search — one row per (file,
+        # commit) touched in recent git history. A ticket described in the
+        # developer's own words ("fix race condition on retry") often echoes
+        # a past commit MESSAGE more literally than the code itself does;
+        # _git_recency_scores() already ranks by recency but discards
+        # message content entirely (--format=). Independent of
+        # BLUEPRINT_VERSION like reverse_imports below — content comes from
+        # git log, not blueprint parsing, so it is NOT wiped by the
+        # version_changed block.
+        try:
+            db.execute(
+                "CREATE VIRTUAL TABLE IF NOT EXISTS chrono_fts USING fts5("
+                "  file UNINDEXED,"
+                "  commit_message,"
+                "  tokenize='unicode61'"
+                ")"
+            )
+        except Exception:
+            pass  # FTS5 unavailable in this SQLite build; chrono search degrades gracefully
         # Reverse-import edges (src file -> resolved workspace target it imports).
         # Independent of blueprint_version — built from raw source text, not
         # blueprints — so it isn't touched by the version_changed invalidation
@@ -1550,6 +1569,7 @@ def _warm_cache() -> None:
     _build_architecture_map()
     _WARMUP_COMPLETE = True
     _git_recency_scores()      # pre-warm git cache so first scope_task call isn't slow
+    _maybe_build_chrono_fts()  # pre-warm commit-message index — same rationale
     _write_overview()
 
 
@@ -1689,6 +1709,78 @@ _LOG_METHOD_NAMES = frozenset({
 _LIT_MIN_LEN = 10        # message must be at least this long...
 _LIT_MAX_LEN = 120       # ...and is truncated to this
 _LIT_MAX_PER_FILE = 40   # bound blueprint growth on log-heavy files
+
+
+# ---------------------------------------------------------------------------
+# Behavioral tag extraction
+#
+# Blueprints strip bodies, which hides *what a file actually does at runtime*
+# behind a generic-looking signature (`func sync()` says nothing about
+# whether it hits the network, the keychain, or a background dispatch
+# queue). A curated set of framework/infra identifiers, matched against every
+# identifier-kind leaf node the walk() pass in _extract_tree_sitter already
+# visits, surfaces that as a cheap per-file "#tags" section — same trick
+# _literal_row/"#strings" already uses: piggyback on the existing single-pass
+# walk, flow through the SAME regex tokenizers in _index_blueprint_rows/
+# _fts_rows_for_blueprint, zero schema changes. Deliberately a closed,
+# curated set (not "every identifier") — an unbounded set would just
+# duplicate what symbols/symbol_fts already index from signatures.
+# ---------------------------------------------------------------------------
+_BEHAVIORAL_ANCHORS: frozenset[str] = frozenset(t.lower() for t in (
+    # --- HTTP / networking ---
+    "urlsession", "nsurlsession", "urlrequest", "httpclient",
+    "httprequestmessage", "httpresponsemessage", "restclient",
+    "okhttpclient", "okhttp", "retrofit", "httpurlconnection",
+    "axios", "fetch", "xmlhttprequest", "requests", "httpx", "aiohttp",
+    "urllib", "reqwest", "hyper", "httparty", "faraday", "libcurl",
+    "grpc", "grpcclient", "websocket", "socketio",
+    # --- Local persistence / DB / ORM ---
+    "coredata", "nsmanagedobject", "nspersistentcontainer", "nsfetchrequest",
+    "realm", "sqlite3", "room", "roomdatabase", "entityframework",
+    "dbcontext", "efcore", "hibernate", "entitymanager", "sequelize",
+    "typeorm", "prisma", "mongoose", "sqlalchemy", "activerecord",
+    "diesel", "gorm", "userdefaults", "nsuserdefaults", "sharedpreferences",
+    "indexeddb", "localstorage",
+    # --- Security / keychain / crypto ---
+    "keychain", "secitemadd", "secitemcopymatching", "secitemupdate",
+    "secitemdelete", "keychainwrapper", "keystore", "androidkeystore",
+    "cryptokit", "cryptojs", "bcrypt", "jsonwebtoken", "jwt",
+    "securestring", "securestorage", "cipher", "messagedigest", "hmac",
+    # --- Concurrency / background execution ---
+    "dispatchqueue", "dispatchgroup", "dispatchsemaphore", "operationqueue",
+    "nsoperationqueue", "threadpoolexecutor", "executorservice",
+    "completablefuture", "coroutinescope", "dispatchers",
+    "cancellationtoken", "semaphoreslim", "threadpool", "taskfactory",
+    "waitgroup", "mutex", "tokio", "asyncio", "eventmachine",
+    "backgroundworker", "ihostedservice",
+    # --- Push / scheduling / background jobs ---
+    "unusernotificationcenter", "backgroundtasks", "workmanager",
+    "jobscheduler", "firebasemessaging", "celery", "sidekiq", "resque",
+    "quartz", "hangfire",
+    # --- Dependency injection ---
+    "dagger", "hilt", "koin", "autofac", "ninject", "springboot",
+    "autowired", "servicecollection",
+    # --- Serialization ---
+    "jsonserializer", "newtonsoft", "systemtextjson", "gson", "jackson",
+    "moshi", "codable", "jsondecoder", "jsonencoder", "protobuf", "serde",
+    # --- Game / physics engines ---
+    "skphysicsbody", "skspritenode", "sknode", "rigidbody", "rigidbody2d",
+    "monobehaviour", "gameobject", "box2d", "chipmunk",
+))
+# Coarse per-file signal, not exhaustive symbol indexing — bound growth the
+# same way _LIT_MAX_PER_FILE bounds #strings.
+_TAG_MAX_PER_FILE = 24
+
+
+def _is_tag_leaf_kind(kind: str) -> bool:
+    """Leaf node kinds worth checking against _BEHAVIORAL_ANCHORS. "identifier"
+    is a substring match (covers identifier / type_identifier /
+    field_identifier / property_identifier / simple_identifier /
+    shorthand_property_identifier across every grammar mimir supports);
+    "constant" is added explicitly for Ruby, whose capitalized module/class
+    references (ActiveRecord, Sidekiq) are a distinct leaf kind there, not
+    "identifier"."""
+    return "identifier" in kind or kind == "constant"
 
 
 def _lit_first_string(node) -> object | None:
@@ -1904,6 +1996,7 @@ def _extract_tree_sitter(path: Path, src: bytes, ts_lang: str) -> Optional[str]:
     lit_kinds = _LIT_NODE_KINDS.get(ts_lang)
     lit_lines: list[str] = []
     seen_lit_line_nos: set[int] = set()
+    tag_hits: dict[str, int] = {}   # anchor text -> first line number seen
 
     # Signatures that are just bare keywords have no name to reference — skip them
     _anon = re.compile(r'^(?:async\s+)?(?:function|class|interface|enum)\s*[<({]?$')
@@ -1932,6 +2025,19 @@ def _extract_tree_sitter(path: Path, src: bytes, ts_lang: str) -> Optional[str]:
                     # Indented so _toplevel_names_from_blueprint never treats a
                     # literal as a top-level symbol in get_architecture output.
                     lit_lines.append(f"L{line_no:<5}  {row}")
+        elif (node.child_count() == 0
+              and len(tag_hits) < _TAG_MAX_PER_FILE
+              and _is_tag_leaf_kind(node.kind())):
+            text = src[node.start_byte():node.end_byte()].decode("utf-8", "replace").lower()
+            if text in _BEHAVIORAL_ANCHORS and text not in tag_hits:
+                line_no = node.start_position().row + 1
+                # Skip a line already captured as a signature (e.g. a local
+                # `let x = URLSession.shared` that _is_def_node also treats
+                # as a def-node) — that line's own text already contains the
+                # anchor token, so a separate #tags row would just duplicate
+                # the same file:line in verify_symbol_existence results.
+                if line_no not in seen_line_nos:
+                    tag_hits[text] = line_no
         for i in range(node.child_count()):
             walk(node.child(i), child_depth)
 
@@ -1940,6 +2046,15 @@ def _extract_tree_sitter(path: Path, src: bytes, ts_lang: str) -> Optional[str]:
     body = "\n".join(lines)
     if lit_lines:
         body = (body + "\n" if body else "") + "#strings\n" + "\n".join(lit_lines)
+    if tag_hits:
+        # Same L<n>-prefixed, 2-space-indented format #strings uses — this is
+        # what lets tags flow through _index_blueprint_rows/
+        # _fts_rows_for_blueprint's existing L<n> line tokenizers with zero
+        # code changes there, and keeps _toplevel_names_from_blueprint from
+        # treating a tag as a top-level symbol in get_architecture output.
+        tag_lines = [f"L{lineno:<5}  {tag}"
+                     for tag, lineno in sorted(tag_hits.items(), key=lambda kv: kv[1])]
+        body = (body + "\n" if body else "") + "#tags\n" + "\n".join(tag_lines)
     return body
 
 
@@ -2249,6 +2364,107 @@ def _git_recency_scores() -> dict[str, int]:
     except Exception:
         _GIT_RECENCY_CACHE["ts"] = now  # avoid hammering on repeated failure
         return {}
+
+
+_CHRONO_LOOKBACK_DAYS = 180
+_CHRONO_MAX_COMMITS = 2000
+_CHRONO_TTL_SECONDS = 6 * 3600   # rebuild at most every 6 hours
+_CHRONO_MAX_ROWS = 40000         # bound DB growth on very active repos
+_CHRONO_MSG_MARKER = "\x1e"      # ASCII record separator; won't collide with real subject text
+
+
+def _maybe_build_chrono_fts(force: bool = False) -> None:
+    """Rebuild chrono_fts (commit-message full text) if stale or missing.
+
+    Mirrors _git_recency_scores()'s subprocess+timeout pattern, but persists
+    to the on-disk chrono_fts FTS5 table (like symbol_fts) instead of an
+    in-memory TTL cache: a 180-day git log is too expensive to redo on every
+    60s recency-cache expiry. Freshness is tracked via the meta table
+    ('chrono_fts_built_ts') — the common case (still fresh) costs one
+    indexed SELECT, so this is safe to call on every scope_task/locate.
+    """
+    if _DISK_CACHE is None:
+        return
+    now = time.time()
+    if not force:
+        try:
+            row = _DISK_CACHE.execute(
+                "SELECT value FROM meta WHERE key='chrono_fts_built_ts'"
+            ).fetchone()
+            if row and now - float(row[0]) < _CHRONO_TTL_SECONDS:
+                return
+        except Exception:
+            pass
+    try:
+        out = subprocess.check_output(
+            ["git", "log", f"--since={_CHRONO_LOOKBACK_DAYS}.days.ago",
+             "-n", str(_CHRONO_MAX_COMMITS), "--name-only",
+             f"--pretty=format:{_CHRONO_MSG_MARKER}%s"],
+            cwd=str(WORKSPACE_ROOT), text=True, timeout=15,
+            stdin=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        )
+    except Exception:
+        # Non-git dir / git missing / timeout — record the attempt so we
+        # back off for one TTL window instead of retrying every call.
+        try:
+            _DISK_CACHE.execute(
+                "INSERT OR REPLACE INTO meta VALUES ('chrono_fts_built_ts', ?)", (str(now),)
+            )
+            _DISK_CACHE.commit()
+        except Exception:
+            pass
+        return
+
+    rows: list[tuple[str, str]] = []
+    for chunk in out.split(_CHRONO_MSG_MARKER)[1:]:
+        chunk_lines = chunk.splitlines()
+        if not chunk_lines:
+            continue
+        message = chunk_lines[0].strip()
+        if not message:
+            continue
+        for fpath in chunk_lines[1:]:
+            fpath = fpath.strip()
+            if fpath:
+                rows.append((fpath, message))
+        if len(rows) >= _CHRONO_MAX_ROWS:
+            break
+
+    try:
+        _DISK_CACHE.execute("DELETE FROM chrono_fts")
+        if rows:
+            _DISK_CACHE.executemany(
+                "INSERT INTO chrono_fts(file, commit_message) VALUES (?,?)", rows[:_CHRONO_MAX_ROWS]
+            )
+        _DISK_CACHE.execute(
+            "INSERT OR REPLACE INTO meta VALUES ('chrono_fts_built_ts', ?)", (str(now),)
+        )
+        _DISK_CACHE.commit()
+    except Exception:
+        pass  # chrono_fts table not present (FTS5 unavailable) — degrade silently
+
+
+def _chrono_fts_scores(terms: list[str], limit: int = 20) -> dict[str, float]:
+    """BM25 lookup against chrono_fts. Best (most negative) score kept per
+    file, mirroring _fts_search's per-file max-score grouping."""
+    if not terms or _DISK_CACHE is None:
+        return {}
+    safe_terms = [t for t in terms if re.match(r'^\w+$', t)]
+    if not safe_terms:
+        return {}
+    fts_query = ' OR '.join(f'"{t}"' for t in safe_terms)
+    sql = ("SELECT file, bm25(chrono_fts) AS score FROM chrono_fts"
+           " WHERE chrono_fts MATCH ? ORDER BY score LIMIT ?")
+    try:
+        rows = _DISK_CACHE.execute(sql, (fts_query, limit)).fetchall()
+    except Exception:
+        return {}
+    out: dict[str, float] = {}
+    for file, score in rows:
+        abs_score = abs(score)
+        if abs_score > out.get(file, 0.0):
+            out[file] = abs_score
+    return out
 
 
 def _extract_scope_keywords(task: str) -> list[str]:
@@ -3635,6 +3851,31 @@ def _score_task_files(task: str, focus: str = "") -> tuple[dict[str, float], lis
         for rel, rscore in recency.items():
             if rel in file_hit_count:
                 file_hit_count[rel] += min(rscore * 0.5, file_hit_count[rel])
+    except Exception:
+        pass
+
+    # Commit-message boost: files whose recent commit messages mention the
+    # same words as the task, when they're already keyword-matched — catches
+    # tickets that quote a fix's plain-English description ("fix race
+    # condition on retry") more literally than the code itself does. Reuses
+    # valid_kws (already computed above) rather than a separate keyword-
+    # extraction pass. Bounded identically to the recency boost immediately
+    # above (same rank -> score -> min(*, own_score) shape): can at most
+    # double an already-matched file's score, and NEVER adds a file with
+    # zero code-match score. Deliberately conservative — unlike recency
+    # (pure "touched lately," no semantic content), a commit-message hit
+    # DOES carry real semantic content and a case could be made for letting
+    # a strong match alone surface a new file, but that's a strictly
+    # riskier default that needs its own separate before/after measurement.
+    try:
+        _maybe_build_chrono_fts()
+        chrono_hits = _chrono_fts_scores(valid_kws)
+        if chrono_hits:
+            chrono_ranked = sorted(chrono_hits, key=lambda f: -chrono_hits[f])[:20]
+            for i, rel in enumerate(chrono_ranked):
+                if rel in file_hit_count:
+                    cscore = 20 - i   # 20 (best match) down to 1
+                    file_hit_count[rel] += min(cscore * 0.5, file_hit_count[rel])
     except Exception:
         pass
 
