@@ -122,50 +122,46 @@ These are the same tools Claude uses — you can explore a codebase, verify a sy
 The section looks like this (you can edit it to suit your project):
 
 ```markdown
-## Code exploration — use mimir tools
+## Code exploration — use mimir tools (v2)
 
 This project has mimir MCP tools available. Use them before reading raw files.
 
+@.mimir-overview.md
+
 At the start of any coding session:
-1. Call `get_status` to check the index is ready and see active exclusions.
-2. If the user names or clearly implies a specific sub-project/app/API area (e.g.
-   "the mobile app", "the API"), call `set_focus("matching-prefix:3")` immediately —
-   or pass `focus="prefix:3"` directly on individual `scope_task`/`semantic_search`
-   calls. In a multi-sub-project repo, unscoped ranking silently
-   defaults to whichever sub-project has the most indexed symbols; it will NOT
-   reliably surface the right area on its own.
-3. Call `get_architecture()` for a high-level map of the whole codebase (cheap) —
-   once per session if you don't already have this context warm; skip it for a
-   narrow follow-up task later in the same session.
-4. Call `get_changed_files()` to see what is currently in flight vs main — same,
-   once per session, not per task.
-5. Call `scope_task("describe what you want to do")` to find relevant files.
+1. If the user names or clearly implies a specific sub-project/app/API area (e.g.
+   "the mobile app", "the API"), call `mimir("set_focus", "matching-prefix:3")`
+   immediately, or pass focus="prefix:3" directly on individual locate() calls. In a
+   multi-sub-project repo, unscoped ranking silently defaults to whichever sub-project
+   has the most indexed symbols; it will NOT reliably surface the right area on its own.
+2. Call locate("describe what you want to do") to find relevant files/symbols.
 
 For any task involving existing code:
-- Use `scope_hint("rough terms")` BEFORE `scope_task` when you have vague keywords
-  and are unsure of the exact symbol names. It returns what the codebase calls things
-  so the follow-up `scope_task` query is precise. Costs very few tokens.
-- Use `scope_task` with specific class/method names once you know them — it finds
-  the right files in one call.
-- Use `semantic_search("what the code does")` when `scope_task` returns poor results
-  because you know the concept but not the code name. It decomposes identifiers and
-  uses BM25 ranking to find files by meaning rather than exact token match.
-- Use `get_symbol(path, name)` to read ONE function or class body instead of the
-  whole file.
-- Use `get_file_structure` to see a file's full symbol map before reading it line
-  by line.
-- Skip `verify_symbol_existence` if the symbol already showed up in `scope_task`'s
-  "Matched symbols" with a file:line — that's already confirmation. Use it only for
-  a symbol `scope_task` didn't surface, before assuming it exists.
-- Use `find_callers` after `verify_symbol_existence` to trace impact.
-- Use `get_dependents(path)` to find what else imports a file before changing it.
-- Use `get_imports` when an unfamiliar symbol appears and you need to trace its
-  origin.
-- Call `record_alias(domain_term, code_name)` when you discover a feature name maps
-  to a different code name — future scope_task searches will expand it automatically.
-- Call `add_ignore(pattern, reason)` when you encounter vendor/generated/test files
-  that add noise — always tell the user what you are adding and why first.
+- Call locate() before opening files or grepping — one call ranks files AND surfaces
+  the specific symbol names in them.
+- Call inspect(path, symbol="Name1,Name2") to read just the symbols you need — batch
+  multiple names in one call rather than one inspect() call per name.
+- Omit `symbol` on inspect() to get a file's (or directory's) full structural map first.
+- Use inspect(path, view="imports") to trace an unfamiliar symbol's origin.
+- Use inspect(path, view="dependents") before changing a shared file to see blast radius.
+- Use inspect(symbol=Name, view="callers") after locate(mode="symbol") to trace impact.
+- Call mimir("alias", "domain term, CodeName") when a feature name maps to a different
+  code name — future locate() searches expand it automatically.
+- Call mimir("ignore", "pattern, reason") when you encounter vendor/generated/test
+  files that add noise — always tell the user what you are adding and why first.
+
+In a monorepo, if locate() results span unrelated sub-projects, call locate(mode="area")
+to see where matches cluster, then mimir("set_scope", dir) to hard-narrow (excludes
+other sub-projects entirely) or mimir("set_focus", "prefix:weight") to soft-bias (they
+still appear, just lower-scored). Both clear with an empty-string call.
+
+mimir("help") lists every other command (status, arch, changed, note, audit, and every
+pre-v2 tool name for compatibility with instructions generated before this redesign).
 ```
+
+(`@.mimir-overview.md` is Claude Code's file-import syntax — it pulls mimir's generated architecture snapshot into context automatically, no tool call needed. Only added for project-scoped setup, since the file is workspace-specific.)
+
+> **Upgrading from a pre-2026-07-09 install?** Re-run `mimir-setup` — it now replaces a stale `## Code exploration` section (any version) instead of skipping it when one is already present, so your CLAUDE.md picks up the new tool names automatically. Nothing breaks in the meantime either way: every old tool name (`scope_task`, `get_symbol`, etc.) still works, just as a `mimir("scope_task", ...)` command instead of a directly-registered tool — see [Tools and when to use them](#tools-and-when-to-use-them) below.
 
 ---
 
@@ -218,32 +214,41 @@ Manage it interactively instead with `/mcp add` inside a `copilot` session, or c
 `mimir-setup copilot-cli` creates `.github/copilot-instructions.md` in the current project (or `mimir-setup copilot-cli --global` for `$HOME/.copilot/copilot-instructions.md`, applied to every project), both of which Copilot CLI reads automatically. If you prefer to create either manually:
 
 ```markdown
-## Code exploration — use mimir tools
+## Code exploration — use mimir tools (v2)
 
 This project has mimir MCP tools. Always use them before using built-in search or reading files.
 
 Workflow for any coding session:
-1. Call `get_status` to confirm the index is ready.
-2. If the user names or clearly implies a specific sub-project/app/API area (e.g.
-   "the mobile app", "the API"), call `set_focus("matching-prefix:3")` immediately —
-   or pass `focus="prefix:3"` directly on individual `scope_task`/`semantic_search`
-   calls. In a multi-sub-project repo, unscoped ranking silently
-   defaults to whichever sub-project has the most indexed symbols; it will NOT
-   reliably surface the right area on its own.
-3. Call `get_architecture()` for a high-level map of the whole codebase (one cheap
-   call) — once per session if you don't already have this context warm; skip it
-   for a narrow follow-up task later in the same session.
-4. Call `get_changed_files()` to see what is currently in flight vs main — same,
-   once per session, not per task.
-5. For vague queries, call `scope_hint("rough terms")` first to find the right symbol
-   names, then call `scope_task` with those names.
-6. Call `get_symbol(path, name)` to read ONE function or class body.
-7. Use `get_dependents(path)` before changing a shared file to see blast radius.
-8. When you discover a domain/feature term maps to a code name, call `record_alias`.
-9. When you encounter vendor/generated/noisy files, tell the user what you found,
-   ask for confirmation, then call `add_ignore(pattern, reason)` to exclude them.
+1. If the user names or clearly implies a specific sub-project/app/API area (e.g.
+   "the mobile app", "the API"), call mimir("set_focus", "matching-prefix:3")
+   immediately, or pass focus="prefix:3" directly on individual locate() calls. In a
+   multi-sub-project repo, unscoped ranking silently defaults to whichever sub-project
+   has the most indexed symbols; it will NOT reliably surface the right area on its own.
+2. Call locate() with a description of the task — use its ranked file list and inline
+   symbol names, do NOT fall back to glob or grep.
+   - Tip: use technical/class names when known (e.g. 'RectificationFilter') rather
+     than feature names (e.g. 'corrective actions filter').
+3. Call inspect(path, symbol="Name1,Name2") to read just the symbols you need in one
+   call — much cheaper than reading the whole file, and cheaper than one inspect()
+   call per symbol.
+4. Use inspect(path, view="dependents") before changing a shared file to see blast
+   radius.
+5. When you discover a domain/feature term maps to a code name, call
+   mimir("alias", "domain term, CodeName") to save it — future locate() searches
+   expand it automatically.
+6. When you encounter vendor/generated/noisy files, tell the user what you found, ask
+   for confirmation, then call mimir("ignore", "pattern, reason") to exclude them.
 
 Do not use built-in file search, glob, or grep if mimir tools are available.
+
+In a monorepo, if locate() results span unrelated sub-projects, call
+locate(task, mode="area") to see where matches cluster, then mimir("set_scope", dir)
+to hard-narrow (excludes other sub-projects entirely) or
+mimir("set_focus", "prefix:weight") to soft-bias (they still appear, just
+lower-scored). Both clear with an empty-string call.
+
+mimir("help") lists every other command, plus every pre-v2 tool name for
+compatibility with instructions generated before this redesign.
 ```
 
 Without this file, Copilot may fall back to its own glob/grep search when mimir output is large.
@@ -284,7 +289,16 @@ All tools work on Windows.
 
 ## Tools and when to use them
 
+**As of 2026-07-09, only 3 tools are registered with your AI client: `locate`, `inspect`, and `mimir`** — a redesign that cut the per-turn tool-schema overhead from ~15,100 to ~3,800 characters. Every tool below this line is still a real, fully working Python function (nothing was removed), but the AI reaches it two ways instead of calling it by name directly:
+
+- `locate()` and `inspect()` are themselves the new tools — see [locate](#5-scope_task--find-the-right-files) and [inspect](#7-get_symbol--read-just-the-code-you-need) below for what each one replaces.
+- Everything else (`get_status`, `set_focus`, `record_alias`, `add_ignore`, `scope_hint`, `verify_symbol_existence`, `find_callers`, `get_dependents`, `get_imports`, `get_architecture`, `get_changed_files`, `semantic_search`, `record_note`, and the original `scope_task`/`get_symbol`/`get_file_structure` forms) is reached as a **command name** through the `mimir` tool: `mimir("get_status")`, `mimir("record_alias", "domain term, CodeName")`, etc. Each subsection below is marked with a `→` line showing the exact call. Call `mimir("help")` for the full command list, or `mimir("help", "<command>")` for one command's original argument docs.
+
+The explanations and examples below still describe exactly how each underlying function behaves — only the call syntax changed.
+
 ### 0. `get_status` — check the index before you start
+
+→ `mimir("status")`
 
 Call this at the start of a session to see how much of the workspace is indexed, whether the symbol index is ready, and what focus and exclusion settings are active.
 
@@ -321,6 +335,8 @@ If `symbol_index: building`, the other tools still work but `scope_task` and `ve
 ---
 
 ### 1. `set_focus` — bias searches toward the project you're working in
+
+→ `mimir("set_focus", "entries persist=true|false")`
 
 In a repo with multiple sibling projects (common in mobile mono-repos, microservices, etc.), generic keyword searches can surface files from projects you're not touching. `set_focus` tells mimir to multiply scores for files matching a path prefix, so the right project rises to the top.
 
@@ -364,6 +380,9 @@ semantic_search("authentication flow", focus="src/auth:2.0")
 
 ### 2. `get_architecture` — orient yourself in one call
 
+→ `mimir("arch")` — or, cheaper still, zero calls: the generated CLAUDE.md
+`@`-imports `.mimir-overview.md`, which already contains this map.
+
 Returns a high-level map of the entire workspace: directories grouped by file count, with top-level symbol names per file. Much cheaper than calling `get_file_structure` on every file to understand the project layout.
 
 **Example output:**
@@ -388,6 +407,8 @@ Large repos (60+ directories) show the most file-dense modules first with a note
 
 ### 3. `get_changed_files` — see what's in flight
 
+→ `mimir("changed", "main")` (base branch defaults to "main" if omitted)
+
 Returns structural blueprints of every source file changed vs a git base branch — covering committed branch changes, uncommitted edits, and untracked new files.
 
 **Example:**
@@ -400,6 +421,8 @@ WHEN TO USE: at the start of a session to orient yourself on what is actively be
 ---
 
 ### 4. `scope_hint` — cheap first pass when you have rough keywords
+
+→ `mimir("scope_hint", "rough terms")`
 
 Call this **before** `scope_task` when you have vague descriptions and are unsure of the exact symbol or class names used in the codebase. It performs a quick symbol lookup across all terms, returns what it found per term, and suggests a refined `scope_task` query using the actual names it discovered.
 
@@ -431,6 +454,12 @@ The suggested query uses the actual symbol names found — copy it directly into
 ---
 
 ### 5. `scope_task` — find the right files
+
+→ Superseded by the `locate` tool: `locate("describe what you want to do")`.
+`locate` returns a more compact format (matched symbol names inline, not a
+separate section) and falls through to a semantic search automatically on
+zero hits. The exact original `scope_task` format below is still reachable
+via `mimir("scope_task", "task max_files=5")` if you want it specifically.
 
 Call this on any task involving existing code. Give it a plain-English description — or ideally specific class/method names once you know them from `scope_hint`. It extracts keywords, searches the workspace (symbol index + path matching + import graph + git recency), and returns a ranked list of the most relevant files with matched symbol locations and suggested `get_symbol` calls.
 
@@ -465,6 +494,10 @@ Returns: keywords searched, matched symbols with file:line locations, ranked fil
 
 ### 6. `semantic_search` — find code by what it does, not what it's called
 
+→ `locate()` now falls through to this automatically when its exact-symbol
+search finds nothing — a manual call is rarely needed. To force it directly:
+`mimir("semantic_search", "what the code does max_results=10")`.
+
 Use this when `scope_task` returns poor results because you know the **concept** but not the **code name**. Good cases:
 - "authentication token refresh" when the method is called `renewCredentials`
 - "connection pool exhaustion" when the class is `DBSessionLimiter`
@@ -487,6 +520,8 @@ Returns ranked files with matched symbol signatures showing why each file was ra
 
 ### 7. `get_symbol` — read just the code you need
 
+→ Superseded by the `inspect` tool: `inspect(path, symbol="Name1,Name2")`.
+
 Returns the complete source of one or more named functions/classes/methods — bodies included. The efficient middle ground between `get_file_structure` (signatures only) and reading the whole raw file.
 
 **Example:**
@@ -504,6 +539,9 @@ If a symbol isn't found, it's listed under "Not found" and the response still in
 
 ### 8. `get_file_structure` — understand a file or browse a module
 
+→ Superseded by the `inspect` tool: `inspect(path)` (omit `symbol` for the
+structural map, works on a file or a whole directory).
+
 Pass a file for a compact map of it: every class, function, method, and their signatures — with line numbers, bodies stripped. Pass a directory instead and it returns the same blueprint for every source file under it (capped at `max_files`, default 10) — use this when you know *where* to look but not *which* file.
 
 **Examples:**
@@ -515,6 +553,8 @@ Use this when you want the full symbol map of a file before deciding which symbo
 ---
 
 ### 9. `get_imports` — trace where symbols come from
+
+→ `inspect(path, view="imports")`
 
 Lists every import in a file. Resolves relative paths and the `@/` alias (Next.js) to actual workspace files. Distinguishes workspace files from external packages.
 
@@ -540,6 +580,8 @@ Works for: TypeScript, JavaScript, Python, Kotlin, Swift, C#, Go, Rust.
 
 ### 10. `verify_symbol_existence` — confirm a symbol is real
 
+→ `locate(symbol_name, mode="symbol")`, or `mimir("verify_symbol_existence", "SymbolName")`
+
 Searches the entire workspace for a symbol definition and returns its exact location and signature.
 
 **Example:**
@@ -550,6 +592,8 @@ Use this before assuming a function or type exists, before importing it, or when
 ---
 
 ### 11. `find_callers` — trace who calls a symbol
+
+→ `inspect(symbol="SymbolName", view="callers")`
 
 Searches raw source text across the entire workspace for every call site and usage of a symbol. Unlike `verify_symbol_existence` (which only finds definitions), this finds where a symbol is called, passed, or referenced in implementation code.
 
@@ -564,6 +608,8 @@ WHEN TO USE: after `verify_symbol_existence` tells you where something is define
 
 ### 12. `get_dependents` — blast-radius analysis
 
+→ `inspect(path, view="dependents")`
+
 Returns every workspace file that directly imports a given file. Built from the reverse import index constructed at startup — no extra configuration needed.
 
 **Example:**
@@ -576,6 +622,8 @@ WHEN TO USE: before modifying a widely-used utility, service, or model — get t
 ---
 
 ### 13. `record_alias` — teach mimir your project's vocabulary
+
+→ `mimir("alias", "domain term, CodeName")`
 
 Records a mapping from a domain/feature name to the code name used in the codebase. Once saved, `scope_task` automatically expands matching phrases before searching.
 
@@ -606,6 +654,8 @@ push notifications = PushNotificationService, PushManager
 
 ### 13b. `record_note` — attach context to a path
 
+→ `mimir("note", "path/prefix, note text")`
+
 Records a free-text note tied to a path prefix. **Different from `record_alias`**: aliases expand search vocabulary (silently fed into `scope_task`'s keyword matching); notes attach context — shown as prose next to matching files, never used for ranking or search.
 
 **Example:**
@@ -631,6 +681,8 @@ Features/Playback = check MainActivity.java/AppDelegate.swift for the real logic
 ---
 
 ### 14. `add_ignore` — exclude noisy files on the fly
+
+→ `mimir("ignore", "pattern, reason")`
 
 Adds a gitignore-style pattern to `.mimirignore` and takes effect immediately — no restart needed. The AI uses this when it encounters vendor libraries, generated code, test fixtures, or build artefacts that pollute blueprints and `get_architecture` output.
 
