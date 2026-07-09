@@ -1027,13 +1027,31 @@ def _iter_source_files() -> list[Path]:
     return result
 
 
-# Languages where _resolve_import reliably returns 'workspace' hits.
-# C# uses namespace matching (unreliable), Swift always returns 'external'.
-# Including them just wastes a full file read per file with no payoff.
+# Languages where _resolve_import can produce a workspace hit. Swift always
+# returns 'external' (no reverse-import resolution) — including it just
+# wastes a full file read per file with no payoff.
+#
+# .cs added 2026-07-10 after a real Carps-git/top-cat A/B: C#'s namespace
+# resolution (_CS_NS_INDEX, in _resolve_import) is imprecise — most real
+# namespaces have many files sharing them (70% of Carps' 1063 namespaces do,
+# the worst has 211), so a `using X;` resolves to whichever file's namespace
+# string happens to be closest in length, not necessarily the one actually
+# used. Despite that imprecision, real measurement showed it's still a real
+# net win, not noise: 3/60 real Carps tickets improved (0 regressed) via the
+# existing forward/reverse-import score-boost in _score_task_files, once
+# C# files can enter that graph at all (previously zero C# files ever could).
+# top-cat showed no measurable effect either way (0 improved, 0 regressed) —
+# a real win on one repo, harmless on the other, not a universal win. A
+# precise, type-usage-aware resolver was investigated as a follow-up (cross-
+# referencing blueprint/body identifiers against a namespace+type index) but
+# hit a real coverage gap of its own — much real type usage lives inside
+# method bodies, invisible to blueprint text — and was judged a bigger lift
+# than this pass; see docs/plan-behavioral-tags-chrono-fts.md.
 _REVERSE_IMPORT_EXTS = frozenset({
     '.ts', '.tsx', '.js', '.jsx', '.mjs',
     '.py', '.pyi',
     '.java', '.kt', '.kts',
+    '.cs',
 })
 # Imports always live at the top of the file. Reading beyond the first 8KB
 # (≈ 200 lines) is wasted I/O — no language puts import blocks mid-file.
@@ -1044,8 +1062,9 @@ def _build_reverse_imports() -> None:
     """Build _REVERSE_IMPORTS: for each workspace file, which other files import it.
 
     Only covers languages where _resolve_import can produce 'workspace' hits
-    (TypeScript/JS, Python, Java/Kotlin). C# and Swift are skipped — their
-    namespace/module resolution doesn't produce reliable file-level reverse links.
+    (TypeScript/JS, Python, Java/Kotlin, C# — see _REVERSE_IMPORT_EXTS for the
+    C# precision caveat). Swift is skipped — its module resolution doesn't
+    produce reliable file-level reverse links at all, not even an imprecise one.
     Reads only the first 8KB per file since imports are always at the top.
     """
     global _REVERSE_IMPORTS, _REVERSE_IMPORTS_FWD

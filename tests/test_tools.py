@@ -707,6 +707,61 @@ class TestJavaReverseImports:
         )
 
 
+class TestCSharpReverseImports:
+    """Added 2026-07-10 after a real Carps-git/top-cat A/B (docs/plan-
+    behavioral-tags-chrono-fts.md): .cs joined _REVERSE_IMPORT_EXTS, so C#
+    files can now enter _REVERSE_IMPORTS at all (previously zero could,
+    regardless of import content). _CS_NS_INDEX's namespace resolution is
+    imprecise on namespaces shared by multiple files, but a `using` for a
+    namespace declared by exactly ONE file (as here) resolves deterministically."""
+
+    @pytest.fixture(autouse=True)
+    def setup(self, tmp_path, monkeypatch):
+        # Namespaces deliberately NOT prefix-related to each other (e.g. not
+        # "Example" + "Example.Dialog") -- _resolve_import's C# branch
+        # matches on ns.startswith(specifier + '.') as well as exact
+        # equality, so a consumer whose OWN namespace happens to prefix the
+        # imported one can self-match and win the closest-length tiebreak.
+        # That's a real, already-documented imprecision of this resolver
+        # (see _REVERSE_IMPORT_EXTS's comment) -- this fixture avoids it to
+        # reliably test the clean, unambiguous case.
+        src = tmp_path / "src"
+        src.mkdir()
+        (src / "DialogBuilder.cs").write_text(
+            "namespace Widgets.Dialogs;\npublic class DialogBuilder {}\n"
+        )
+        (src / "BaseActivity.cs").write_text(
+            "using Widgets.Dialogs;\nnamespace Activities;\npublic class BaseActivity {}\n"
+        )
+        monkeypatch.setattr(mimir, "WORKSPACE_ROOT", tmp_path)
+        monkeypatch.setattr(mimir, "_MIMIRIGNORE_PATTERNS", [])
+        monkeypatch.setattr(mimir, "_FILE_LIST", [])
+        monkeypatch.setattr(mimir, "_FILE_LIST_TS", 0.0)
+        monkeypatch.setattr(mimir, "_CACHE", mimir._CACHE.__class__())
+
+        for f in (src / "DialogBuilder.cs", src / "BaseActivity.cs"):
+            mimir._cache_put(f, mimir._build_blueprint(f))
+        mimir._build_cs_ns_index()
+        mimir._build_reverse_imports()
+
+    def test_cs_extension_is_in_reverse_import_exts(self):
+        assert ".cs" in mimir._REVERSE_IMPORT_EXTS
+
+    def test_base_activity_depends_on_dialog_builder(self):
+        rel_dialog = next(
+            (r for r in mimir._REVERSE_IMPORTS if "DialogBuilder.cs" in r), None
+        )
+        assert rel_dialog is not None, (
+            f"DialogBuilder.cs not found as a key in _REVERSE_IMPORTS.\n"
+            f"Keys: {list(mimir._REVERSE_IMPORTS.keys())}"
+        )
+        dependents = mimir._REVERSE_IMPORTS[rel_dialog]
+        assert any("BaseActivity.cs" in d for d in dependents), (
+            f"BaseActivity.cs not found in dependents of DialogBuilder.cs.\n"
+            f"Dependents: {dependents}"
+        )
+
+
 # ---------------------------------------------------------------------------
 # set_focus wildcard (*) suppression
 # ---------------------------------------------------------------------------
