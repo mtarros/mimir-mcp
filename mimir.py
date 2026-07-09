@@ -2508,6 +2508,40 @@ def _chrono_fts_scores(terms: list[str], limit: int = 20) -> dict[str, float]:
     return out
 
 
+# Concept synonym groups for _score_task_files (Phase 2 of the 2026-07-09
+# search-quality work — see docs/plan-behavioral-tags-chrono-fts.md).
+# Deliberately small, generic-English, verb-level groups — not the 8-term
+# lists an early proposal used, since a bigger group is more noise-prone
+# and IDF alone won't catch a synonym that happens to be locally common in
+# a given codebase. Distinct from record_alias/.mimiraliases: aliases are
+# user-taught, project-specific jargon->codename mappings; this is a
+# built-in, generic mapping with no persistence, complementary rather than
+# overlapping. Every group member routes to the SAME scoring_key at
+# accumulation time (see _score_task_files) so the group shares one
+# _KW_CAP budget instead of each synonym getting an independent one.
+_CONCEPT_SYNONYMS: dict[str, list[str]] = {
+    "save":     ["save", "persist", "store", "write"],
+    "load":     ["load", "fetch", "retrieve"],
+    "delete":   ["delete", "remove", "clear", "erase"],
+    "create":   ["create", "add", "insert"],
+    "cancel":   ["cancel", "abort", "terminate"],
+    "notify":   ["notify", "alert", "inform"],
+    # "update"/"modify"/"change"/"edit" and "validate"/"verify"/"check" were
+    # both dropped after a real Carps A/B (60 real tickets): these are common
+    # enough English words to appear incidentally in doc/config-file prose
+    # (README.md, .github/*.md, CI scripts) independent of true relevance,
+    # and both caused real regressions there while the remaining groups —
+    # more distinctive verbs, less likely to appear coincidentally — did
+    # not. See docs/plan-behavioral-tags-chrono-fts.md for the numbers.
+}
+_CONCEPT_LOOKUP: dict[str, str] = {
+    syn.lower(): concept_id
+    for concept_id, syns in _CONCEPT_SYNONYMS.items()
+    for syn in syns
+}
+_CONCEPT_MAX_ADDED = 8   # bound how many synonym terms one task can pull in
+
+
 def _extract_scope_keywords(task: str) -> list[str]:
     """Pull candidate symbol names out of a plain-English task description."""
     seen: set[str] = set()
@@ -2557,6 +2591,20 @@ def _extract_scope_keywords(task: str) -> list[str]:
         w = m.group()
         wl = w.lower()
         if wl not in seen and wl not in _SCOPE_STOPWORDS:
+            seen.add(wl)
+            out.append(w)
+
+    # Short concept-synonym trigger words ("save", "load", "add", "get")
+    # would otherwise never reach _score_task_files's synonym expansion at
+    # all — they're common short verbs that fall under the 5-char plain-word
+    # threshold above. This is a narrow, curated allowlist (only the ~30
+    # terms in _CONCEPT_SYNONYMS), not a general relaxation of the length
+    # rule, so it doesn't reopen the short-noisy-word problem that rule
+    # exists to prevent.
+    for m in re.finditer(r'\b[a-zA-Z]{2,4}\b', task):
+        w = m.group()
+        wl = w.lower()
+        if wl not in seen and wl in _CONCEPT_LOOKUP:
             seen.add(wl)
             out.append(w)
 
@@ -3650,6 +3698,37 @@ def _score_task_files(task: str, focus: str = "") -> tuple[dict[str, float], lis
 
     valid_kws = [kw for kw in keywords if re.match(r"^\w[\w]*$", kw)]
 
+    # Concept synonym expansion (Phase 2, added 2026-07-09): a ticket saying
+    # "save the record" should also search "persist"/"store"/"write" — the
+    # code may spell the concept differently than the ticket does. A naive
+    # first version of this (each synonym added as an independent keyword)
+    # had a real scoring flaw: _KW_CAP/IDF below are applied per-keyword-
+    # string, so a file weakly matching several synonyms could out-score a
+    # file precisely matching the literal term once, by stacking N
+    # independent caps instead of sharing one. Fixed here by having every
+    # synonym in a matched group route to the SAME `scoring_key` (the
+    # concept's canonical name) in the accumulation loop below, so the
+    # whole group shares one _KW_CAP budget — exactly like one keyword
+    # would get, never more. `_concept_best_idf` tracks the single BEST
+    # (highest) IDF among synonyms that actually hit in a given file, used
+    # in place of a per-keyword IDF at the final scoring step, so a file
+    # matching the rarer synonym isn't diluted by also weakly matching a
+    # more common one.
+    _scoring_key_for: dict[str, str] = {}
+    _concept_added: list[str] = []
+    _concept_seen_lc = {kw.lower() for kw in valid_kws}
+    for kw in list(valid_kws):
+        concept_id = _CONCEPT_LOOKUP.get(kw.lower())
+        if not concept_id:
+            continue
+        _scoring_key_for[kw] = concept_id
+        for syn in _CONCEPT_SYNONYMS[concept_id]:
+            if syn.lower() not in _concept_seen_lc:
+                _concept_seen_lc.add(syn.lower())
+                _concept_added.append(syn)
+                _scoring_key_for[syn] = concept_id
+    valid_kws = valid_kws + _concept_added[:_CONCEPT_MAX_ADDED]
+
     # Compound bigrams: tickets name domain concepts in prose ("Unavailable
     # Types are set against a category...") that the code spells as ONE
     # compound identifier (UnavailableType / UnavailableTypeCategory). For
@@ -3712,32 +3791,54 @@ def _score_task_files(task: str, focus: str = "") -> tuple[dict[str, float], lis
     #   3 files gets a boost. This is what stops generic business vocabulary
     #   ("Types", "All", "Operative") from burying the specific file.
     _KW_CAP = 9.0
-    _file_kw_scores: dict[str, dict[str, float]] = {}   # {rel: {kw: capped_score}}
+    _file_kw_scores: dict[str, dict[str, float]] = {}   # {rel: {scoring_key: capped_score}}
     _file_kw_primary: dict[str, set[str]] = {}           # distinct primary kws per file
+    # {rel: {concept_id: best (highest) IDF among synonyms that hit in this
+    # file}} — a concept group shares one _KW_CAP budget (via scoring_key
+    # below) but should be weighted by whichever matched synonym is rarest
+    # in this file, not diluted by also weakly matching a common one.
+    _file_concept_best_idf: dict[str, dict[str, float]] = {}
+
+    idf_w = {kw: _idf_weight_in_scope(kw) for kw in valid_kws + _sub_kws}
 
     for kw in valid_kws + _sub_kws:
         sub_weight_factor = 0.3 if kw in _sub_kw_set else 1.0
         is_primary = kw not in _sub_kw_set
         cap = _KW_CAP * sub_weight_factor
+        scoring_key = _scoring_key_for.get(kw, kw)
         for rel, line, sig in multi_hits.get(kw, []):
             all_hits.append((kw, rel, line, sig))
             weight = (3 if _DEF_LINE_PAT.search(sig) else 1) * sub_weight_factor
             kw_scores = _file_kw_scores.setdefault(rel, {})
-            prev = kw_scores.get(kw, 0.0)
+            prev = kw_scores.get(scoring_key, 0.0)
             if prev < cap:
-                kw_scores[kw] = prev + min(weight, cap - prev)
+                kw_scores[scoring_key] = prev + min(weight, cap - prev)
+            if kw in _scoring_key_for:
+                best = _file_concept_best_idf.setdefault(rel, {})
+                if idf_w[kw] > best.get(scoring_key, 0.0):
+                    best[scoring_key] = idf_w[kw]
             if is_primary:
-                _file_kw_primary.setdefault(rel, set()).add(kw)
+                # Track by scoring_key, not raw kw: a file matching both
+                # "save" and its synonym "persist" (one user concept, two
+                # spellings) must count as ONE distinct primary keyword for
+                # the diversity multiplier below, not two — otherwise the
+                # 1.5x-per-extra-keyword multiplier rewards a file for
+                # matching one concept twice, undoing the whole point of
+                # sharing one scoring budget above.
+                _file_kw_primary.setdefault(rel, set()).add(scoring_key)
 
     # Apply IDF post-cap (equivalent to scaling both weight and cap): a
     # ubiquitous keyword can now contribute at most 9 × 0.05, a rare
     # identifier up to 9 × 2.0. Sub-tokens keep their 0.3 factor and get
     # their own (usually low) IDF on top — the correct double discount.
+    # A concept-group scoring_key isn't a literal keyword (idf_w has no
+    # entry for it), so it uses the tracked best-synonym IDF instead.
     # Document-length normalization then divides down god-files (DbContext,
     # generated registries) that weakly match everything.
-    idf_w = {kw: _idf_weight_in_scope(kw) for kw in valid_kws + _sub_kws}
     for rel, kws in _file_kw_scores.items():
-        raw = sum(s * idf_w[kw] for kw, s in kws.items())
+        concept_idf = _file_concept_best_idf.get(rel, {})
+        raw = sum(s * (idf_w[kw] if kw in idf_w else concept_idf.get(kw, 1.0))
+                  for kw, s in kws.items())
         file_hit_count[rel] = raw * _doc_len_norm(rel)
     _used_fts = _SEMANTIC_READY  # path loop uses FTS5; byte-scan tiebreaker skipped
 
