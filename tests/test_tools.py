@@ -120,12 +120,7 @@ class TestExtractScopeKeywords:
         assert "this" not in kws
 
     def test_short_words_filtered(self):
-        # "add" is deliberately excluded from this query -- it's a curated
-        # concept-synonym trigger word (mimir._CONCEPT_LOOKUP, added
-        # 2026-07-09) and is intentionally extracted despite being short;
-        # see TestConceptLookupAndKeywordExtraction in
-        # tests/test_concept_synonyms.py for that behavior specifically.
-        kws = mimir._extract_scope_keywords("put it to the shelf and go")
+        kws = mimir._extract_scope_keywords("add it to get the job done")
         for kw in kws:
             assert len(kw) >= 4, f"Short word '{kw}' should be filtered"
 
