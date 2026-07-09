@@ -2407,8 +2407,15 @@ def _git_recency_scores() -> dict[str, int]:
         return {}
 
 
-_CHRONO_LOOKBACK_DAYS = 180
-_CHRONO_MAX_COMMITS = 2000
+_CHRONO_LOOKBACK_DAYS = 365   # was 180 -- widened after a real A/B on two
+_CHRONO_MAX_COMMITS = 3000    # independent repos (Carps-git, top-cat) showed
+                               # a real, clear win, not a wash: several real
+                               # tickets' fix commits were older than 180
+                               # days and invisible to chrono_fts entirely.
+                               # Carps: MRR 0.340->0.418 (+23%), hit@5
+                               # 0.45->0.57. top-cat: MRR 0.254->0.310
+                               # (+22%), hit@5 0.42->0.48. See
+                               # docs/plan-behavioral-tags-chrono-fts.md.
 _CHRONO_TTL_SECONDS = 6 * 3600   # rebuild at most every 6 hours
 _CHRONO_MAX_ROWS = 40000         # bound DB growth on very active repos
 _CHRONO_MSG_MARKER = "\x1e"      # ASCII record separator; won't collide with real subject text

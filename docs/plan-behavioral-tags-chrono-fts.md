@@ -1,6 +1,6 @@
-# Behavioral tags, git commit-message search, and config-file indexing
+# Behavioral tags, git commit-message search, config-file indexing, and a widened chrono window
 
-Implementation plan and results, written 2026-07-09. **Status: 3 features shipped and real-A/B-verified against two independent real repos** (Carps-git and top-cat). Two further ideas were built, measured, found not to clear the "verified win" bar, and reverted in full: concept synonym expansion (a wash — see "Investigated and reverted," below) and a config-file down-weight (net-negative — see the follow-up section). Two workflow recommendations (set_scope, a Carps alias) were validated with real evidence but require no code change.
+Implementation plan and results, written 2026-07-09. **Status: 4 features shipped and real-A/B-verified against two independent real repos** (Carps-git and top-cat) — `#tags`, `chrono_fts`, `EXT_LANG` file-type coverage, and a widened chrono_fts lookback window (365 vs 180 days). Two further ideas were built, measured, found not to clear the "verified win" bar, and reverted in full: concept synonym expansion (a wash — see "Investigated and reverted," below) and a config-file down-weight (net-negative — see the follow-up section). Two workflow recommendations (set_scope, a Carps alias) were validated with real evidence but require no code change.
 
 ## Context
 
@@ -102,6 +102,25 @@ After Features 1-3 shipped, the user asked for further recommendations and to "w
 
 **4. Cross-repo validation against a second real repo — strong, positive generalization confirmed.** User provided a second real Bitbucket clone, `/Users/mtarros/Projects/top-cat` (3,200 commits, `T5-XXXX` ticket convention, a C#/Java/Swift/Android+iOS+web stack — structurally different from Carps' C#/TypeScript stack). Built a 252-candidate ground-truth set the same way, sampled 60, and ran a clean isolated before/after (the 3 shipped features reverted vs current shipped state, same warmed cache, strictly read-only — no git writes, `_write_overview` suppressed). **This repo was never touched during any of the tuning above — a genuine out-of-sample test.** Result: **17 improved, 4 regressed, 39 unchanged. MRR 0.153→0.254 (+66% relative), hit@5 0.18→0.42 (2.3x), hit@10 0.23→0.45 (2x).** A larger improvement than measured on Carps itself, and strong evidence the 3 shipped features generalize rather than being overfit to Carps' specific ticket style or codebase shape. (Re-measured after the concept-synonym-expansion revert below — the numbers are identical to the first pass, confirming that feature had zero measurable effect here too, consistent with its "wash" result on Carps.) One task regressed from a found rank to a miss (`87124f34`) — investigated and attributed to ground-truth drift (the function `LogSystemMessage` has evidently moved files since that historical ticket was fixed; the CURRENT location ranks #1, a legitimate match, just not the one recorded in the old commit), not a real ranking regression.
 
+## Feature 5: widen the chrono_fts lookback window (180 → 365 days) — a genuine, cross-repo-verified win
+
+After the "ship only verified wins" correction, re-examined the remaining Carps misses for another real, testable idea rather than guessing. Several miss cases turned out to be fix commits *older than the 180-day `_CHRONO_LOOKBACK_DAYS` window* — e.g. commit `c56585ff` (2025-09-24) and `eaefbf8a` (2025-10-21) predate the ~2026-01 cutoff that a 180-day window implies, so their commit messages were never even indexed into `chrono_fts`, regardless of how well they'd have matched. The `_CHRONO_MAX_COMMITS=2000` cap was checked too — on Carps it reaches back to 2025-10-07, i.e. *further* than 180 days, confirming the 180-day window (not the commit cap) was the actual binding, overly-tight constraint.
+
+**Change**: `_CHRONO_LOOKBACK_DAYS` 180→365, `_CHRONO_MAX_COMMITS` 2000→3000 (checked against both repos' actual commit velocity in the wider window — Carps: 2,695 commits/365 days; top-cat: 1,471/365 days — so 3000 doesn't truncate either).
+
+**Results, isolated before/after, both repos, official re-run with the actual shipped constants** (not simulation):
+
+| Repo | Metric | 180-day window | 365-day window |
+|---|---|---|---|
+| Carps-git (60 tasks) | MRR | 0.340 | **0.418** (+23%) |
+| Carps-git | hit@5 | 0.45 | **0.57** |
+| Carps-git | hit@10 | 0.48 | **0.60** |
+| top-cat (60 tasks) | MRR | 0.254 | **0.310** (+22%) |
+| top-cat | hit@5 | 0.42 | **0.48** |
+| top-cat | hit@10 | 0.45 | **0.52** |
+
+Carps: 9 improved, 1 regressed (a mild reshuffle among several genuinely relevant SignalR test files — target dropped from rank 7 to 10, still shown, not a real loss). top-cat: 6 improved, 2 regressed. **A real, clear win on both independent repos** — this is the bar the "ship only verified wins" rule asks for, unlike the reverted synonym-expansion/config-discount attempts.
+
 ## Commit breakdown
 
 1. Feature 1: `_BEHAVIORAL_ANCHORS` + `walk()` branch + `BLUEPRINT_VERSION` bump + 15 unit tests
@@ -110,3 +129,4 @@ After Features 1-3 shipped, the user asked for further recommendations and to "w
 4. Real A/B / retrieval-quality verification for all three + this write-up
 5. Investigated and reverted: concept synonym expansion (`_CONCEPT_SYNONYMS` grouped scoring, 8 unit tests) — a wash on real A/B, fully reverted per the "ship only verified wins" rule this established
 6. Follow-up: config-file discount built, measured net-negative, reverted; `set_scope` and alias recommendations validated with real evidence; cross-repo validation against top-cat confirms Features 1-3 generalize
+7. Feature 5: widened `chrono_fts` lookback window — a real, clear, cross-repo-verified win found by re-examining misses after the ship-only-verified-wins correction
