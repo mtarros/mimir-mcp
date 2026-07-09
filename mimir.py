@@ -630,6 +630,23 @@ EXT_LANG = {
     ".m":    ("objc",       "cstyle"),
     ".vue":  ("vue",        "cstyle"),
     ".xml":  (None,         "xml"),   # custom extractor; not tree-sitter
+    ".xaml": (None,         "xml"),   # XAML is XML — reuse the XML extractor directly
+    # Non-code config/script/migration files. Real Carps A/B (60 real
+    # tickets) found 13/36 misses were files with an unrecognized extension
+    # -- entirely invisible to search, not just poorly ranked, since
+    # _iter_source_files() filters on EXT_LANG membership before any file
+    # is even read. These aren't "definitions" in a programming-language
+    # sense, so they get the lightweight "text" regex profile (below)
+    # rather than a per-type structural extractor: just make them
+    # findable by keyword/path, not fully structured.
+    ".sql":  (None,         "text"),
+    ".sh":   (None,         "text"),
+    ".yml":  (None,         "text"),
+    ".yaml": (None,         "text"),
+    ".json": (None,         "text"),
+    ".md":   (None,         "text"),
+    ".ocl":  (None,         "text"),
+    ".props":(None,         "text"),
 }
 
 # A node is a "definition" if its type ends with one of these suffixes. This
@@ -728,7 +745,19 @@ REGEX_PROFILES: dict[str, list[re.Pattern]] = {
     "generic": _rx(
         r"^\s*(def|func|fun|fn|function|class|struct|interface|enum|trait|impl|type|object|protocol)\b.*\w",
     ),
+    # Non-code config/script/migration files (.sql/.sh/.yml/.json/.md/.ocl/
+    # .props) have no "definitions" to match against — the goal is just
+    # keyword/path findability, not structure. Matches any substantial line
+    # (containing a real 3+ character word), which excludes blank lines and
+    # pure-punctuation lines (`}`, `---`, `{`) as noise but keeps everything
+    # else, letting the file's real content (table/column names, job/step
+    # names, script commands) flow into the existing line-tokenizing index
+    # exactly the way #tags/#strings already do — no new indexing code.
+    "text": _rx(
+        r"^\s*\S.*[a-zA-Z0-9]{3,}",
+    ),
 }
+_REGEX_PROFILE_MAX_LINES: dict[str, int] = {"text": 150}
 
 
 # --------------------------------------------------------------------------- #
@@ -2061,8 +2090,16 @@ def _extract_tree_sitter(path: Path, src: bytes, ts_lang: str) -> Optional[str]:
 def _extract_regex(text: str, profile_key: str) -> str:
     """Ultra-fast line tokenizer fallback. No parsing, just pattern matching."""
     patterns = REGEX_PROFILES.get(profile_key) or REGEX_PROFILES["generic"]
+    # "text" (non-code config/SQL/script files) matches almost any substantial
+    # line by design — unlike def/class patterns, which are naturally sparse,
+    # a large data-heavy SQL seed script or generated YAML/JSON can otherwise
+    # produce thousands of blueprint lines. Bounded the same way #strings/
+    # #tags cap their own growth (_LIT_MAX_PER_FILE/_TAG_MAX_PER_FILE).
+    max_lines = _REGEX_PROFILE_MAX_LINES.get(profile_key)
     lines: list[str] = []
     for i, line in enumerate(text.splitlines(), start=1):
+        if max_lines is not None and len(lines) >= max_lines:
+            break
         if len(line) > 400:  # skip absurdly long minified lines cheaply
             continue
         for pat in patterns:
@@ -2141,8 +2178,12 @@ def _build_blueprint(path: Path) -> str:
             _cache_put(path, blueprint)
             return blueprint
 
-    # XML files use a dedicated extractor (not tree-sitter/regex)
-    if suffix == '.xml':
+    # XML (and XML-based formats like XAML) use a dedicated extractor (not
+    # tree-sitter/regex) — dispatched on the EXT_LANG profile, not the
+    # literal suffix, so .xaml (mapped to the "xml" profile) actually
+    # reaches this branch instead of silently falling through to the
+    # generic regex path.
+    if profile == 'xml':
         text = raw.decode('utf-8', 'replace')
         body = _extract_xml_blueprint(path, text)
         line_count = raw.count(b'\n') + 1

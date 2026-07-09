@@ -62,6 +62,26 @@ One task jumped from "not in top 10" to rank 1 (`CancelAllJobsViewModel.cs`, "ce
 
 **Methodological note, for transparency**: the first A/B run's harness had a real bug — it restored the real (non-suppressed) `_maybe_build_chrono_fts` *before* running the "before" measurement loop, and since `_score_task_files` calls that function unconditionally, the very first "before" `locate()` call on a fresh cache silently triggered a real chrono_fts build mid-measurement, contaminating "before" with "after" behavior. Caught by comparing the harness's aggregate result against a separate, clean, direct inspection of `file_hit_count`/`_chrono_fts_scores()` (which is what actually surfaced the cap-too-tight explanation above) — the two didn't agree, which is what prompted re-checking the harness itself rather than trusting the first number. Fixed before the final, reported A/B run above.
 
+## Feature 3: Index config/script/migration files (`.sql`/`.sh`/`.yml`/`.yaml`/`.json`/`.md`/`.ocl`/`.props`/`.xaml`)
+
+**What it does**: `_iter_source_files()` filters files by `EXT_LANG` membership at the `os.walk()` level (mimir.py ~984) — a file with an unrecognized extension is never even read, let alone indexed. `EXT_LANG` only covered programming languages; real tickets frequently touch SQL migrations, shell/pipeline scripts, YAML/JSON config, and XAML UI files, none of which were previously visible to search *at all*, not just poorly ranked.
+
+**How found**: after shipping Features 1+2, built a much larger real ground-truth set (163 real, non-merge, ticket-linked, focused-diff commits mined from Carps-git; 60 sampled for measurement) — the earlier 7-task set was too small to reveal this. Of 36 misses in the 60-task sample, 13 (36%) had target files with an extension absent from `EXT_LANG` — confirmed directly (`suffix in mimir.EXT_LANG` → `False` for `.yml`/`.ocl`/`.sql`/etc. on real files that exist in the repo).
+
+**Implementation**: `.xaml` reuses the existing `_extract_xml_blueprint()` directly (XAML is XML — zero new extraction code). The rest get a new lightweight `"text"` regex profile (`REGEX_PROFILES["text"]`, mimir.py ~756) matching any line with a real 3+ character word — deliberately not a structural extractor (these formats have no "definitions" the way source code does), just enough to make table names, job/step names, and script commands keyword-searchable through the *existing* `L<n>`-line tokenizers, the same zero-new-plumbing pattern `#tags`/`#strings` already established. Bounded to 150 lines per file (`_REGEX_PROFILE_MAX_LINES["text"]`) after finding real Carps SQL/YAML files run 1,600–7,000 lines — unbounded, this would have produced thousands of blueprint/symbol rows per file.
+
+**Results (real Carps-git, 60-task sample, before/after)**:
+
+| Metric | Before | After |
+|---|---|---|
+| MRR | 0.241 | **0.340** |
+| Hit-rate@5 | 0.35 | **0.45** |
+| Hit-rate@10 | 0.40 | **0.48** |
+
+**Bug caught by the unit test suite before shipping**: `_build_blueprint`'s XML dispatch checked the literal suffix (`if suffix == '.xml':`) rather than the `EXT_LANG` profile value, so mapping `.xaml` to `(None, "xml")` didn't actually route it through `_extract_xml_blueprint()` — it silently fell through to the generic regex path instead (`[xaml · regex · N lines]` instead of `[xml · N lines]`). A dedicated test (`test_xaml_uses_xml_extractor_not_text_profile`) caught this immediately. Fixed by dispatching on `profile == 'xml'` instead of the hardcoded suffix. Aggregate numbers were unaffected by the bug (the `.xaml` files in this specific 60-task sample weren't the ones providing signal — their `.xaml.cs` code-behind siblings, already `.cs`-indexed, were), but the fix is real and matters for any future XAML-content query.
+
+Net misses: 36 → 31. Not purely additive: 7 of the 13 previously-invisible-extension misses became hits, but 2 previously-correct tasks regressed — direct inspection showed `bitbucket-pipelines.yml` and `Directory.Packages.props` (both now indexed, both large and generically-worded) weakly matching enough query terms to displace a genuinely relevant but lower-scoring `.cs` file out of the top 10 for 2 of the 60 tasks. Net effect is clearly positive (+7/-2 = +5, confirmed by the aggregate MRR/hit-rate jump), but this is a real, measured tradeoff, not a free lunch — large generic config files occasionally out-compete on weak coincidental term overlap. Not mitigated in this pass (e.g. a down-weight for known-generic root-level config files); flag as a candidate refinement if it recurs on a broader sample.
+
 ## Deferred: Virtual Token Expansion redesign (Phase 2)
 
 Not built in this pass — sequenced after Features 1+2 so its own A/B isn't confounded by simultaneous ranking changes. Corrected design direction: a small, conservative `_CONCEPT_SYNONYMS` map (generic English verb groups — save/persist/store, load/fetch/get, delete/remove/clear) where every synonym hit in a file counts toward **one shared cap** (the group scores as if it were a single keyword) and the group's IDF weight is the best among matched synonyms, not summed — fixing the cap-stacking flaw found in the original proposal.
