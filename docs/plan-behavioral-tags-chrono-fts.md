@@ -1,6 +1,6 @@
-# Behavioral tags, git commit-message search, config-file indexing, and a widened chrono window
+# Behavioral tags, git commit-message search, config-file indexing, chrono window widening, a warmup perf fix, and C# reverse-imports
 
-Implementation plan and results, written 2026-07-09. **Status: 4 features shipped and real-A/B-verified against two independent real repos** (Carps-git and top-cat) — `#tags`, `chrono_fts`, `EXT_LANG` file-type coverage, and a widened chrono_fts lookback window (365 vs 180 days). Two further ideas were built, measured, found not to clear the "verified win" bar, and reverted in full: concept synonym expansion (a wash — see "Investigated and reverted," below) and a config-file down-weight (net-negative — see the follow-up section). Two workflow recommendations (set_scope, a Carps alias) were validated with real evidence but require no code change.
+Implementation plan and results, written 2026-07-09 through 2026-07-10. **Status: 6 features shipped and real-A/B-verified against two independent real repos** (Carps-git and top-cat) — `#tags`, `chrono_fts`, `EXT_LANG` file-type coverage, a widened chrono_fts lookback window (365 vs 180 days), a Java/Kotlin warmup performance fix (halves full warmup time, pure perf/no ranking change), and C# reverse-import resolution (real win on Carps, harmless on top-cat). Two ranking ideas were built, measured, found not to clear the "verified win" bar, and reverted in full: concept synonym expansion and adjacent-short-word joining (both real washes at scale, not harmful, just not wins), plus a config-file down-weight (net-negative). Two workflow recommendations (set_scope, a Carps alias) were validated with real evidence but require no code change.
 
 ## Context
 
@@ -127,6 +127,34 @@ After the "ship only verified wins" correction, re-examined the remaining Carps 
 
 Carps: 9 improved, 1 regressed (a mild reshuffle among several genuinely relevant SignalR test files — target dropped from rank 7 to 10, still shown, not a real loss). top-cat: 6 improved, 2 regressed. **A real, clear win on both independent repos** — this is the bar the "ship only verified wins" rule asks for, unlike the reverted synonym-expansion/config-discount attempts.
 
+## Feature 6: fix a pre-existing performance bug — halves full warmup time on both repos
+
+Found as a side effect of investigating C# import resolution (below), not the original goal. Profiling `_build_reverse_imports()` on real Carps-git showed it spending ~30 of its ~31 seconds in a single hot spot: a full recursive `WORKSPACE_ROOT.rglob()` filesystem walk, once per *unresolved* Java/Kotlin import. The bug: `_resolve_import`'s Java/Kotlin branch fell through to this scan on any `_JAVA_CLASS_INDEX` miss — but `_JAVA_CLASS_INDEX` is already built from every workspace `.java`/`.kt`/`.kts` file using the exact same file-stem match the `rglob()` scan also uses, so a miss there is *guaranteed* to also miss via `rglob()`. This ran for every external import (`java.util.*`, `androidx.*`, `kotlinx.*`, etc. — the majority of imports in any real codebase), for zero payoff.
+
+Fixed by treating an index-ready miss as `'external'` directly, and only falling through to the `rglob()` scan in the genuine pre-index state (before `_build_java_class_index()` has run during warmup) — the one case it's actually needed for. Pure performance fix, confirmed behavior-preserving by an existing passing test that already exercised this exact case, plus two new tests pinning the fix (one proves `rglob()` is never called once the index is ready, one proves the pre-index fallback still works).
+
+**Results — full `warm_cache()`, both real repos, measured directly (not `_build_reverse_imports()` in isolation):**
+
+| Repo | Before | After |
+|---|---|---|
+| Carps-git | ~45-50s | **20.6s** |
+| top-cat | ~56-60s | **17.3s** |
+
+## Feature 7: enable C# reverse-import resolution — real win on Carps, harmless on top-cat
+
+C# files could never enter `_REVERSE_IMPORTS` at all, regardless of import content — `.cs` was excluded from `_REVERSE_IMPORT_EXTS` because the existing namespace-based resolver (`_CS_NS_INDEX`) is imprecise: 70% of Carps' 1,063 namespaces are shared by more than one file (the worst, `InControl.Carps.Jobs.Messages`, by 211), so a `using X;` resolves to whichever file's namespace string happens to be closest in length to the specifier — not necessarily the one actually used.
+
+**Investigated a precise fix first**: cross-referencing a file's own blueprint/body identifiers against a `(namespace, type_name) → file` index (buildable in ~0.1s from already-cached blueprints, narrowing ambiguity from 70% to 7% of names). Real progress, but hit a real coverage gap: on the one real case tested in depth, the actual type usage lived entirely inside a method body (a `GetJobsRequest` instantiated in a test method, not held as a field or constructor parameter) — invisible to blueprint-only text. A fully reliable version needs body-scanning, a bigger lift than this pass; flagged as future work. (This investigation also surfaced an unrelated, real, narrow bug: 2 real Carps files have a completely nameless top-level type declaration in their own blueprint, because C# attribute decorations — `[RequiresFeatureAccess(...)] [RequiresActionAccess(...)]` — pushed the class name past `_signature_from_node`'s flat 150-character truncation cap. Confirmed via `verify_symbol_existence`: the affected files' own *definitions* are invisible to symbol search, only usage sites are found. Not fixed in this pass — noted here as a known, quantified, narrow gap for a future session.)
+
+**Shipped the existing imprecise resolver as-is instead**, since even a "closest namespace-length match" connects a file to a plausible neighborhood via the existing forward/reverse-import score-boost in `_score_task_files`, rather than the total disconnection C# files had before. Real A/B, official re-run with the shipped code on both repos:
+
+| Repo | MRR | hit@5 | hit@10 | improved/regressed |
+|---|---|---|---|---|
+| Carps-git | 0.418 → **0.437** | 0.57 → **0.62** | 0.60 → **0.65** | 3 / 0 |
+| top-cat | 0.310 → 0.310 | 0.48 → 0.48 | 0.52 → 0.52 | 0 / 0 |
+
+Real win on Carps (including fixing the `JobStateIds`/`EndDateTime` case flagged earlier — now found via the import graph, not body-content extraction, at rank 2), zero effect on top-cat, **zero regressions on either** — not a universal win like the chrono-window widening, but a real, understood, harmless-everywhere improvement. The cost that made this a hard sell initially (28-40s per warmup) was actually Feature 6's pre-existing Java/Kotlin bug; with that fixed, C# reverse-imports cost ~4.5s.
+
 ## Commit breakdown
 
 1. Feature 1: `_BEHAVIORAL_ANCHORS` + `walk()` branch + `BLUEPRINT_VERSION` bump + 15 unit tests
@@ -136,3 +164,6 @@ Carps: 9 improved, 1 regressed (a mild reshuffle among several genuinely relevan
 5. Investigated and reverted: concept synonym expansion (`_CONCEPT_SYNONYMS` grouped scoring, 8 unit tests) — a wash on real A/B, fully reverted per the "ship only verified wins" rule this established
 6. Follow-up: config-file discount built, measured net-negative, reverted; `set_scope` and alias recommendations validated with real evidence; cross-repo validation against top-cat confirms Features 1-3 generalize
 7. Feature 5: widened `chrono_fts` lookback window — a real, clear, cross-repo-verified win found by re-examining misses after the ship-only-verified-wins correction
+8. Investigated and reverted: adjacent-short-word joining (phrasal verbs) — real mechanism, wash at scale on both repos
+9. Feature 6: fixed a pre-existing Java/Kotlin `rglob()` performance bug — halves full warmup time on both repos, pure perf fix
+10. Feature 7: enabled C# reverse-import resolution using the existing imprecise resolver — real win on Carps, harmless on top-cat; precise type-aware resolution investigated but deferred (needs body-scanning); found and documented (not fixed) a narrow, separate signature-truncation bug affecting 2 real files
