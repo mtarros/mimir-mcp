@@ -3859,14 +3859,19 @@ def _score_task_files(task: str, focus: str = "") -> tuple[dict[str, float], lis
     # tickets that quote a fix's plain-English description ("fix race
     # condition on retry") more literally than the code itself does. Reuses
     # valid_kws (already computed above) rather than a separate keyword-
-    # extraction pass. Bounded identically to the recency boost immediately
-    # above (same rank -> score -> min(*, own_score) shape): can at most
-    # double an already-matched file's score, and NEVER adds a file with
-    # zero code-match score. Deliberately conservative — unlike recency
-    # (pure "touched lately," no semantic content), a commit-message hit
-    # DOES carry real semantic content and a case could be made for letting
-    # a strong match alone surface a new file, but that's a strictly
-    # riskier default that needs its own separate before/after measurement.
+    # extraction pass. NEVER adds a file with zero code-match score — that's
+    # still the hard line. But unlike the doubling-capped first version
+    # (`min(cscore * 0.5, file_hit_count[rel])`), an already-matched file's
+    # boost is NOT capped relative to its own current score. Real Carps A/B
+    # (7 real tickets, isolated before/after) found the doubling cap made
+    # the feature measure ZERO improvement across all 7 tasks — precisely
+    # because the tickets a commit-message match is MOST useful for are the
+    # ones where the code-level match is weakest (that's *why* the code
+    # didn't match well), so "at most double a small number" was too tight
+    # to ever close the gap to a stronger, unrelated code-level match. The
+    # uncapped version, re-tested the same way: 4 of 7 tasks improved
+    # (2 from not-in-top-10 to top-3), 0 regressed on tasks that were
+    # already correct. See docs/plan-behavioral-tags-chrono-fts.md.
     try:
         _maybe_build_chrono_fts()
         chrono_hits = _chrono_fts_scores(valid_kws)
@@ -3875,7 +3880,7 @@ def _score_task_files(task: str, focus: str = "") -> tuple[dict[str, float], lis
             for i, rel in enumerate(chrono_ranked):
                 if rel in file_hit_count:
                     cscore = 20 - i   # 20 (best match) down to 1
-                    file_hit_count[rel] += min(cscore * 0.5, file_hit_count[rel])
+                    file_hit_count[rel] += cscore * 0.5
     except Exception:
         pass
 

@@ -201,22 +201,29 @@ class TestChronoFoldIn:
         assert "handler.py" in file_hit_count and "widget.py" in file_hit_count
         assert file_hit_count["handler.py"] > file_hit_count["widget.py"], file_hit_count
 
-    def test_boost_is_bounded_to_at_most_doubling(self, chrono_repo, monkeypatch):
-        """Same bound the existing git-recency boost already uses --
-        confirms the fold-in didn't accidentally drop the min(*, own_score)
-        cap that keeps a strong commit-message match from swamping a weak
-        code match entirely."""
+    def test_boost_is_uncapped_but_gate_still_holds(self, chrono_repo, monkeypatch):
+        """A real Carps A/B (7 real tickets, see docs/plan-behavioral-tags-
+        chrono-fts.md) found the original "at most double an already-
+        matched file's score" cap made the feature measure ZERO improvement
+        across all 7 tasks: the tickets a commit-message match helps most
+        are exactly the ones with the WEAKEST code-level match, so doubling
+        a small number was never enough to close the gap to a stronger,
+        unrelated code match. The cap was removed for an already-matched
+        file's boost -- re-tested the same way, 4 of 7 real tasks improved,
+        0 regressed. The one invariant that must still hold, and is the
+        actual safety property (not the removed doubling cap), is
+        test_never_adds_a_file_absent_from_code_matches above: chrono can
+        amplify an existing match without limit, but never invents one."""
         mimir._maybe_build_chrono_fts(force=True)
         # Isolate from the (separately tested) recency boost so only the
         # chrono contribution is being measured here.
         monkeypatch.setattr(mimir, "_git_recency_scores", lambda: {})
         base_fhc, _kw, _hits, _exp, _fts = mimir._score_task_files("retry")
         full_fhc, _kw2, _hits2, _exp2, _fts2 = mimir._score_task_files("race condition retry")
-        # handler.py's boosted score must be <= 2x what its unboosted
-        # "retry"-only code match would have been (loose upper bound check;
-        # exact equality isn't expected since keyword sets differ).
         if "handler.py" in base_fhc and "handler.py" in full_fhc:
-            assert full_fhc["handler.py"] <= base_fhc["handler.py"] * 2 + 0.01
+            # The boost is real and can exceed a 2x bound now -- assert it's
+            # positive, not that it's capped.
+            assert full_fhc["handler.py"] >= base_fhc["handler.py"]
 
     def test_disabled_chrono_leaves_ranking_unchanged(self, chrono_repo, monkeypatch):
         """Isolation check for the real A/B methodology: neutralizing
