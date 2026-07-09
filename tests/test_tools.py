@@ -640,6 +640,29 @@ class TestJavaImportResolution:
         kind, display = mimir._resolve_import("android.os.Bundle", self.src_file)
         assert kind == "external"
 
+    def test_index_ready_miss_never_touches_filesystem(self, monkeypatch):
+        """Real Carps A/B: _build_reverse_imports() spent ~30 of its ~31s in
+        a redundant rglob() scan per external Java/Kotlin import (most
+        imports in any real codebase -- java.util.*, androidx.*, etc.).
+        _JAVA_CLASS_INDEX is built from every workspace file using the SAME
+        file-stem match rglob() uses, so once the index is ready a miss is
+        guaranteed to also miss via rglob -- the scan was pure wasted work.
+        This pins the fix: no filesystem walk once the index is ready."""
+        def _fail_if_called(*a, **k):
+            raise AssertionError("rglob() must not be called once _JAVA_CLASS_INDEX_READY is True")
+        monkeypatch.setattr(mimir.Path, "rglob", _fail_if_called)
+        kind, display = mimir._resolve_import("android.os.Bundle", self.src_file)
+        assert kind == "external"
+
+    def test_pre_index_fallback_still_works(self, monkeypatch):
+        """Before _build_java_class_index() has run, resolution must still
+        fall back to a direct filesystem scan -- this is the one case the
+        rglob() strategy is genuinely needed for."""
+        monkeypatch.setattr(mimir, "_JAVA_CLASS_INDEX_READY", False)
+        kind, display = mimir._resolve_import("com.example.topcat.BaseActivity", self.src_file)
+        assert kind == "workspace"
+        assert "BaseActivity.java" in display
+
 
 class TestJavaReverseImports:
     """_build_reverse_imports should populate _REVERSE_IMPORTS for Java projects."""

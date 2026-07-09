@@ -3303,7 +3303,22 @@ def _resolve_import(specifier: str, source_file: Path) -> tuple[str, str]:
                     len(r)
                 ))
                 return ('workspace', best)
-        # Strategy 2: direct filesystem lookup (pre-index fallback)
+            # _JAVA_CLASS_INDEX is built from EVERY workspace .java/.kt/.kts file,
+            # keyed by file stem — the exact same match criterion Strategy 2's
+            # rglob(f'{class_name}{ext}') below uses. A miss here means rglob
+            # is guaranteed to find nothing either (both search by identical
+            # file-stem naming), so once the index is ready a miss really
+            # means "external", not "index might be incomplete, keep
+            # searching". Profiled on real Carps-git: skipping the redundant
+            # rglob() scan here cut _build_reverse_imports() from ~31s to a
+            # small fraction of that — it was doing one full recursive
+            # workspace filesystem walk per unresolved external import
+            # (java.util.*, androidx.*, etc.), which is most Java/Kotlin
+            # imports in any real codebase.
+            return ('external', specifier)
+        # Strategy 2: direct filesystem lookup — only reachable pre-index,
+        # i.e. if _resolve_import is ever called before _build_java_class_index()
+        # has run during warmup.
         for p in WORKSPACE_ROOT.rglob(f'{class_name}{ext}'):
             if p.is_file():
                 try:
